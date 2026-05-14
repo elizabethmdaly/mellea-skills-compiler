@@ -59,13 +59,45 @@ class LintRunResult:
 
 
 def lint_fixtures_loader_contract(package_dir: Path) -> LintResult:
-    """`<package>/fixtures/__init__.py` must export ALL_FIXTURES or FIXTURES."""
+    """`<package>/fixtures/__init__.py` must export ALL_FIXTURES or FIXTURES.
+
+    NOTE — `skipped` semantics:
+    `fixtures/__init__.py` is a *mandatory* output of the deterministic
+    `fixtures_writer.py` (Step 4). Its absence means the writer never ran or
+    its output was discarded — historically this was masked because (a) the
+    writer-renderer path resolution silently failed for out-of-tree compiles
+    (see `mellea_skills.py`) and (b) this lint reported `skipped`, which the
+    Step-7 aggregator counted as `pass`. The fix lives in
+    `compile/mellea_skills.py` (hard-fail when writers cannot be located);
+    this lint backstops it by reporting `fail` rather than `skipped` for the
+    missing-file case. `skipped` is reserved for lints that genuinely do not
+    apply to a given package shape (e.g. a tool-dispatch lint on a
+    single_shot skill).
+    """
     result = LintResult(lint_id="fixtures-loader-contract", verdict="pass")
 
     fixtures_init = package_dir / "fixtures" / "__init__.py"
     if not fixtures_init.exists():
-        result.verdict = "skipped"
-        result.skipped_reason = "fixtures/__init__.py not found"
+        result.verdict = "fail"
+        result.failures.append(
+            LintFailure(
+                file="fixtures/__init__.py",
+                line=None,
+                column=None,
+                message=(
+                    "fixtures/__init__.py not found in compiled package — this "
+                    "file is mandatory and is normally produced by the "
+                    "deterministic writer `.claude/melleafy/writers/fixtures_writer.py`. "
+                    "Its absence usually means the writer-renderer never ran "
+                    "(see compile/writer_renderer.py + the writers_repo_root "
+                    "resolution in compile/mellea_skills.py). Was the spec "
+                    "compiled out-of-tree with an older compiler that walked "
+                    "up from the package dir instead of the installed "
+                    "compiler package?"
+                ),
+                rule_ref="R16, Rule 4-1 (mellea-fy-fixtures.md)",
+            )
+        )
         return result
 
     result.files_checked = 1
@@ -290,6 +322,19 @@ def lint_runtime_defaults_bound(package_dir: Path) -> LintResult:
 
     Skipped when the directive file is absent — usually because the package was
     compiled with an older pipeline that did not write the directive.
+
+    NOTE — `skipped` vs `fail` semantics:
+    `config.py` is a *mandatory* output of the deterministic `config_writer.py`
+    (Step 3, ENFORCE mode). Its absence means the writer never ran or its
+    output was discarded — historically masked because (a) the writer-renderer
+    path resolution silently failed for out-of-tree compiles (see
+    `mellea_skills.py`) and (b) this lint reported `skipped` for the missing
+    file, which the Step-7 aggregator counted as `pass`. The primary fix is in
+    `compile/mellea_skills.py` (hard-fail when writers cannot be located);
+    this lint backstops it by reporting `fail` rather than `skipped` for the
+    missing-config.py case. The `runtime_directive.json`-missing branch
+    legitimately stays `skipped` because older packages may exist that were
+    compiled before the directive was emitted at all.
     """
     result = LintResult(lint_id="runtime-defaults-bound", verdict="pass")
 
@@ -304,8 +349,27 @@ def lint_runtime_defaults_bound(package_dir: Path) -> LintResult:
         )
         return result
     if not config_path.exists():
-        result.verdict = "skipped"
-        result.skipped_reason = "config.py not found"
+        result.verdict = "fail"
+        result.failures.append(
+            LintFailure(
+                file="config.py",
+                line=None,
+                column=None,
+                message=(
+                    "config.py not found in compiled package — this file is "
+                    "mandatory and is normally produced by the deterministic "
+                    "writer `.claude/melleafy/writers/config_writer.py` "
+                    "(Step 3, ENFORCE mode). Its absence usually means the "
+                    "writer-renderer never ran (see compile/writer_renderer.py "
+                    "+ the writers_repo_root resolution in "
+                    "compile/mellea_skills.py). Was the spec compiled "
+                    "out-of-tree with an older compiler that walked up from "
+                    "the package dir instead of the installed compiler "
+                    "package?"
+                ),
+                rule_ref="C8 runtime defaults",
+            )
+        )
         return result
 
     try:

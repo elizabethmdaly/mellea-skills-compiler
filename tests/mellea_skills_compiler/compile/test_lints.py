@@ -118,19 +118,31 @@ class TestFixturesLoaderContract:
             )
             assert len(result.failures) == 1
 
-    def test_skipped_when_fixtures_init_missing(self):
-        """fixtures/ exists with no __init__.py — verdict skipped."""
+    def test_fails_when_fixtures_init_missing(self):
+        """fixtures/ exists with no __init__.py — verdict fail (mandatory file)."""
+        # NOTE: previously this was asserted as `skipped`. That semantics was
+        # wrong — fixtures/__init__.py is a mandatory output of fixtures_writer.py,
+        # and treating its absence as a skip masked the out-of-tree writer-renderer
+        # bug fixed alongside this test. See the docstring on
+        # lint_fixtures_loader_contract for the full rationale.
         with tempfile.TemporaryDirectory() as tmp:
             pkg = Path(tmp)
             (pkg / "fixtures").mkdir()
             # Some other file but no __init__.py
             (pkg / "fixtures" / "data.txt").write_text("not python\n")
             result = lint_fixtures_loader_contract(pkg)
-            assert result.verdict == "skipped", (
-                f"Missing fixtures/__init__.py should produce skipped, got {result.verdict}"
+            assert result.verdict == "fail", (
+                f"Missing fixtures/__init__.py should fail (mandatory file), "
+                f"got {result.verdict}"
             )
-            assert result.skipped_reason is not None
-            assert "fixtures/__init__.py" in result.skipped_reason
+            assert len(result.failures) == 1
+            msg = result.failures[0].message
+            assert "fixtures/__init__.py not found" in msg, (
+                f"Failure message should name the missing mandatory file; got: {msg}"
+            )
+            assert "fixtures_writer" in msg, (
+                f"Failure message should reference the writer responsible; got: {msg}"
+            )
 
     def test_fails_with_syntax_error(self):
         """fixtures/__init__.py with a Python syntax error should fail with line info."""
@@ -404,17 +416,29 @@ class TestRuntimeDefaultsBound:
                 f"Skip reason should mention 'older pipeline'; got: {result.skipped_reason}"
             )
 
-    def test_skipped_when_config_missing(self):
-        """No config.py → skipped."""
+    def test_fails_when_config_missing(self):
+        """No config.py → fail (config.py is a mandatory writer output)."""
+        # NOTE: previously this was asserted as `skipped`. That semantics was
+        # wrong — config.py is a mandatory output of config_writer.py (Step 3,
+        # ENFORCE mode), and treating its absence as a skip masked the
+        # out-of-tree writer-renderer bug fixed alongside this test. See the
+        # docstring on lint_runtime_defaults_bound for the full rationale.
         with tempfile.TemporaryDirectory() as tmp:
             pkg = Path(tmp)
             _write_directive(pkg, "ollama", "granite3.3:8b")
             result = lint_runtime_defaults_bound(pkg)
-            assert result.verdict == "skipped", (
-                f"Missing config.py should skip; got {result.verdict}"
+            assert result.verdict == "fail", (
+                f"Missing config.py should fail (mandatory file), "
+                f"got {result.verdict}"
             )
-            assert result.skipped_reason is not None
-            assert "config.py" in result.skipped_reason
+            assert len(result.failures) == 1
+            msg = result.failures[0].message
+            assert "config.py not found" in msg, (
+                f"Failure message should name the missing mandatory file; got: {msg}"
+            )
+            assert "config_writer" in msg, (
+                f"Failure message should reference the writer responsible; got: {msg}"
+            )
 
     def test_skipped_when_directive_malformed_json(self):
         """Malformed JSON in runtime_directive.json → skipped with parse-error reason."""
@@ -547,6 +571,37 @@ class TestRunLints:
                 assert "verdict" in lint_entry
                 assert "failures" in lint_entry
                 assert isinstance(lint_entry["failures"], list)
+
+    def test_overall_fail_on_missing_mandatory_writer_outputs(self):
+        """An incomplete package missing config.py + fixtures/ must fail overall.
+
+        Regression test for the out-of-tree writer-renderer bug: previously, both
+        lints reported `skipped` for the missing-file case, the Step-7 aggregator
+        counted `skipped` as `pass`, and incomplete packages shipped with a
+        falsely-green verdict. Both lints now fail loudly so the aggregator
+        propagates the fail upward.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = Path(tmp)
+            # No config.py, no fixtures/__init__.py — but a runtime directive
+            # exists, so the runtime-defaults-bound lint actually proceeds past
+            # its directive-missing skip branch and reaches the config.py check.
+            _write_directive(pkg, "ollama", "granite3.3:8b")
+            result = run_lints(pkg)
+            assert result.overall_verdict == "fail", (
+                f"Package missing both mandatory writer outputs must fail "
+                f"overall; got {result.overall_verdict} with lints="
+                f"{[(r.lint_id, r.verdict) for r in result.lints]}"
+            )
+            verdicts = {r.lint_id: r.verdict for r in result.lints}
+            assert verdicts.get("fixtures-loader-contract") == "fail", (
+                f"fixtures-loader-contract should fail on missing __init__.py; "
+                f"verdicts={verdicts}"
+            )
+            assert verdicts.get("runtime-defaults-bound") == "fail", (
+                f"runtime-defaults-bound should fail on missing config.py; "
+                f"verdicts={verdicts}"
+            )
 
     def test_intermediate_dir_created(self):
         """intermediate/ should be created if it didn't already exist."""
