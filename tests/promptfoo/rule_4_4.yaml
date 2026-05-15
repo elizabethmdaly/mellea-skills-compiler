@@ -1,0 +1,92 @@
+# Rule 4-4 — stdlib-arity: calls to mellea.stdlib.* functions must use correct argument counts/names
+# Lint: stdlib-arity
+# Ref: /concepts/requirements-system
+
+description: "Rule 4-4 — stdlib-arity: correct argument counts for mellea.stdlib functions"
+
+providers:
+  - id: exec
+    config:
+      command: "python tests/promptfoo/runners/lint_runner.py"
+
+prompts:
+  - '{{ {"lint": lint, "file": file, "subcheck": subcheck|default(null), "code": code} | dump | safe }}'
+
+defaultTest:
+  options:
+    provider: exec
+
+tests:
+  - description: "FAIL — req() called with zero positional args (requires 1)"
+    vars:
+      lint: stdlib-arity
+      file: requirements.py
+      code: |
+        from mellea.stdlib.requirements import req, simple_validate
+        EMPTY_REQ = req()
+    assert:
+      - type: contains
+        value: "FAIL"
+      - type: icontains
+        value: "req"
+
+  - description: "FAIL — simple_validate() called with zero args (requires 1)"
+    vars:
+      lint: stdlib-arity
+      file: requirements.py
+      code: |
+        from mellea.stdlib.requirements import req, simple_validate
+        LENGTH_REQ = req("Under 100 words", validation_fn=simple_validate())
+    assert:
+      - type: contains
+        value: "FAIL"
+      - type: icontains
+        value: "simple_validate"
+
+  - description: "FAIL — req() with unrecognised keyword argument"
+    vars:
+      lint: stdlib-arity
+      file: requirements.py
+      code: |
+        from mellea.stdlib.requirements import req
+        LENGTH_REQ = req("Under 100 words", validator=lambda x: True)
+    assert:
+      - type: contains
+        value: "FAIL"
+
+  - description: "PASS — req() with description only"
+    vars:
+      lint: stdlib-arity
+      file: requirements.py
+      code: |
+        from mellea.stdlib.requirements import req
+        LENGTH_REQ = req("Keep response under 100 words")
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "PASS — req() with description and validation_fn"
+    vars:
+      lint: stdlib-arity
+      file: requirements.py
+      code: |
+        from mellea.stdlib.requirements import req, simple_validate
+        LENGTH_REQ = req(
+            "Keep response under 100 words",
+            validation_fn=simple_validate(lambda x: len(x.split()) < 100),
+        )
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "PASS — check() with two positional args"
+    vars:
+      lint: stdlib-arity
+      file: requirements.py
+      code: |
+        from mellea.stdlib.requirements import req, check
+        LENGTH_REQ = req("Under 100 words")
+        result = check(LENGTH_REQ, "some output text")
+    assert:
+      - type: contains
+        value: "PASS"

@@ -1,0 +1,68 @@
+# Rule 3-1 — every parameter in pipeline.py:run_pipeline must have an explicit type annotation
+# Lint: cross-reference sub-check F
+# Ref: /concepts/generative-functions
+
+description: "Rule 3-1 — run_pipeline parameters must be type-annotated"
+
+providers:
+  - id: exec
+    config:
+      command: "python tests/promptfoo/runners/lint_runner.py"
+
+prompts:
+  - '{{ {"lint": lint, "file": file, "subcheck": subcheck|default(null), "code": code} | dump | safe }}'
+
+defaultTest:
+  options:
+    provider: exec
+
+tests:
+  - description: "FAIL — bare parameter with no annotation"
+    vars:
+      lint: cross-reference
+      subcheck: "F"
+      file: pipeline.py
+      code: |
+        def run_pipeline(ticket, priority: str = "normal") -> dict:
+            return {}
+    assert:
+      - type: contains
+        value: "FAIL"
+      - type: icontains
+        value: "annotation"
+
+  - description: "FAIL — all parameters bare"
+    vars:
+      lint: cross-reference
+      subcheck: "F"
+      file: pipeline.py
+      code: |
+        def run_pipeline(ticket, user_id, context) -> dict:
+            return {}
+    assert:
+      - type: contains
+        value: "FAIL"
+
+  - description: "PASS — all parameters annotated"
+    vars:
+      lint: cross-reference
+      subcheck: "F"
+      file: pipeline.py
+      code: |
+        def run_pipeline(ticket: str, priority: str = "normal", user_id: str | None = None) -> dict:
+            return {}
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "PASS — single annotated parameter"
+    vars:
+      lint: cross-reference
+      subcheck: "F"
+      file: pipeline.py
+      code: |
+        def run_pipeline(query: str) -> str:
+            return ""
+    assert:
+      - type: contains
+        value: "PASS"

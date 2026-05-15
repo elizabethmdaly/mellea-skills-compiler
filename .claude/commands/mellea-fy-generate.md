@@ -48,6 +48,8 @@ The `run_pipeline` function signature and `main.py` shape vary by modality from 
 
 **Rule 3-1 — `run_pipeline` parameter type annotations**: Every parameter in the generated `run_pipeline` function signature MUST have an explicit Python type annotation. If the source spec declares a type for a parameter (e.g. from a typed function signature, a schema field, or an explicit type note in the spec text), use that type. If the source spec is untyped or ambiguous, default to `str`. Do not emit bare parameter names (e.g. `company_domain`) — emit `company_domain: str` instead. This applies to both required and optional (defaulted) parameters.
 
+**Rule 3-2 — `run_pipeline` is the canonical entry point name**: The top-level entry function in `pipeline.py` MUST be named exactly `run_pipeline` — not `run_phase_1`, not `run_assessment`, not any other `run_*` variant. The smoke-check loader at `toolkit/file_utils.py:load_skill_pipeline` uses `melleafy.json:entry_signature` as the authoritative source of truth for which function to invoke, with `run_pipeline` as the fallback when the manifest is absent. Empirically observed regression: a package defining `run_phase_2_gap_analysis`, `run_phase_3_roadmap`, and `run_pipeline` as public top-level functions caused the pre-fix loader to pick `run_phase_2_gap_analysis` (alphabetically first under `dir()`) and crash at fixture smoke-check with a TypeError. Public helper functions named `run_<phase>` are PERMITTED alongside `run_pipeline` — the loader's manifest-driven discovery handles the disambiguation — but `run_pipeline` MUST be present. Step 5 records the canonical signature in `melleafy.json:entry_signature`. The `pipeline-entry-canonical` lint enforces this at Step 7.
+
 ### Step 3a-pre: Bundled assets are already mirrored (Rule OUT-6)
 
 Companion directories from the skill root (`scripts/`, `references/`, `assets/`) are mirrored into `<package_name>/` **deterministically by the compile pipeline**, _before_ mellea-fy runs. The model does not perform the copy — it is plumbing handled by `mellea_skills_compiler.compile.mellea_skills._mirror_companion_dirs`. By the time Step 3 begins, any companion directory that existed at the skill root is already present at `<package_name>/<dir>/` and can be referenced directly.
@@ -82,7 +84,7 @@ _JSON the model emits:_
     },
     {
       "name": "MODEL_ID",
-      "value": "granite3.3:8b",
+      "value": "granite4.1:8b",
       "type": "str",
       "category": "C8"
     },
@@ -106,7 +108,7 @@ PREFIX_TEXT: Final[str] = """You are an AI assistant.\nYou help users with resea
 
 # === C8: Runtime Environment ===
 BACKEND: Final[str] = 'ollama'
-MODEL_ID: Final[str] = 'granite3.3:8b'
+MODEL_ID: Final[str] = 'granite4.1:8b'
 
 LOOP_BUDGET: Final[int] = 3
 ```
@@ -189,6 +191,15 @@ Apply this per-mode distinction at the call site in `pipeline.py` too: every bra
 - `DECIDE` logic: Python `if/elif/else` wrapping Mellea calls
 - MUST convert all non-string `grounding_context` values to `str()`
 - MUST use `format=PydanticModel` for every `m.instruct()` that produces structured output
+- MUST include a description argument on every `m.instruct(...)` call — either as the first positional argument or as a `description=` keyword. Mellea 0.5+ requires this; calls without it crash at runtime with `TypeError: instruct() missing 1 required positional argument: 'description'`. For format-only schema-extract calls where the natural-language instruction is implicit in the schema, emit a generated fallback description, e.g.:
+
+  ```python
+  m.instruct(
+      f"Produce a {ModelName} per the schema, grounded in the provided context.",
+      format=ModelName,
+      ...
+  )
+  ```
 - MUST parse the thunk after every `m.instruct(format=Model)` before accessing any field or calling any Pydantic method. `m.instruct()` returns a `ComputedModelOutputThunk` — NOT a Pydantic model. Direct field access (`thunk.field_name`) or `.model_dump()` raises `AttributeError`. Always include `_parse_instruct_result` and `_safe_parse_with_fallback` helpers in `pipeline.py` and call them immediately after every `m.instruct(format=Model)` call:
 
   ```python

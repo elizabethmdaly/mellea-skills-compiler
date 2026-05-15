@@ -1,0 +1,58 @@
+# KB3 — validator-soundness: validation_fn must use simple_validate() or (ctx, result) -> ...
+# Lint: validator-soundness sub-check A
+# Ref: /how-to/write-custom-verifiers
+
+description: "KB3 — validator-soundness: validation_fn signature"
+
+providers:
+  - id: exec
+    config:
+      command: "python tests/promptfoo/runners/lint_runner.py"
+
+prompts:
+  - '{{ {"lint": lint, "file": file, "subcheck": subcheck|default(null), "code": code} | dump | safe }}'
+
+defaultTest:
+  options:
+    provider: exec
+
+tests:
+  - description: "FAIL — raw lambda missing Context wrapper"
+    vars:
+      lint: validator-soundness
+      file: requirements.py
+      code: |
+        from mellea.stdlib.requirements import req, simple_validate
+        LENGTH_REQ = req("Keep response under 100 words",
+                         validation_fn=lambda x: len(x.split()) < 100)
+    assert:
+      - type: contains
+        value: "FAIL"
+      - type: icontains
+        value: "simple_validate"
+
+  - description: "PASS — simple_validate wrapper"
+    vars:
+      lint: validator-soundness
+      file: requirements.py
+      code: |
+        from mellea.stdlib.requirements import req, simple_validate
+        LENGTH_REQ = req("Keep response under 100 words",
+                         validation_fn=simple_validate(lambda x: len(x.split()) < 100))
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "PASS — (ctx, result) -> ValidationResult signature"
+    vars:
+      lint: validator-soundness
+      file: requirements.py
+      code: |
+        from mellea import Context, ValidationResult
+        from mellea.stdlib.requirements import req
+        def _check_length(ctx: Context, result) -> ValidationResult:
+            return ValidationResult(len(str(result).split()) < 100)
+        LENGTH_REQ = req("Keep response under 100 words", validation_fn=_check_length)
+    assert:
+      - type: contains
+        value: "PASS"

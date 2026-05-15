@@ -13,6 +13,7 @@ mellea version; the doc_index cache uses a configurable TTL (default 24h) with
 a stale-cache fallback if the network is unreachable.
 """
 
+import hashlib
 import importlib
 import importlib.metadata
 import inspect
@@ -33,11 +34,72 @@ LOGGER = configure_logger()
 
 CACHE_DIR = Path.home() / ".cache" / "mellea-skills-compiler"
 
-# Modules always introspected, regardless of dependency_plan.json contents.
+# Modules always introspected, regardless of which skill modality is being
+# compiled. These cover the universal surface every generated skill uses
+# (session, requirements, sampling, message types, model options, generative
+# slots). Modality-specific additions live in `_MODALITY_MODULES` below and
+# are appended at compile time based on `classification.json:modality`.
+#
+# Why CORE_MODULES is the de-facto contract:
+# The original design routed per-skill additions through
+# `dependency_plan.json:plan[*].target`, expecting the LLM to declare its
+# Mellea imports there. In practice that field holds OUTPUT paths
+# (`config.py:SKILL_NAME`, `pipeline.py:run_pipeline`) — it was always
+# populated with the wrong shape, so dynamic expansion silently returned
+# an empty set. Empirically verified across three real compiles. The
+# dependency-plan path was removed; modality-driven expansion replaces it.
 CORE_MODULES = {
+    "mellea.backends.model_options",
+    "mellea.stdlib.components.chat",
+    "mellea.stdlib.components.docs.document",
+    "mellea.stdlib.components.genstub",
+    "mellea.stdlib.components.instruction",
+    "mellea.stdlib.context",
+    "mellea.stdlib.functional",
     "mellea.stdlib.requirements",
     "mellea.stdlib.sampling",
-    "mellea.backends.model_options",
+    "mellea.stdlib.session",
+}
+
+
+# Per-modality module additions, keyed by `classification.json:modality`.
+# An unknown modality contributes no extra modules (no failure — the base
+# CORE_MODULES still applies, and downstream lints surface gaps).
+_MODALITY_MODULES: dict[str, set[str]] = {
+    "synchronous_oneshot": set(),
+    "conversational_session": set(),  # components.chat is already in CORE
+    "streaming": {
+        "mellea.stdlib.chunking",
+        "mellea.stdlib.sampling.budget_forcing",
+    },
+    "realtime_media": {
+        "mellea.stdlib.chunking",
+        "mellea.stdlib.sampling.budget_forcing",
+    },
+    "stateful": {
+        "mellea.stdlib.components.mify",
+        "mellea.stdlib.components.mobject",
+    },
+    "review_gated": set(),
+    "scheduled": set(),
+    "event_triggered": set(),
+    "heartbeat": set(),
+}
+
+
+# Tool-involvement-variant module additions. P2 = "skill calls tools" which
+# uses the React framework; P3 = LLM-orchestrated tool calls. Skills with
+# these variants need React/tool surface even when the modality is otherwise
+# synchronous_oneshot.
+_TOOL_VARIANT_MODULES: dict[str, set[str]] = {
+    "P2": {
+        "mellea.stdlib.components.react",
+        "mellea.stdlib.frameworks.react",
+    },
+    "P3": {
+        "mellea.stdlib.components.react",
+        "mellea.stdlib.frameworks.react",
+    },
 }
 
 # Static fallback for `forbidden_param_names` if the genslot symbol is not
@@ -97,25 +159,32 @@ def _atomic_write(path: Path, content: str) -> None:
     os.replace(tmp, path)
 
 
-def _load_dependency_plan_targets(intermediate_dir: Path) -> set[str]:
-    """Extract target module names from `dependency_plan.json` if present.
+def _modality_specific_modules(intermediate_dir: Path) -> set[str]:
+    """Return additional mellea modules to introspect based on the skill's
+    modality + tool-involvement variant (recorded in classification.json).
 
-    Each entry's `target` field has shape `module.path:symbol`; we keep only
-    the module portion. Returns an empty set if the file is missing or malformed.
+    classification.json is written by Step 0 of mellea-fy. Modality drives
+    most additions (e.g. streaming → chunking + budget_forcing). Tool
+    involvement variants P2/P3 add React/tool surface even when the
+    modality is otherwise non-streaming. Unknown values contribute no
+    extras; CORE_MODULES still applies.
     """
-    plan_path = intermediate_dir / "dependency_plan.json"
-    if not plan_path.exists():
+    classification_path = intermediate_dir / "classification.json"
+    if not classification_path.exists():
         return set()
     try:
-        plan = json.loads(plan_path.read_text())
+        classification = json.loads(classification_path.read_text())
     except (OSError, json.JSONDecodeError):
         return set()
-    targets: set[str] = set()
-    for dep in plan.get("plan", []):
-        target = dep.get("target")
-        if target:
-            targets.add(target.split(":")[0])
-    return targets
+
+    extras: set[str] = set()
+    modality = classification.get("modality")
+    if isinstance(modality, str):
+        extras |= _MODALITY_MODULES.get(modality, set())
+    variant = classification.get("tool_involvement_variant")
+    if isinstance(variant, str):
+        extras |= _TOOL_VARIANT_MODULES.get(variant, set())
+    return extras
 
 
 def _introspect_mellea(referenced_modules: set[str]) -> dict[str, dict[str, Any]]:
@@ -124,6 +193,15 @@ def _introspect_mellea(referenced_modules: set[str]) -> dict[str, dict[str, Any]
     Restricted to the union of CORE_MODULES and `referenced_modules` (from
     dependency_plan.json). Modules that fail to import or symbols that resolve
     to objects without inspectable signatures are skipped silently.
+
+    For class objects defined in the module, additionally enumerate public
+    methods and surface them as `ClassName.method` entries. Without this,
+    `MelleaSession.chat()` and `MelleaSession.instruct()` — the core
+    operations every skill uses — are invisible to the grounding because
+    they're class attributes, not module-level callables. The drift we hit:
+    LLM emits `m.chat(...) -> str` (Mellea 0.4 mental model) when the actual
+    0.5 return type is `Message`. Surfacing the method signatures lets the
+    grounding contradict that mental model directly.
     """
     try:
         mellea_pkg = importlib.import_module("mellea")
@@ -150,6 +228,25 @@ def _introspect_mellea(referenced_modules: set[str]) -> dict[str, dict[str, Any]
                 symbols[name] = {"signature": f"{name}{inspect.signature(obj)}"}
             except (ValueError, TypeError):
                 pass
+            # If this is a class defined in (or re-exported into) the module
+            # being introspected, also record its public method signatures
+            # as `ClassName.method` entries.
+            if inspect.isclass(obj):
+                for method_name, method_obj in inspect.getmembers(obj):
+                    if method_name.startswith("_"):
+                        continue
+                    if not (
+                        inspect.isfunction(method_obj)
+                        or inspect.ismethod(method_obj)
+                    ):
+                        continue
+                    try:
+                        sig = inspect.signature(method_obj)
+                    except (ValueError, TypeError):
+                        continue
+                    symbols[f"{name}.{method_name}"] = {
+                        "signature": f"{name}.{method_name}{sig}"
+                    }
         if symbols:
             api_ref[module_name] = symbols
     return api_ref
@@ -218,6 +315,26 @@ def _grounding_unavailable_payload() -> str:
     )
 
 
+def _api_ref_cache_path(version: str, extras: set[str] | None = None) -> Path:
+    """Return the cache filename for the given mellea version + extras.
+
+    Cache key includes a short hash of CORE_MODULES *and* the modality-driven
+    `extras` so:
+      - Changes to CORE_MODULES auto-invalidate stale caches without
+        manual `rm -rf ~/.cache/mellea-skills-compiler/`.
+      - A P2 (tool-dispatch) compile cannot inadvertently consume a cache
+        produced by an earlier P4 (synchronous_oneshot) compile that was
+        missing React modules.
+
+    Exposed as a helper so tests can construct the same path without
+    duplicating the hashing logic.
+    """
+    combined = set(CORE_MODULES) | (extras or set())
+    digest_input = "|".join(sorted(combined))
+    cache_hash = hashlib.sha256(digest_input.encode()).hexdigest()[:8]
+    return CACHE_DIR / f"api_ref_{version}_{cache_hash}.json"
+
+
 def write_mellea_api_ref(intermediate_dir: Path, refresh: bool = False) -> Path:
     """Write `mellea_api_ref.json` to `intermediate_dir`.
 
@@ -236,7 +353,11 @@ def write_mellea_api_ref(intermediate_dir: Path, refresh: bool = False) -> Path:
         _atomic_write(out_path, _grounding_unavailable_payload())
         return out_path
 
-    cache_path = CACHE_DIR / f"api_ref_{version}.json"
+    # Cache key includes modality-driven extras so a P2 (tool-dispatch)
+    # compile doesn't reuse a P4 (synchronous_oneshot) cache that's missing
+    # React/tool modules. Resolve extras first, then look up.
+    referenced = _modality_specific_modules(intermediate_dir)
+    cache_path = _api_ref_cache_path(version, referenced)
 
     if cache_path.exists() and not refresh:
         LOGGER.info("Using cached mellea_api_ref for version %s", version)
@@ -244,7 +365,6 @@ def write_mellea_api_ref(intermediate_dir: Path, refresh: bool = False) -> Path:
         return out_path
 
     LOGGER.info("Introspecting mellea %s for api_ref", version)
-    referenced = _load_dependency_plan_targets(intermediate_dir)
     modules = _introspect_mellea(referenced)
     forbidden = _extract_forbidden_param_names()
     compatibility = _load_compatibility_entries(version)

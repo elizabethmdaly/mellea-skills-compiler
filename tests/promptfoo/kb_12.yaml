@@ -1,0 +1,110 @@
+# KB12 — Every m.instruct(...) call must include a description argument
+# Lint: instruct-has-description (structural; always runs)
+# Ref: Mellea 0.5.0 `MelleaSession.instruct(description, *, ...)` — description
+# is positional-or-keyword and REQUIRED. Omitting it crashes at runtime with
+# `TypeError: instruct() missing 1 required positional argument: 'description'`.
+# Empirically observed in nis2-navigator compile of phase-0-spike.
+
+description: "KB12 — Every m.instruct(...) call must have a description (positional or keyword)"
+
+providers:
+  - id: exec
+    config:
+      command: "python tests/promptfoo/runners/lint_runner.py"
+
+prompts:
+  - '{{ {"lint": lint, "file": file, "subcheck": subcheck|default(null), "code": code} | dump | safe }}'
+
+defaultTest:
+  options:
+    provider: exec
+
+tests:
+  - description: "FAIL — format-only m.instruct(...) with no description (nis2-navigator regression)"
+    vars:
+      lint: instruct-has-description
+      file: pipeline.py
+      code: |
+        from mellea import start_session
+        from mellea.backends.model_options import ModelOption
+        from .schemas import JurisdictionRoute
+        from .config import AGENT_DESCRIPTION
+
+        def run_pipeline():
+            with start_session("ollama", "granite4.1:8b") as m:
+                route_thunk = m.instruct(
+                    format=JurisdictionRoute,
+                    grounding_context={"query": "x"},
+                    model_options={ModelOption.SYSTEM_PROMPT: AGENT_DESCRIPTION},
+                )
+    assert:
+      - type: contains
+        value: "FAIL"
+      - type: icontains
+        value: "description"
+
+  - description: "FAIL — bare m.instruct() with no args at all"
+    vars:
+      lint: instruct-has-description
+      file: pipeline.py
+      code: |
+        from mellea import start_session
+
+        def run_pipeline():
+            with start_session("ollama", "granite4.1:8b") as m:
+                m.instruct()
+    assert:
+      - type: contains
+        value: "FAIL"
+
+  - description: "PASS — positional description as the first argument"
+    vars:
+      lint: instruct-has-description
+      file: pipeline.py
+      code: |
+        from mellea import start_session
+        from .schemas import JurisdictionRoute
+
+        def run_pipeline():
+            with start_session("ollama", "granite4.1:8b") as m:
+                route_thunk = m.instruct(
+                    "Classify the query per the JurisdictionRoute schema.",
+                    format=JurisdictionRoute,
+                )
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "PASS — description= as a keyword argument"
+    vars:
+      lint: instruct-has-description
+      file: pipeline.py
+      code: |
+        from mellea import start_session
+        from .schemas import JurisdictionRoute
+
+        def run_pipeline():
+            with start_session("ollama", "granite4.1:8b") as m:
+                route_thunk = m.instruct(
+                    description="Classify the query per the JurisdictionRoute schema.",
+                    format=JurisdictionRoute,
+                )
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "PASS — non-m.instruct() call is ignored (other.instruct, m.transform, etc.)"
+    vars:
+      lint: instruct-has-description
+      file: pipeline.py
+      code: |
+        from .schemas import S
+
+        def f():
+            other = None
+            other.instruct(format=S)  # not m.instruct — ignore
+            m_obj = None
+            m_obj.transform(format=S)  # not .instruct — ignore
+    assert:
+      - type: contains
+        value: "PASS"

@@ -18,6 +18,7 @@ from mellea_skills_compiler.compile import grounding
 from mellea_skills_compiler.compile.grounding import (
     _DOC_PAGES_FALLBACK,
     _FORBIDDEN_PARAM_NAMES_FALLBACK,
+    _api_ref_cache_path,
     _atomic_write,
     write_mellea_api_ref,
     write_mellea_doc_index,
@@ -136,7 +137,7 @@ class TestWriteMelleaApiRef:
             grounding, "_load_compatibility_entries", lambda v: []
         )
 
-        cache_path = patched_cache / "api_ref_0.4.2.json"
+        cache_path = _api_ref_cache_path("0.4.2")
         assert not cache_path.exists()
 
         write_mellea_api_ref(intermediate_dir)
@@ -215,8 +216,8 @@ class TestWriteMelleaApiRef:
         )
         write_mellea_api_ref(intermediate_dir)
 
-        assert (patched_cache / "api_ref_0.4.2.json").exists()
-        assert (patched_cache / "api_ref_0.5.0.json").exists()
+        assert _api_ref_cache_path("0.4.2").exists()
+        assert _api_ref_cache_path("0.5.0").exists()
 
     def test_writes_to_intermediate_dir(
         self, patched_cache, intermediate_dir, monkeypatch
@@ -240,9 +241,111 @@ class TestWriteMelleaApiRef:
         assert out_path == intermediate_dir / "mellea_api_ref.json"
         assert out_path.exists()
 
-        cache_path = patched_cache / "api_ref_0.4.2.json"
+        cache_path = _api_ref_cache_path("0.4.2")
         assert cache_path.exists()
         assert out_path.read_text() == cache_path.read_text()
+
+
+class TestModalitySpecificModules:
+    """Verify classification.json:modality drives per-skill module expansion.
+
+    Regression target: the previous dependency-plan-driven mechanism was
+    empirically dead (every real compile produced an empty target set
+    because `plan[*].target` records output paths, not Mellea modules).
+    Modality-driven expansion replaces it deterministically.
+    """
+
+    def test_synchronous_oneshot_adds_no_extras(self, intermediate_dir):
+        """synchronous_oneshot needs only CORE_MODULES; no modality extras."""
+        (intermediate_dir / "classification.json").write_text(
+            json.dumps({"modality": "synchronous_oneshot"})
+        )
+        assert grounding._modality_specific_modules(intermediate_dir) == set()
+
+    def test_streaming_adds_chunking_and_budget_forcing(self, intermediate_dir):
+        """streaming modality needs chunking + sampling.budget_forcing modules."""
+        (intermediate_dir / "classification.json").write_text(
+            json.dumps({"modality": "streaming"})
+        )
+        extras = grounding._modality_specific_modules(intermediate_dir)
+        assert "mellea.stdlib.chunking" in extras
+        assert "mellea.stdlib.sampling.budget_forcing" in extras
+
+    def test_stateful_adds_mify_and_mobject(self, intermediate_dir):
+        """stateful modality needs mify + mobject modules."""
+        (intermediate_dir / "classification.json").write_text(
+            json.dumps({"modality": "stateful"})
+        )
+        extras = grounding._modality_specific_modules(intermediate_dir)
+        assert "mellea.stdlib.components.mify" in extras
+        assert "mellea.stdlib.components.mobject" in extras
+
+    def test_tool_variant_p2_adds_react(self, intermediate_dir):
+        """Tool-involvement variant P2 (skill calls tools) needs React surface."""
+        (intermediate_dir / "classification.json").write_text(
+            json.dumps(
+                {
+                    "modality": "synchronous_oneshot",
+                    "tool_involvement_variant": "P2",
+                }
+            )
+        )
+        extras = grounding._modality_specific_modules(intermediate_dir)
+        assert "mellea.stdlib.components.react" in extras
+        assert "mellea.stdlib.frameworks.react" in extras
+
+    def test_modality_and_variant_unions(self, intermediate_dir):
+        """A stateful skill with P2 tools should get both expansions."""
+        (intermediate_dir / "classification.json").write_text(
+            json.dumps(
+                {"modality": "stateful", "tool_involvement_variant": "P2"}
+            )
+        )
+        extras = grounding._modality_specific_modules(intermediate_dir)
+        assert "mellea.stdlib.components.mify" in extras
+        assert "mellea.stdlib.components.react" in extras
+
+    def test_missing_classification_returns_empty(self, intermediate_dir):
+        """No classification.json → no extras (CORE_MODULES still applies)."""
+        # intermediate_dir is empty by default
+        assert grounding._modality_specific_modules(intermediate_dir) == set()
+
+    def test_unknown_modality_returns_empty(self, intermediate_dir):
+        """An unrecognised modality is graceful — empty extras, no exception."""
+        (intermediate_dir / "classification.json").write_text(
+            json.dumps({"modality": "frobnicate"})
+        )
+        assert grounding._modality_specific_modules(intermediate_dir) == set()
+
+    def test_malformed_classification_returns_empty(self, intermediate_dir):
+        """A broken JSON classification file does not crash; returns empty."""
+        (intermediate_dir / "classification.json").write_text("{not valid json")
+        assert grounding._modality_specific_modules(intermediate_dir) == set()
+
+
+class TestCacheKeyVariesByExtras:
+    """Same mellea version + different modality must produce different caches.
+
+    Without this, a P4 skill's compile-time cache would be reused by a P2
+    skill's compile and silently miss React modules.
+    """
+
+    def test_different_extras_yield_different_cache_paths(self):
+        path_a = _api_ref_cache_path("0.5.0", {"mellea.stdlib.chunking"})
+        path_b = _api_ref_cache_path(
+            "0.5.0",
+            {"mellea.stdlib.components.react", "mellea.stdlib.frameworks.react"},
+        )
+        assert path_a != path_b, (
+            "Different modality-driven extras must produce distinct cache "
+            "filenames; otherwise a P2 compile inherits a P4 cache."
+        )
+
+    def test_empty_extras_matches_none_extras(self):
+        """`extras=None` and `extras=set()` produce the same cache path."""
+        assert _api_ref_cache_path("0.5.0", None) == _api_ref_cache_path(
+            "0.5.0", set()
+        )
 
 
 def _make_fake_urlopen_response(body: bytes) -> MagicMock:

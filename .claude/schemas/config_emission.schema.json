@@ -26,12 +26,7 @@
         },
         "value": {
           "description": "The constant's value as a JSON scalar. Strings may contain any characters including quotes, backslashes, and braces — the writer uses repr() or triple-quoting to produce safe Python source.",
-          "oneOf": [
-            { "type": "string" },
-            { "type": "integer" },
-            { "type": "number" },
-            { "type": "boolean" }
-          ]
+          "type": ["string", "integer", "number", "boolean"]
         },
         "type": {
           "type": "string",

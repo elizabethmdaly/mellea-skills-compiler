@@ -1,0 +1,74 @@
+# KB8 — no "watsonx" backend string in generated code
+# Lint: known-behaviours sub-check 3h
+# Ref: /integrations/watsonx (integration is read-only; backend string must not appear in generated packages)
+
+description: "KB8 — no watsonx backend string"
+
+providers:
+  - id: exec
+    config:
+      command: "python tests/promptfoo/runners/lint_runner.py"
+
+prompts:
+  - '{{ {"lint": lint, "file": file, "subcheck": subcheck|default(null), "code": code} | dump | safe }}'
+
+defaultTest:
+  options:
+    provider: exec
+
+tests:
+  - description: "FAIL — watsonx backend string in config.py"
+    vars:
+      lint: known-behaviours
+      subcheck: "3h"
+      file: config.py
+      code: |
+        from typing import Final
+        BACKEND: Final[str] = "watsonx"
+        MODEL_ID: Final[str] = "ibm/granite-13b-instruct-v2"
+    assert:
+      - type: contains
+        value: "FAIL"
+      - type: icontains
+        value: "watsonx"
+
+  - description: "FAIL — watsonx backend string inline in pipeline.py"
+    vars:
+      lint: known-behaviours
+      subcheck: "3h"
+      file: pipeline.py
+      code: |
+        from mellea import start_session
+
+        def run_pipeline(query: str) -> str:
+            with start_session(backend="watsonx") as m:
+                return m.instruct(query)
+    assert:
+      - type: contains
+        value: "FAIL"
+
+  - description: "PASS — anthropic backend"
+    vars:
+      lint: known-behaviours
+      subcheck: "3h"
+      file: config.py
+      code: |
+        from typing import Final
+        BACKEND: Final[str] = "anthropic"
+        MODEL_ID: Final[str] = "claude-3-5-sonnet-20241022"
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "PASS — no backend string at all"
+    vars:
+      lint: known-behaviours
+      subcheck: "3h"
+      file: config.py
+      code: |
+        from typing import Final
+        AGENT_NAME: Final[str] = "TicketTriageAgent"
+        MAX_RETRIES: Final[int] = 3
+    assert:
+      - type: contains
+        value: "PASS"

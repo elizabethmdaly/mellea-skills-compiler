@@ -1,0 +1,70 @@
+# KB4 — validator-soundness: no vacuous lambda body (always returns True)
+# Lint: validator-soundness sub-check B
+# Ref: /how-to/write-custom-verifiers
+
+description: "KB4 — validator-soundness: no vacuous validators"
+
+providers:
+  - id: exec
+    config:
+      command: "python tests/promptfoo/runners/lint_runner.py"
+
+prompts:
+  - '{{ {"lint": lint, "file": file, "subcheck": subcheck|default(null), "code": code} | dump | safe }}'
+
+defaultTest:
+  options:
+    provider: exec
+
+tests:
+  - description: "FAIL — lambda always returns True"
+    vars:
+      lint: validator-soundness
+      file: requirements.py
+      code: |
+        from mellea.stdlib.requirements import req, simple_validate
+        LENGTH_REQ = req("Keep response under 100 words",
+                         validation_fn=simple_validate(lambda x: True))
+    assert:
+      - type: contains
+        value: "FAIL"
+      - type: icontains
+        value: "vacuous"
+
+  - description: "FAIL — lambda always returns True (explicit bool)"
+    vars:
+      lint: validator-soundness
+      file: requirements.py
+      code: |
+        from mellea.stdlib.requirements import req, simple_validate
+        ALWAYS_PASS = req("Always passes",
+                          validation_fn=simple_validate(lambda result: True))
+    assert:
+      - type: contains
+        value: "FAIL"
+
+  - description: "PASS — lambda with real condition"
+    vars:
+      lint: validator-soundness
+      file: requirements.py
+      code: |
+        from mellea.stdlib.requirements import req, simple_validate
+        LENGTH_REQ = req("Keep response under 100 words",
+                         validation_fn=simple_validate(lambda x: len(x.split()) < 100))
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "PASS — (ctx, result) -> ValidationResult with real logic"
+    vars:
+      lint: validator-soundness
+      file: requirements.py
+      code: |
+        from mellea import Context, ValidationResult
+        from mellea.stdlib.requirements import req
+        def _check(ctx: Context, result) -> ValidationResult:
+            return ValidationResult(result is not None and len(str(result)) > 0)
+        NON_EMPTY_REQ = req("Non-empty response", validation_fn=_check)
+    assert:
+      - type: contains
+        value: "PASS"

@@ -1,0 +1,78 @@
+# KB7 — no prefix= used as persona/system-prompt mechanism; use ModelOption.SYSTEM_PROMPT
+# Lint: known-behaviours sub-check 3g
+# Ref: /how-to/configure-model-options
+
+description: "KB7 — prefix= must not carry persona/system-prompt text"
+
+providers:
+  - id: exec
+    config:
+      command: "python tests/promptfoo/runners/lint_runner.py"
+
+prompts:
+  - '{{ {"lint": lint, "file": file, "subcheck": subcheck|default(null), "code": code} | dump | safe }}'
+
+defaultTest:
+  options:
+    provider: exec
+
+tests:
+  - description: "FAIL — prefix= set to a config.py constant (persona pattern)"
+    vars:
+      lint: known-behaviours
+      subcheck: "3g"
+      file: pipeline.py
+      code: |
+        from config import PREFIX_TEXT
+        from mellea import start_session
+
+        def run_pipeline(query: str) -> str:
+            with start_session() as m:
+                result = m.instruct(query, prefix=PREFIX_TEXT)
+            return result
+    assert:
+      - type: contains
+        value: "FAIL"
+      - type: icontains
+        value: "SYSTEM_PROMPT"
+
+  - description: "PASS — prefix= used for structured output generation (JSON prefix)"
+    vars:
+      lint: known-behaviours
+      subcheck: "3g"
+      file: pipeline.py
+      code: |
+        from pydantic import BaseModel
+        from mellea import start_session
+
+        class Result(BaseModel):
+            value: str
+
+        def run_pipeline(query: str) -> str:
+            with start_session() as m:
+                result = m.instruct(query, format=Result, prefix='{"value":')
+            return result.value
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "PASS — persona via ModelOption.SYSTEM_PROMPT"
+    vars:
+      lint: known-behaviours
+      subcheck: "3g"
+      file: pipeline.py
+      code: |
+        from config import PREFIX_TEXT
+        from mellea import start_session
+        from mellea.backends.model_options import ModelOption
+
+        def run_pipeline(query: str) -> str:
+            with start_session() as m:
+                result = m.instruct(
+                    query,
+                    model_options={ModelOption.SYSTEM_PROMPT: PREFIX_TEXT},
+                )
+            return result
+    assert:
+      - type: contains
+        value: "PASS"

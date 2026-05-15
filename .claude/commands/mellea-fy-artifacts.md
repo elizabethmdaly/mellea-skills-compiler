@@ -52,7 +52,7 @@ Numbered sections in fixed order (conditional sections omitted when not triggere
 - **§8 Generated stubs to implement** — if any `stub` or `delegate_to_runtime` dispositions: table listing every stub with its target symbol and implementation instructions
 - **§9 Fixtures and smoke test** — always present: how to run `python -m pytest fixtures/` and the expected output
 
-SETUP.md sections do NOT invent backend options. The C8 default is always `ollama` with `granite3.3:8b` unless the source spec explicitly names a different backend.
+SETUP.md sections do NOT invent backend options. The C8 default is always `ollama` with `granite4.1:8b` unless the source spec explicitly names a different backend.
 
 ---
 

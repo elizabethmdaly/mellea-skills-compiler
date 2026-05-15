@@ -1,0 +1,88 @@
+# KB5 — session-boundary: at most one distinct BaseModel format type per start_session() block
+# Lint: session-boundary
+# Ref: /concepts/context-and-sessions
+
+description: "KB5 — session-boundary: single format type per session"
+
+providers:
+  - id: exec
+    config:
+      command: "python tests/promptfoo/runners/lint_runner.py"
+
+prompts:
+  - '{{ {"lint": lint, "file": file, "subcheck": subcheck|default(null), "code": code} | dump | safe }}'
+
+defaultTest:
+  options:
+    provider: exec
+
+tests:
+  - description: "FAIL — two distinct format types in one session"
+    vars:
+      lint: session-boundary
+      file: pipeline.py
+      code: |
+        from pydantic import BaseModel
+        from mellea import start_session
+
+        class TriageVerdict(BaseModel):
+            category: str
+
+        class ClaimList(BaseModel):
+            claims: list[str]
+
+        def run_pipeline(ticket: str) -> dict:
+            with start_session() as m:
+                verdict = m.instruct("Triage this ticket", format=TriageVerdict)
+                claims = m.instruct("Extract claims", format=ClaimList)
+            return {"verdict": verdict, "claims": claims}
+    assert:
+      - type: contains
+        value: "FAIL"
+      - type: icontains
+        value: "session"
+
+  - description: "PASS — single format type used twice in one session"
+    vars:
+      lint: session-boundary
+      file: pipeline.py
+      code: |
+        from pydantic import BaseModel
+        from mellea import start_session
+
+        class TriageVerdict(BaseModel):
+            category: str
+            confidence: float
+
+        def run_pipeline(ticket: str) -> dict:
+            with start_session() as m:
+                first = m.instruct("Triage this ticket", format=TriageVerdict)
+                refined = m.instruct("Refine the verdict", format=TriageVerdict)
+            return {"verdict": refined}
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "PASS — two sessions each with one format type"
+    vars:
+      lint: session-boundary
+      file: pipeline.py
+      code: |
+        from pydantic import BaseModel
+        from mellea import start_session
+
+        class TriageVerdict(BaseModel):
+            category: str
+
+        class ClaimList(BaseModel):
+            claims: list[str]
+
+        def run_pipeline(ticket: str) -> dict:
+            with start_session() as m:
+                verdict = m.instruct("Triage this ticket", format=TriageVerdict)
+            with start_session() as m:
+                claims = m.instruct("Extract claims", format=ClaimList)
+            return {"verdict": verdict, "claims": claims}
+    assert:
+      - type: contains
+        value: "PASS"

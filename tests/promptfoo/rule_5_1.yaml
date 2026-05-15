@@ -1,0 +1,96 @@
+# Rule 5-1 — melleafy.json must validate against melleafy.schema.json
+# Lint: melleafy-json-consistency sub-check A
+# Ref: intermediate/melleafy.schema.json
+
+description: "Rule 5-1 — melleafy.json schema validation"
+
+providers:
+  - id: exec
+    config:
+      command: "python tests/promptfoo/runners/lint_runner.py"
+
+prompts:
+  - '{{ {"lint": lint, "file": file, "subcheck": subcheck|default(null), "code": code} | dump | safe }}'
+
+defaultTest:
+  options:
+    provider: exec
+
+tests:
+  - description: "FAIL — melleafy.json missing required field source_runtime"
+    vars:
+      lint: melleafy-json-consistency
+      subcheck: "A"
+      file: melleafy.json
+      code: |
+        {
+          "format_version": "1.0",
+          "modality": "text",
+          "categories_resolved": {},
+          "declared_env_vars": [],
+          "entry_signature": "run_pipeline(query: str) -> str",
+          "pipeline_parameters": ["query"]
+        }
+    assert:
+      - type: contains
+        value: "FAIL"
+      - type: icontains
+        value: "source_runtime"
+
+  - description: "FAIL — melleafy.json has unexpected extra field"
+    vars:
+      lint: melleafy-json-consistency
+      subcheck: "A"
+      file: melleafy.json
+      code: |
+        {
+          "format_version": "1.0",
+          "source_runtime": "openclaw",
+          "modality": "text",
+          "categories_resolved": {},
+          "declared_env_vars": [],
+          "entry_signature": "run_pipeline(query: str) -> str",
+          "pipeline_parameters": ["query"],
+          "unknown_field": "should_not_be_here"
+        }
+    assert:
+      - type: contains
+        value: "FAIL"
+
+  - description: "PASS — minimal valid melleafy.json"
+    vars:
+      lint: melleafy-json-consistency
+      subcheck: "A"
+      file: melleafy.json
+      code: |
+        {
+          "format_version": "1.0",
+          "source_runtime": "openclaw",
+          "modality": "text",
+          "categories_resolved": {},
+          "declared_env_vars": [],
+          "entry_signature": "run_pipeline(query: str) -> str",
+          "pipeline_parameters": ["query"]
+        }
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "PASS — melleafy.json with env vars and categories"
+    vars:
+      lint: melleafy-json-consistency
+      subcheck: "A"
+      file: melleafy.json
+      code: |
+        {
+          "format_version": "1.0",
+          "source_runtime": "openclaw",
+          "modality": "text",
+          "categories_resolved": {"c6_tools": 2, "c7_credentials": 1},
+          "declared_env_vars": ["OPENAI_API_KEY", "SLACK_TOKEN"],
+          "entry_signature": "run_pipeline(ticket: str, priority: str) -> dict",
+          "pipeline_parameters": ["ticket", "priority"]
+        }
+    assert:
+      - type: contains
+        value: "PASS"

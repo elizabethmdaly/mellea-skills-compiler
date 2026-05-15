@@ -54,7 +54,7 @@ def mirror_companion_dirs(skill_dir: Path, package_dir: Path) -> list[str]:
 # Defaults for the LLM backend and model that compiled skills use at runtime.
 # Sourced from .claude/data/runtime_defaults.json with optional CLI overrides.
 _RUNTIME_DEFAULTS_PATH = Path(".claude/data/runtime_defaults.json")
-_RUNTIME_DEFAULTS_FALLBACK = {"backend": "ollama", "model_id": "granite3.3:8b"}
+_RUNTIME_DEFAULTS_FALLBACK = {"backend": "ollama", "model_id": "granite4.1:8b"}
 
 
 def resolve_runtime_defaults(

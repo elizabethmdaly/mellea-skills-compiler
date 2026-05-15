@@ -1,0 +1,110 @@
+# KB11 — Optional fields in P2 BaseModel must have extraction guidance in Field(description=...)
+# Lint: known-behaviours sub-check 3m
+# Ref: /how-to/enforce-structured-output
+
+description: "KB11 — Optional BaseModel fields need extraction guidance in Field(description=...)"
+
+providers:
+  - id: exec
+    config:
+      command: "python tests/promptfoo/runners/lint_runner.py"
+
+prompts:
+  - '{{ {"lint": lint, "file": file, "subcheck": subcheck|default(null), "code": code} | dump | safe }}'
+
+defaultTest:
+  options:
+    provider: exec
+
+tests:
+  - description: "FAIL — Optional field with no Field() at all"
+    vars:
+      lint: known-behaviours
+      subcheck: "3m"
+      file: schemas.py
+      code: |
+        from typing import Optional
+        from pydantic import BaseModel
+
+        class BookingIntent(BaseModel):
+            destination: str
+            departure_date: Optional[str]
+            return_date: Optional[str]
+    assert:
+      - type: contains
+        value: "FAIL"
+      - type: icontains
+        value: "description"
+
+  - description: "FAIL — Optional field with Field() but no extraction guidance keyword"
+    vars:
+      lint: known-behaviours
+      subcheck: "3m"
+      file: schemas.py
+      code: |
+        from typing import Optional
+        from pydantic import BaseModel, Field
+
+        class BookingIntent(BaseModel):
+            destination: str
+            departure_date: Optional[str] = Field(default=None, description="The departure date")
+    assert:
+      - type: contains
+        value: "FAIL"
+
+  - description: "PASS — Optional field with 'extract' guidance"
+    vars:
+      lint: known-behaviours
+      subcheck: "3m"
+      file: schemas.py
+      code: |
+        from typing import Optional
+        from pydantic import BaseModel, Field
+
+        class BookingIntent(BaseModel):
+            destination: str
+            departure_date: Optional[str] = Field(
+                default=None,
+                description="Extract the departure date if mentioned; otherwise null.",
+            )
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "PASS — Optional field with 'do not ask' guidance"
+    vars:
+      lint: known-behaviours
+      subcheck: "3m"
+      file: schemas.py
+      code: |
+        from typing import Optional
+        from pydantic import BaseModel, Field
+
+        class BookingIntent(BaseModel):
+            destination: str
+            return_date: Optional[str] = Field(
+                default=None,
+                description="Return date if the user mentioned one; do not ask for it.",
+            )
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "PASS — Optional field with 'if the' guidance"
+    vars:
+      lint: known-behaviours
+      subcheck: "3m"
+      file: schemas.py
+      code: |
+        from typing import Optional
+        from pydantic import BaseModel, Field
+
+        class SearchIntent(BaseModel):
+            query: str
+            max_results: Optional[int] = Field(
+                default=None,
+                description="Limit if the user specified a count.",
+            )
+    assert:
+      - type: contains
+        value: "PASS"

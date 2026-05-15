@@ -1,0 +1,102 @@
+# Rule 4-2 — import-soundness: every mellea.* import path must exist in mellea_api_ref.json.modules
+# Lint: import-soundness
+# Ref: /concepts/generative-functions
+
+description: "Rule 4-2 — import-soundness: no hallucinated mellea module paths"
+
+providers:
+  - id: exec
+    config:
+      command: "python tests/promptfoo/runners/lint_runner.py"
+
+prompts:
+  - '{{ {"lint": lint, "file": file, "subcheck": subcheck|default(null), "code": code, "mellea_api_ref": mellea_api_ref|default(null)} | dump | safe }}'
+
+defaultTest:
+  options:
+    provider: exec
+
+tests:
+  - description: "FAIL — shortened import path (mellea.model_options instead of mellea.backends.model_options)"
+    vars:
+      lint: import-soundness
+      file: pipeline.py
+      mellea_api_ref: |
+        {
+          "format_version": "1.0",
+          "grounding_unavailable": false,
+          "modules": {
+            "mellea.backends.model_options": {},
+            "mellea.stdlib.requirements": {},
+            "mellea.stdlib.sampling": {}
+          }
+        }
+      code: |
+        from mellea.model_options import ModelOption
+        from mellea import start_session
+
+        def run_pipeline(query: str) -> str:
+            with start_session() as m:
+                return m.instruct(query)
+    assert:
+      - type: contains
+        value: "FAIL"
+      - type: icontains
+        value: "mellea.model_options"
+
+  - description: "FAIL — entirely hallucinated submodule"
+    vars:
+      lint: import-soundness
+      file: pipeline.py
+      mellea_api_ref: |
+        {
+          "format_version": "1.0",
+          "grounding_unavailable": false,
+          "modules": {
+            "mellea.backends.model_options": {},
+            "mellea.stdlib.requirements": {},
+            "mellea.stdlib.sampling": {}
+          }
+        }
+      code: |
+        from mellea.stdlib.strategies import RepairTemplateStrategy
+    assert:
+      - type: contains
+        value: "FAIL"
+
+  - description: "PASS — correct full module path"
+    vars:
+      lint: import-soundness
+      file: pipeline.py
+      mellea_api_ref: |
+        {
+          "format_version": "1.0",
+          "grounding_unavailable": false,
+          "modules": {
+            "mellea.backends.model_options": {},
+            "mellea.stdlib.requirements": {},
+            "mellea.stdlib.sampling": {}
+          }
+        }
+      code: |
+        from mellea.backends.model_options import ModelOption
+        from mellea.stdlib.requirements import req, simple_validate
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "WARN — grounding unavailable, check skipped"
+    vars:
+      lint: import-soundness
+      file: pipeline.py
+      mellea_api_ref: |
+        {
+          "format_version": "1.0",
+          "grounding_unavailable": true,
+          "modules": {}
+        }
+      code: |
+        from mellea.stdlib.strategies import RepairTemplateStrategy
+    assert:
+      - type: icontains
+        value: "skipped"

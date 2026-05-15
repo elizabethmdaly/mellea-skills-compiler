@@ -1,8 +1,9 @@
 import importlib
+import json
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import yaml
 from rich.console import Console
@@ -52,6 +53,32 @@ def parse_spec_file(spec_path: Path) -> dict:
     return {"frontmatter": frontmatter, "body": body, "path": str(spec_path)}
 
 
+_ENTRY_SIGNATURE_NAME_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+def _entry_name_from_melleafy(pipeline_dir: Path) -> Optional[str]:
+    """Extract the entry function name from `<pkg>/melleafy.json:entry_signature`.
+
+    Returns the leading identifier of `entry_signature` (e.g. `"run_pipeline"`
+    from `"run_pipeline(session_id: str, ...) -> AssessmentReport"`), or None
+    if the manifest is absent, unreadable, missing the field, or malformed.
+    Step 5 writes this field; the manifest is the authoritative source of
+    truth for which `run_*` function is the entry point.
+    """
+    manifest = pipeline_dir / "melleafy.json"
+    if not manifest.exists():
+        return None
+    try:
+        data = json.loads(manifest.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    sig = data.get("entry_signature")
+    if not isinstance(sig, str):
+        return None
+    match = _ENTRY_SIGNATURE_NAME_RE.match(sig)
+    return match.group(1) if match else None
+
+
 # Dynamically import the pipeline from the skill directory
 def load_skill_pipeline(pipeline_dir: Path):
 
@@ -68,11 +95,30 @@ def load_skill_pipeline(pipeline_dir: Path):
         # Remove parent directory from sys.path
         sys.path.pop(0)
 
-    # Find the main entry point (run_* function).
-    # Prefer functions defined directly in pipeline.py over imported ones,
-    # since pipeline.py may import helper run_* functions from other modules
-    # (e.g., run_all_detectors from detectors.py) that aren't the entry point.
     module_name = skill_pipeline.__name__
+
+    # Tier 1 — Authoritative: melleafy.json:entry_signature names the entry.
+    # The deterministic `dir()` scan below sorts alphabetically and can pick
+    # the wrong public `run_*` helper when pipeline.py defines several (e.g.
+    # `run_phase_2_gap_analysis` sorts before `run_pipeline`). The manifest
+    # field, written by Step 5 from the typed pipeline signature, removes
+    # that ambiguity.
+    manifest_name = _entry_name_from_melleafy(pipeline_dir)
+    if manifest_name is not None:
+        fn = getattr(skill_pipeline, manifest_name, None)
+        if callable(fn) and getattr(fn, "__module__", None) == module_name:
+            return fn
+
+    # Tier 2 — Convention: every skill SHOULD have `run_pipeline` as the
+    # canonical entry name (per mellea-fy-generate.md). Try that next so
+    # older packages without melleafy.json still resolve correctly.
+    fn = getattr(skill_pipeline, "run_pipeline", None)
+    if callable(fn) and getattr(fn, "__module__", None) == module_name:
+        return fn
+
+    # Tier 3 — Legacy fallback: alphabetical `run_*` scan, preferring
+    # locally-defined functions over imported ones. Preserved for
+    # backward compat with packages that don't follow either convention.
     run_fn = None
     imported_run_fn = None
     for attr_name in dir(skill_pipeline):
@@ -86,7 +132,6 @@ def load_skill_pipeline(pipeline_dir: Path):
             elif imported_run_fn is None:
                 imported_run_fn = fn
 
-    # Fall back to an imported run_* if no locally-defined one was found
     if run_fn is None:
         run_fn = imported_run_fn
 

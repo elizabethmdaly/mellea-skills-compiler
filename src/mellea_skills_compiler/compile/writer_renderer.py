@@ -52,6 +52,12 @@ class WriterSpec:
       - "directory": writer module exposes `write(emission, dir_path) -> list[Path]`
         and the renderer wipes `output_relpath` (preserving the dir itself)
         before invoking, so the writer is the sole producer of the dir's contents.
+
+    `schema_path`, when set, points at a JSON-Schema file under `.claude/schemas/`.
+    The renderer validates the emission JSON against the schema BEFORE invoking
+    the writer, so schema-violation drift (e.g. LLM emits `fixture_id` when the
+    schema requires `id`) surfaces as a precise schema error instead of a
+    downstream `KeyError` inside the writer.
     """
 
     name: str  # human-readable label, e.g. "config.py"
@@ -59,13 +65,14 @@ class WriterSpec:
     output_relpath: str  # e.g. "config.py" or "fixtures"
     writer_path: Path  # absolute path to the .claude/melleafy/writers/*.py module
     output_kind: str = "file"  # "file" | "directory"
+    schema_path: Optional[Path] = None  # absolute path to JSON Schema; None = skip
 
 
 @dataclass
 class RenderResult:
     name: str
     status: (
-        str  # "match" | "diff" | "missing-emission" | "missing-output" | "writer-error"
+        str  # "match" | "diff" | "missing-emission" | "missing-output" | "writer-error" | "schema-invalid"
     )
     detail: Optional[str] = None
     diff_lines_added: int = 0
@@ -80,6 +87,64 @@ def _load_writer_module(writer_path: Path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _validate_against_schema(
+    emission: dict, schema_path: Path, emission_relpath: str
+) -> Optional[str]:
+    """Return None if `emission` conforms to the schema at `schema_path`, else
+    a precise human-readable error string naming the failing field and reason.
+
+    The schema files at `.claude/schemas/` use Draft 2020-12. We catch the most
+    common validation failures (unexpected key from `additionalProperties: false`,
+    missing required field, wrong type) and format the error so the message
+    points at the JSON path of the violation rather than spitting a bare class
+    name. Returning a string here causes the renderer to report verdict
+    `schema-invalid` without invoking the writer.
+    """
+    if not schema_path.exists():
+        return None  # missing schema = backward-compat skip (warn-style)
+    try:
+        schema = json.loads(schema_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"schema file {schema_path.name} could not be loaded: {exc}"
+
+    try:
+        import jsonschema
+    except ImportError:
+        # Defensive: jsonschema is a hard dep in pyproject.toml; if it's
+        # somehow missing, skip validation rather than break the compile.
+        LOGGER.warning(
+            "[writer:%s] jsonschema not installed — emission validation skipped",
+            emission_relpath,
+        )
+        return None
+
+    validator = jsonschema.Draft202012Validator(schema)
+    errors = sorted(validator.iter_errors(emission), key=lambda e: list(e.absolute_path))
+    if not errors:
+        return None
+
+    # Format up to the first 3 errors with concrete JSON paths so the LLM (and
+    # human) can locate the violations directly. More than 3 is usually one
+    # cascading shape mistake — the head gives enough signal.
+    formatted: list[str] = []
+    for err in errors[:3]:
+        path = list(err.absolute_path)
+        path_str = "$" + "".join(
+            f"[{p}]" if isinstance(p, int) else f".{p}" for p in path
+        )
+        formatted.append(f"  at {path_str}: {err.message}")
+    extra = (
+        f"\n  …and {len(errors) - 3} more validation errors"
+        if len(errors) > 3
+        else ""
+    )
+    return (
+        f"{emission_relpath} violates {schema_path.name}:\n"
+        + "\n".join(formatted)
+        + extra
+    )
 
 
 def _load_writer(writer_path: Path) -> Callable[[dict], str]:
@@ -125,6 +190,17 @@ def _render_one(package_dir: Path, spec: WriterSpec, *, enforce: bool) -> Render
             status="writer-error",
             detail=f"could not read or parse {spec.emission_relpath}: {exc}",
         )
+
+    if spec.schema_path is not None:
+        schema_error = _validate_against_schema(
+            emission, spec.schema_path, spec.emission_relpath
+        )
+        if schema_error is not None:
+            return RenderResult(
+                name=spec.name,
+                status="schema-invalid",
+                detail=schema_error,
+            )
 
     if spec.output_kind == "directory":
         return _render_directory(spec, emission, output_path, enforce=enforce)
@@ -344,6 +420,11 @@ def _log_result(result: RenderResult, *, enforce: bool) -> None:
         LOGGER.warning("[writer:%s] %s", result.name, result.detail)
     elif result.status == "writer-error":
         LOGGER.warning("[writer:%s] %s", result.name, result.detail)
+    elif result.status == "schema-invalid":
+        # Always error-level: the LLM emitted JSON that doesn't conform to the
+        # writer's contract; the writer cannot be invoked. Step 7 lints will
+        # then hard-fail on the missing rendered artifact.
+        LOGGER.error("[writer:%s] %s", result.name, result.detail)
 
 
 def default_writer_specs(repo_root) -> List[WriterSpec]:
@@ -355,12 +436,14 @@ def default_writer_specs(repo_root) -> List[WriterSpec]:
         `write(emission, out_dir) -> list[Path]`
     """
     writers_dir = repo_root / ".claude" / "melleafy" / "writers"
+    schemas_dir = repo_root / ".claude" / "schemas"
     return [
         WriterSpec(
             name="config.py",
             emission_relpath="intermediate/config_emission.json",
             output_relpath="config.py",
             writer_path=writers_dir / "config_writer.py",
+            schema_path=schemas_dir / "config_emission.schema.json",
         ),
         WriterSpec(
             name="fixtures/",
@@ -368,5 +451,6 @@ def default_writer_specs(repo_root) -> List[WriterSpec]:
             output_relpath="fixtures",
             writer_path=writers_dir / "fixtures_writer.py",
             output_kind="directory",
+            schema_path=schemas_dir / "fixtures_emission.schema.json",
         ),
     ]

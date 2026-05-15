@@ -1,0 +1,108 @@
+# Rule 4-5 — config_writer round-trip: repr() handles all quoting; no manual escaping needed
+# Lint: writer (config_writer.py round-trip correctness)
+# Ref: .claude/melleafy/writers/config_writer.py
+
+description: "Rule 4-5 — config_writer round-trip for tricky string values"
+
+providers:
+  - id: exec
+    config:
+      command: "python tests/promptfoo/runners/writer_runner.py"
+
+prompts:
+  - '{{ {"writer": writer, "emission": emission} | dump | safe }}'
+
+defaultTest:
+  options:
+    provider: exec
+
+tests:
+  - description: "PASS — plain string round-trips correctly"
+    vars:
+      writer: config_writer
+      emission: |
+        {
+          "constants": [
+            {"name": "AGENT_NAME", "value": "TicketTriageAgent", "type": "str"}
+          ]
+        }
+    assert:
+      - type: contains
+        value: "AGENT_NAME: Final[str] = 'TicketTriageAgent'"
+      - type: contains
+        value: "from typing import Final"
+
+  - description: "PASS — string with single quotes uses double-quote repr"
+    vars:
+      writer: config_writer
+      emission: |
+        {
+          "constants": [
+            {"name": "PREFIX_TEXT", "value": "You're a helpful assistant.", "type": "str"}
+          ]
+        }
+    assert:
+      - type: contains
+        value: "PREFIX_TEXT: Final[str] ="
+      - type: icontains
+        value: "you're a helpful assistant"
+
+  - description: "PASS — string with double quotes round-trips via repr()"
+    vars:
+      writer: config_writer
+      emission: |
+        {
+          "constants": [
+            {"name": "SYSTEM_MSG", "value": "Say \"hello\" to the user.", "type": "str"}
+          ]
+        }
+    assert:
+      - type: contains
+        value: "SYSTEM_MSG: Final[str] ="
+      - type: icontains
+        value: "hello"
+
+  - description: "PASS — integer constant"
+    vars:
+      writer: config_writer
+      emission: |
+        {
+          "constants": [
+            {"name": "MAX_RETRIES", "value": 3, "type": "int"}
+          ]
+        }
+    assert:
+      - type: contains
+        value: "MAX_RETRIES: Final[int] = 3"
+
+  - description: "PASS — boolean constant"
+    vars:
+      writer: config_writer
+      emission: |
+        {
+          "constants": [
+            {"name": "VERBOSE", "value": true, "type": "bool"}
+          ]
+        }
+    assert:
+      - type: contains
+        value: "VERBOSE: Final[bool] = True"
+
+  - description: "PASS — multiple constants in order"
+    vars:
+      writer: config_writer
+      emission: |
+        {
+          "constants": [
+            {"name": "AGENT_NAME", "value": "MyAgent", "type": "str"},
+            {"name": "MAX_RETRIES", "value": 3, "type": "int"},
+            {"name": "VERBOSE", "value": false, "type": "bool"}
+          ]
+        }
+    assert:
+      - type: contains
+        value: "AGENT_NAME: Final[str] = 'MyAgent'"
+      - type: contains
+        value: "MAX_RETRIES: Final[int] = 3"
+      - type: contains
+        value: "VERBOSE: Final[bool] = False"

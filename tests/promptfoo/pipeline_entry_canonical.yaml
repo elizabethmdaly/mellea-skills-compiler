@@ -1,0 +1,95 @@
+# pipeline-entry-canonical — `pipeline.py` MUST define `run_pipeline` as a
+# top-level def, and `melleafy.json:entry_signature` (when present) MUST start
+# with `run_pipeline(`.
+#
+# Empirically observed regression: nis2-navigator pipeline.py defined three
+# public run_* functions (run_phase_2_gap_analysis, run_phase_3_roadmap,
+# run_pipeline). The smoke-check loader picked the alphabetically-first one and
+# crashed when called with entry-point kwargs. This lint enforces the canonical
+# entry name so the loader (which uses melleafy.json:entry_signature as
+# authoritative) and the package agree.
+
+description: "pipeline-entry-canonical — pipeline.py must define top-level run_pipeline; melleafy.json must agree"
+
+providers:
+  - id: exec
+    config:
+      command: "python tests/promptfoo/runners/lint_runner.py"
+
+prompts:
+  - '{{ {"lint": lint, "file": file, "code": code, "entry_signature": entry_signature|default(null)} | dump | safe }}'
+
+defaultTest:
+  options:
+    provider: exec
+
+tests:
+  - description: "PASS — pipeline.py defines run_pipeline as a top-level def"
+    vars:
+      lint: pipeline-entry-canonical
+      file: pipeline.py
+      code: |
+        def run_pipeline(session_id: str, regulatory_updates: str = '') -> dict:
+            return {}
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "PASS — public run_* helpers alongside run_pipeline are allowed"
+    vars:
+      lint: pipeline-entry-canonical
+      file: pipeline.py
+      code: |
+        def run_phase_2_gap_analysis(session_id: str) -> dict:
+            return {}
+
+        def run_phase_3_roadmap(session_id: str) -> dict:
+            return {}
+
+        def run_pipeline(session_id: str, regulatory_updates: str = '') -> dict:
+            return {}
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "FAIL — no run_pipeline def (only phase helpers)"
+    vars:
+      lint: pipeline-entry-canonical
+      file: pipeline.py
+      code: |
+        def run_phase_2_gap_analysis(session_id: str) -> dict:
+            return {}
+
+        def run_phase_3_roadmap(session_id: str) -> dict:
+            return {}
+    assert:
+      - type: contains
+        value: "FAIL"
+      - type: icontains
+        value: "run_pipeline"
+
+  - description: "PASS — entry_signature agrees with run_pipeline"
+    vars:
+      lint: pipeline-entry-canonical
+      file: pipeline.py
+      entry_signature: "run_pipeline(session_id: str) -> dict"
+      code: |
+        def run_pipeline(session_id: str) -> dict:
+            return {}
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "FAIL — entry_signature names a non-canonical function"
+    vars:
+      lint: pipeline-entry-canonical
+      file: pipeline.py
+      entry_signature: "run_phase_2(session_id: str) -> dict"
+      code: |
+        def run_pipeline(session_id: str) -> dict:
+            return {}
+    assert:
+      - type: contains
+        value: "FAIL"
+      - type: icontains
+        value: "run_phase_2"

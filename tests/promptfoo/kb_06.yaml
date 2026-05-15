@@ -1,0 +1,92 @@
+# KB6 — @generative function must not use reserved parameter names
+# Lint: known-behaviours sub-check 3f
+# Ref: /concepts/generative-functions
+
+description: "KB6 — forbidden @generative parameter names"
+
+providers:
+  - id: exec
+    config:
+      command: "python tests/promptfoo/runners/lint_runner.py"
+
+prompts:
+  - '{{ {"lint": lint, "file": file, "subcheck": subcheck|default(null), "code": code} | dump | safe }}'
+
+defaultTest:
+  options:
+    provider: exec
+
+tests:
+  - description: "FAIL — parameter named 'm' (reserved)"
+    vars:
+      lint: known-behaviours
+      subcheck: "3f"
+      file: slots.py
+      code: |
+        from mellea.stdlib.sampling import generative
+
+        @generative
+        def summarise(text: str, m) -> str:
+            """Summarise the given text."""
+    assert:
+      - type: contains
+        value: "FAIL"
+      - type: icontains
+        value: "forbidden"
+
+  - description: "FAIL — parameter named 'context' (reserved)"
+    vars:
+      lint: known-behaviours
+      subcheck: "3f"
+      file: slots.py
+      code: |
+        from mellea.stdlib.sampling import generative
+
+        @generative
+        def extract_entities(text: str, context) -> str:
+            """Extract named entities."""
+    assert:
+      - type: contains
+        value: "FAIL"
+
+  - description: "FAIL — parameter named 'requirements' (reserved)"
+    vars:
+      lint: known-behaviours
+      subcheck: "3f"
+      file: slots.py
+      code: |
+        from mellea.stdlib.sampling import generative
+
+        @generative
+        def classify(text: str, requirements) -> str:
+            """Classify input."""
+    assert:
+      - type: contains
+        value: "FAIL"
+
+  - description: "PASS — clean parameter names"
+    vars:
+      lint: known-behaviours
+      subcheck: "3f"
+      file: slots.py
+      code: |
+        from mellea.stdlib.sampling import generative
+
+        @generative
+        def summarise(text: str, max_words: int = 100) -> str:
+            """Summarise the given text in at most max_words words."""
+    assert:
+      - type: contains
+        value: "PASS"
+
+  - description: "PASS — non-generative function may use reserved names"
+    vars:
+      lint: known-behaviours
+      subcheck: "3f"
+      file: slots.py
+      code: |
+        def helper(text: str, context: dict) -> str:
+            return text
+    assert:
+      - type: contains
+        value: "PASS"

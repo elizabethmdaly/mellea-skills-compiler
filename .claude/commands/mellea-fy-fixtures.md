@@ -12,7 +12,7 @@ Step 4 generates 5–8 test fixtures covering ≥3 C-categories. Fixtures are th
 
 ## CRITICAL: Input parameter matching
 
-**The keys in every fixture's `inputs` object MUST be identical to the parameter names of the `run_pipeline` function in `pipeline.py`.** This is not optional. A fixture with `{"text": "..."}` for a pipeline that expects `run_pipeline(user_query=...)` will fail at runtime with a `TypeError`. Before emitting JSON, verify the exact parameter names from the generated pipeline function. The schema cannot enforce this — it's the model's responsibility to match.
+**The keys in every fixture's `inputs` object MUST be a subset of the parameter names of the `run_pipeline` function in `pipeline.py`.** This is not optional. The smoke-check invokes `run_pipeline(**inputs)`; any extra key raises `TypeError: got an unexpected keyword argument '<key>'` at fixture-run time. Empirically observed regression: a `nis2-navigator` fixture passed `{'session_id': ..., 'regulatory_updates': ...}` to a pipeline that compiled without the matching parameter set, and the smoke-check crashed. Before emitting JSON, verify the exact parameter names from the generated pipeline function. The schema cannot enforce this — it is the model's responsibility to match. The `fixture-signature-bound` lint (Step 7) enforces this mechanically: any `inputs` key not in the entry parameter set is a hard failure. Optional/defaulted parameters MAY be omitted (subset semantics); `**kwargs` in the signature exempts a fixture from the check entirely.
 
 ---
 
