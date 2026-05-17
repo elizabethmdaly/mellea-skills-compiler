@@ -35,8 +35,23 @@ class ContextMgmtStrippingProxy(http.server.BaseHTTPRequestHandler):
         }
         h["Content-Length"] = str(len(body))
         conn = self._make_conn(300)
-        conn.request("POST", path, body=body, headers=h)
-        r = conn.getresponse()
+        try:
+            conn.request("POST", path, body=body, headers=h)
+            r = conn.getresponse()
+        except (
+            ssl.SSLError,
+            ConnectionError,
+            http.client.RemoteDisconnected,
+            TimeoutError,
+        ):
+            # Upstream TLS/socket connection dropped during request send or
+            # before producing response headers (same dual-session gateway
+            # flakiness as the IncompleteRead handler below, but at the
+            # connect/send phase rather than the mid-response stream).
+            # Return without writing anything to the downstream — the SDK
+            # sees a closed connection and retries with fresh state.
+            conn.close()
+            return
         self.send_response(r.status, r.reason)
         for hk, hv in r.getheaders():
             if hk.lower() not in {"transfer-encoding", "connection"}:
@@ -45,7 +60,30 @@ class ContextMgmtStrippingProxy(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         try:
             while True:
-                chunk = r.read(4096)
+                try:
+                    chunk = r.read(4096)
+                except http.client.IncompleteRead as exc:
+                    # Upstream gateway closed the chunked stream prematurely
+                    # (transient on the IBM LiteLLM gateway under concurrent
+                    # `claude` sessions sharing the same auth). Forward any
+                    # partial bytes we did receive, then return WITHOUT
+                    # writing the clean end-of-stream marker (`0\r\n\r\n`).
+                    # Reasoning: writing the marker would tell the Anthropic
+                    # SDK the response is complete when it isn't — silent
+                    # truncation. Returning early lets the connection close,
+                    # which surfaces a retryable transport error to the SDK
+                    # and avoids the noisy traceback we saw before this fix.
+                    if exc.partial:
+                        try:
+                            self.wfile.write(
+                                f"{len(exc.partial):X}\r\n".encode()
+                                + exc.partial
+                                + b"\r\n"
+                            )
+                            self.wfile.flush()
+                        except BrokenPipeError:
+                            pass
+                    return
                 if not chunk:
                     break
                 self.wfile.write(f"{len(chunk):X}\r\n".encode() + chunk + b"\r\n")

@@ -1,10 +1,10 @@
 # Melleafy Step 2: Element-to-Primitive Mapping
 
-**Version**: 4.1.0 | **Prereq**: `inventory.json`, `classification.json` | **Produces**: `element_mapping.json`
+**Version**: 4.2.0 | **Prereq**: `inventory.json`, `classification.json` | **Produces**: `element_mapping.json`, `expected_signature.json`
 
-> **Schema**: Output `intermediate/element_mapping.json` MUST conform to `.claude/schemas/element_mapping.schema.json`.
+> **Schema**: Output `intermediate/element_mapping.json` MUST conform to `.claude/schemas/element_mapping.schema.json`. Output `intermediate/expected_signature.json` MUST conform to `src/mellea_skills_compiler/descriptor/schemas/expected_signature.schema.json` (P3.5.D — fixture/signature alignment).
 
-Step 2 reads `inventory.json` and produces `element_mapping.json` — the routing decision for every element: which file in the generated package, which symbol, which Mellea primitive.
+Step 2 reads `inventory.json` and produces `element_mapping.json` — the routing decision for every element: which file in the generated package, which symbol, which Mellea primitive. It also emits `expected_signature.json` — the canonical `run_pipeline` I/O signature locked from this point forward (Step 4 fixtures, Step 5 descriptor emission, and the `R-SEM-SIGNATURE-MATCH` descriptor validator rule all read this artefact).
 
 **Important**: Step 2 does NOT commit dispositions for tool-dependent elements. Every `TOOL_TEMPLATE` mapping entry is provisional (`final_target_file: "pending_step_2.5"`). Step 2.5 decides `real_impl` vs `stub` vs `mock` and amends.
 
@@ -150,3 +150,86 @@ Each invocation is scoped to a single element. Output goes into `intermediate/el
 - Every `dialect_override_applied` non-null value references a real row in the detected runtime's dialect doc
 
 Failure at any check is a generation-halt error. `.melleafy-partial/` retains the intermediate artifacts for debugging.
+
+---
+
+## Output: `expected_signature.json` (P3.5.D — fixture/signature alignment)
+
+After emitting `element_mapping.json`, derive and emit `intermediate/expected_signature.json` — the canonical `run_pipeline` I/O signature. This artefact:
+
+- **Locks** the signature for Step 4 fixture generation (every fixture's `inputs` dict has keys matching `expected_signature.inputs[].name`).
+- **Constrains** Step 5 descriptor emission (the prompt inlines `expected_signature` as a HARD CONSTRAINT block — see `mellea-fy-generate.md` §"Descriptor mode").
+- **Enforces** signature parity at validation via `R-SEM-SIGNATURE-MATCH` (descriptor's `inputs`/`outputs`/`schemas` must match exactly).
+
+### Derivation rules (deterministic)
+
+Given the same inputs (`element_mapping.json`, `classification.json`, `inventory.json`, the spec text), produce the same `expected_signature.json`. The derivation:
+
+1. **`function_name`** is always `"run_pipeline"` (per Rule 3-2 in `mellea-fy-generate.md`).
+
+2. **`inputs[]`** — read in declaration order:
+   - From `classification.json:modality`, apply the modality-specific entry-point shape (`mellea-fy-generate.md` Rule R21):
+     - `synchronous_oneshot` / `streaming` / `review_gated` / `realtime_media` → user-provided params.
+     - `conversational_session` → first input is always `{name: "session_id", type: "str"}`, then user-provided params.
+     - `event_triggered` → single input `{name: "event", type: "dict"}`.
+     - `scheduled` → empty inputs list.
+     - `heartbeat` → single input `{name: "state", type: "dict"}`.
+   - For each `TOOL_INPUT` mapping entry routed to a pipeline parameter (not `loader.py`), append `{name: <target_symbol>, type: <python_type_from_inventory>}`.
+   - For each `CONVERSE` mapping entry with realisation (2) (parameter-with-default), append the parameter.
+   - If the spec is untyped or ambiguous (Rule 3-1), default `type` to `"str"`.
+
+3. **`outputs[]`** — one entry per top-level pipeline return value:
+   - For modalities returning a structured payload (`synchronous_oneshot`, `review_gated`), one entry whose `type` is the schema name from the final `m.instruct(format=Schema)` mapping entry.
+   - For `streaming`, one entry with `type: "Iterator[str]"`.
+   - For `scheduled` / `event_triggered`, an empty list (returns `None`).
+   - For `heartbeat`, one entry with `type: "dict"`.
+   - The first entry's name is conventional: `result` when the output is a primitive, otherwise snake_case of the schema name (e.g. `findings_report` for `FindingsReport`).
+
+4. **`schemas[]`** — every schema referenced by `inputs[].type` or `outputs[].type` (and transitively via field refs), produced from `SCHEMA`-tagged inventory entries:
+   - `name` is the PascalCase schema name from the inventory.
+   - `kind` is `"model"` for Pydantic models, `"enum"` for `Literal[...]` enums.
+   - `fields[]` mirrors the schema's declared fields, in declaration order.
+   - `optional` is `true` iff the schema field is annotated `Optional[T]` / `T | None` in the source.
+
+5. **`source_element_refs`** — record the `element_id` values that contributed to the signature derivation (provenance for repair-loop debugging).
+
+6. **`modality`** — copy `classification.json:modality` verbatim.
+
+### Worked example
+
+For a sentry-style code-review skill whose `classification.modality = "synchronous_oneshot"`, with one `TOOL_INPUT` element `elem_004` mapped to a `diff: str` parameter and one final `m.instruct(format=FindingsReport)` call:
+
+```json
+{
+  "format_version": "1.0",
+  "function_name": "run_pipeline",
+  "inputs": [
+    {"name": "diff", "type": "str"}
+  ],
+  "outputs": [
+    {
+      "name": "findings_report",
+      "type": "FindingsReport",
+      "schema_ref": "#/schemas/FindingsReport"
+    }
+  ],
+  "schemas": [
+    {
+      "name": "FindingsReport",
+      "kind": "model",
+      "fields": [
+        {"name": "severity", "type": "str"},
+        {"name": "issues", "type": "list[str]"}
+      ]
+    }
+  ],
+  "source_element_refs": ["elem_004", "elem_017"],
+  "modality": "synchronous_oneshot"
+}
+```
+
+### Cross-checks before Step 2 declares done (signature side)
+
+- Every `inputs[].name` and `outputs[].name` is a valid Python identifier.
+- Every schema referenced by an input/output `type` is declared under `schemas[]`.
+- The derivation is repeatable: a re-run on the same `element_mapping.json` + `classification.json` + `inventory.json` produces a byte-identical `expected_signature.json`.

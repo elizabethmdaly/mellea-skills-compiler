@@ -20,6 +20,7 @@ from mellea_skills_compiler.compile.claude_directives import (
     resolve_runtime_defaults,
     write_runtime_directive,
 )
+from mellea_skills_compiler.compile.mellea_skills import _tolerant_name_extract
 
 
 class TestDerivePackageName:
@@ -42,6 +43,27 @@ class TestDerivePackageName:
         skill_dir.mkdir()
         result = derive_package_name(skill_dir, None)
         assert result == "crewai_job_posting_mellea"
+
+    def test_dir_input_prefers_frontmatter_name_over_dir_name(self, tmp_path):
+        """When dir name and frontmatter name diverge, frontmatter wins.
+
+        This is the bug found by the eval-corpus overnight batch:
+        directories like ``0f596e5feb22/`` had spec.md frontmatter
+        ``name: coding-agent``. The wrapper used to emit
+        ``0f596e5feb22_mellea/`` while the LLM (which reads frontmatter)
+        wrote intermediate JSON to ``coding_agent_mellea/``. They must
+        agree — frontmatter is the source of truth per Rule OUT-2.
+        """
+        skill_dir = tmp_path / "0f596e5feb22"
+        skill_dir.mkdir()
+        result = derive_package_name(skill_dir, {"name": "coding-agent"})
+        assert result == "coding_agent_mellea"
+
+    def test_dir_input_falls_back_to_dir_when_frontmatter_lacks_name(self, tmp_path):
+        skill_dir = tmp_path / "my-crewai-skill"
+        skill_dir.mkdir()
+        result = derive_package_name(skill_dir, {"description": "no name field"})
+        assert result == "my_crewai_skill_mellea"
 
     def test_normalises_uppercase(self):
         result = derive_package_name(Path("/x/y/spec.md"), {"name": "WeatherSkill"})
@@ -66,6 +88,55 @@ class TestDerivePackageName:
         # fallback kicks in.
         result = derive_package_name(Path("/spec.md"), {"name": ""})
         assert result == "skill_mellea"
+
+
+class TestTolerantNameExtract:
+    """Fallback name extractor used when strict YAML parsing fails.
+
+    Real-world specs sometimes have unquoted colons / parens inside their
+    ``description:`` value (e.g. "Roles: provider (Anbieter), deployer
+    (Betreiber)"). yaml.safe_load chokes on those — but the slash command
+    is more permissive and the wrapper must agree on the package name.
+    This helper does a regex extraction of just the ``name:`` field so
+    the wrapper's package-directory choice still matches the LLM's.
+    """
+
+    def test_extracts_name_from_clean_frontmatter(self, tmp_path):
+        spec = tmp_path / "spec.md"
+        spec.write_text("---\nname: weather\ndescription: clean\n---\nbody\n")
+        assert _tolerant_name_extract(spec) == {"name": "weather"}
+
+    def test_extracts_name_when_yaml_would_fail(self, tmp_path):
+        # description contains unquoted "Roles:" which breaks strict YAML.
+        spec = tmp_path / "spec.md"
+        spec.write_text(
+            "---\n"
+            "name: eu-ai-act-classification\n"
+            "description: Classify an AI system. Roles: provider (Anbieter), deployer.\n"
+            "---\n"
+            "body\n"
+        )
+        assert _tolerant_name_extract(spec) == {"name": "eu-ai-act-classification"}
+
+    def test_strips_quotes_around_name_value(self, tmp_path):
+        spec = tmp_path / "spec.md"
+        spec.write_text("---\nname: 'quoted-name'\n---\nbody\n")
+        assert _tolerant_name_extract(spec) == {"name": "quoted-name"}
+        spec.write_text('---\nname: "double-quoted"\n---\nbody\n')
+        assert _tolerant_name_extract(spec) == {"name": "double-quoted"}
+
+    def test_returns_empty_when_no_frontmatter_block(self, tmp_path):
+        spec = tmp_path / "spec.md"
+        spec.write_text("# just a body\n\nNo frontmatter here.\n")
+        assert _tolerant_name_extract(spec) == {}
+
+    def test_returns_empty_when_frontmatter_lacks_name(self, tmp_path):
+        spec = tmp_path / "spec.md"
+        spec.write_text("---\ndescription: no name field\n---\nbody\n")
+        assert _tolerant_name_extract(spec) == {}
+
+    def test_returns_empty_for_missing_file(self, tmp_path):
+        assert _tolerant_name_extract(tmp_path / "nope.md") == {}
 
 
 class TestMirrorCompanionDirs:

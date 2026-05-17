@@ -126,45 +126,98 @@ For `mellea.stdlib.*` calls to functions **not** in the table above: if `interme
 
 ---
 
+## Severity model (format_version 1.1+)
+
+Each lint declares one of three severities. The severity controls whether a `verdict=fail` from that lint blocks the compile gate or merely surfaces as a finding.
+
+| Severity  | Gate behaviour                                                                                 | Triggers repair? |
+| --------- | ---------------------------------------------------------------------------------------------- | ---------------- |
+| `error`   | Always blocks compile (`overall_verdict = fail`).                                              | Yes              |
+| `warning` | Surfaces in the report and stdout; does NOT block compile. `--strict` promotes to `error`.     | No               |
+| `info`    | Telemetry only. Surfaces in the report; never blocks (not even under `--strict`).              | No               |
+
+### Per-lint severity classification
+
+| Lint id                                          | Severity  | Rationale                                                                                                           |
+| ------------------------------------------------ | --------- | ------------------------------------------------------------------------------------------------------------------- |
+| `parseable`                                      | `error`   | Tier 1 — handled by the slash command; classified here for consistency.                                             |
+| `import-soundness`                               | `error`   | Wrong module paths → `ImportError` at first import.                                                                 |
+| `stdlib-arity`                                   | `error`   | Wrong arity/keyword → `TypeError` on first call.                                                                    |
+| `pipeline-entry-canonical`                       | `error`   | Wrong entry name → smoke-check loader cannot find `run_pipeline`.                                                   |
+| `fixture-signature-bound`                        | `error`   | Fixture inputs don't match params → smoke-check crashes.                                                            |
+| `instruct-has-description`                       | `error`   | Missing description → `TypeError` from Mellea 0.5+.                                                                 |
+| `instruct-result-parse-before-access`            | `error`   | Accessing attrs on unparsed thunk → `AttributeError`.                                                               |
+| `generative-forbidden-params`                    | `error`   | Reserved param names → `@generative` decorator raises.                                                              |
+| `generative-call-passes-session`                 | `error`   | Missing session → `TypeError` at call time.                                                                         |
+| `validator-soundness`                            | `error`   | Malformed validators → Mellea eval fails.                                                                           |
+| `grounding-context-types`                        | `error`   | Wrong types → backend rejects.                                                                                      |
+| `format-annotation`                              | `error`   | Wrong annotation → Mellea parser fails.                                                                             |
+| `variable-safety`                                | `error`   | Undefined variable → `NameError`.                                                                                   |
+| `session-boundary`                               | `error`   | KB5 documented bug — multi-schema priming.                                                                          |
+| `bundled-asset-path-resolution`                  | `error`   | Wrong path → `FileNotFoundError` when pip-installed.                                                                |
+| `runtime-defaults-bound`                         | `error`   | Config drift → wrong model/backend at runtime.                                                                      |
+| `import-side-effects`                            | `error`   | Module-level side effects break headless import.                                                                    |
+| `fixtures-loader-contract`                       | `error`   | Missing `fixtures/__init__.py` → smoke-check loader cannot find fixtures.                                           |
+| `complex-schema-needs-strategy-or-fallback`      | `warning` | Defensive heuristic — Mellea ships a default `RejectionSamplingStrategy`; code often still works without explicit strategy. |
+| `optional-extraction-guidance`                   | `warning` | Pattern advice for extraction quality, not a runtime correctness invariant.                                         |
+| `prefix-persona`                                 | `warning` | Style guidance for persona text content.                                                                            |
+| `no-watsonx`                                     | `warning` | Project policy — not a runtime correctness issue.                                                                   |
+| `run-pipeline-params-typed`                      | `warning` | Style — requires explicit type annotations on `run_pipeline` parameters.                                            |
+| `melleafy-json-consistency`                      | `info`    | Drift detection between descriptor and rendered package — useful telemetry but the package still runs when divergent. |
+
+### Blocking failures
+
+`overall_verdict = fail` iff at least one lint has `verdict == "fail"` AND `severity == "error"`. WARNING-severity and INFO-severity `verdict=fail` entries are surfaced in the report but do NOT block. Use `--strict` to restore the pre-graduated-severity behaviour (warnings promote to blocking; info remains telemetry-only).
+
+### Escape hatch
+
+`melleafy compile <spec> --strict` and `melleafy validate <pkg> --strict` make any lint failure blocking, regardless of severity. Use this when running against a strict-compliance gate (e.g. release validation) or when you want the historical "every lint is a gate" behaviour.
+
+---
+
 ## Failure report: `intermediate/step_7_report.json`
 
 ```json
 {
-  "format_version": "1.0",
+  "format_version": "1.1",
   "checked_at": "2026-04-22T15:30:00Z",
   "package_path": "ticket_triage_mellea/",
   "overall_verdict": "fail",
+  "blocking_failures": 1,
+  "warnings": 0,
+  "info_failures": 0,
+  "strict": false,
 
-  "tier_1": {
-    "verdict": "pass",
-    "lints": [
-      { "lint_id": "parseable", "verdict": "pass", "files_checked": 12 }
-    ]
-  },
-
-  "tier_2": {
-    "verdict": "fail",
-    "lints": [
-      { "lint_id": "cross-reference", "verdict": "pass" },
-      {
-        "lint_id": "session-boundary",
-        "verdict": "fail",
-        "failures": [
-          {
-            "file": "pipeline.py",
-            "line": 45,
-            "column": 5,
-            "message": "start_session() block contains m.instruct calls with 2 distinct format types: TriageVerdict and ClaimList. Split into separate sessions (Known Behaviour 5).",
-            "kb_ref": "KB 5"
-          }
-        ]
-      }
-    ]
-  },
-
-  "tier_3": { "verdict": "skipped", "reason": "Tier 2 failed" }
+  "lints": [
+    {
+      "lint_id": "session-boundary",
+      "verdict": "fail",
+      "severity": "error",
+      "files_checked": 1,
+      "skipped_reason": null,
+      "failures": [
+        {
+          "file": "pipeline.py",
+          "line": 45,
+          "column": 5,
+          "message": "start_session() block contains m.instruct calls with 2 distinct format types: TriageVerdict and ClaimList. Split into separate sessions (Known Behaviour 5).",
+          "rule_ref": "KB 5"
+        }
+      ]
+    },
+    {
+      "lint_id": "no-watsonx",
+      "verdict": "pass",
+      "severity": "warning",
+      "files_checked": 4,
+      "skipped_reason": null,
+      "failures": []
+    }
+  ]
 }
 ```
+
+When the Python `run_lints` orchestrator emits the report it currently uses a flat `lints` array (no tier nesting) — the slash command merges its Tier 1/3 results into the same flat structure when it consumes the file. The per-lint `severity` field is normative.
 
 Every failure entry has: `file` (relative path), `line` (1-indexed), `column` (1-indexed or null), `message` (what's wrong and what to do), and optionally `kb_ref`, `spec_ref`, `suggestion`.
 

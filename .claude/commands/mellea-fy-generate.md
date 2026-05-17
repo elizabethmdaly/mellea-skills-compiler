@@ -64,6 +64,8 @@ Step 7's `bundled-asset-path-resolution` lint catches violations at validation t
 
 > **C8 backend rule**: `BACKEND` and `MODEL_ID` values are injected via the system prompt by the compile pipeline (sourced from `.claude/data/runtime_defaults.json`, with optional `--backend` / `--model-id` CLI overrides). Emit them in `config.py` exactly as instructed in the system prompt; do not invent alternatives. The Step 7 `runtime-defaults-bound` lint enforces this — divergence from the injected values is a hard failure.
 
+> **Fallback when the model does not emit `config_emission.json`**: if the slash command exits without writing `intermediate/config_emission.json` at all, the wrapper synthesises one deterministically from `intermediate/runtime_directive.json` (which the wrapper writes before the model session starts). The synthesised emission contains only the C8 `BACKEND` and `MODEL_ID` constants — enough for the deterministic writer to render a schema-compliant `config.py` and for the `runtime-defaults-bound` lint to pass. This means `runtime-defaults-bound` never fails purely because the model omitted the IR; it only fails on genuine drift between the emitted values and the injected runtime defaults. The model should still emit `config_emission.json` with the full constant set (PREFIX_TEXT, LOOP_BUDGET, etc.) — the fallback is the last line of defence, not the intended path.
+
 _JSON the model emits:_
 
 ```json
@@ -468,6 +470,53 @@ def _get_user_approval(draft: str) -> str:
 
 - `intermediate/mellea_api_ref.json` was consulted before code body generation (or `grounding_unavailable: true` was noted and KB fallback used)
 - Fixture pair examples from `<package_name>/fixtures/` (Step 4) were used as grounding context for each generated file (invariant 4)
+
+---
+
+## Descriptor mode (`--use-descriptor`)
+
+When `mellea-skills compile` was invoked with the `--use-descriptor` flag (propagated from `mellea-fy.md`'s argument parser to this sub-command), Step 5 takes a different code path. Steps 0–4 (classify, inventory, map, deps, fixtures) and Step 6 (artefacts) run identically to the default path. Step 7 (lints) also runs identically — but its role shifts from "catch LLM Python mistakes" to "catch renderer-emitted Python regressions" per plan §10.5.
+
+**Canonical Step-5 algorithm in descriptor mode** (Phase 3.5.A): the descriptor-emission prompt consumes ALL EIGHT intermediate artefacts produced by Steps 0 through 2.5, alongside the schema doc, filtered surface, and one-shot example. The descriptor must reflect those analytical decisions faithfully rather than re-derive them.
+
+The algorithm:
+
+1. Read every intermediate artefact present under `<package_name>/intermediate/`. The canonical 8-artefact set is:
+   - `classification.json` — 5-axis archetype (Step 0)
+   - `inventory.json` — element tags, C1–C9 categories, source-line refs (Step 1b)
+   - `element_mapping.json` — tag → Mellea symbol mapping (Step 2)
+   - `element_mapping_amendments.json` — Step 2.5d overrides (often supersedes the initial mapping)
+   - `dependency_plan.json` — 8-disposition dependency plan (Step 2.5c)
+   - `mellea_api_ref.json` — introspected Mellea surface, replaces/augments the bundled `surface_0.5.0.json` (Step 2.5e)
+   - `mellea_doc_index.json` — per-symbol doc-page references (Step 2.5f)
+   - `expected_signature.json` (P3.5.D — Step 2 always emits this artefact; the system prompt inlines it as a HARD CONSTRAINT block. The `R-SEM-SIGNATURE-MATCH` validator rule fires on any divergence between the descriptor's `inputs`/`outputs`/`schemas` and the locked signature. Absent only on legacy / pre-P3.5.D intermediate artefact sets — in that case the rule is non-firing) — locked I/O signature constraint
+2. Load the introspected Mellea surface from `mellea_api_ref.json` if present, else from `<repo>/melleafy-handoff/kickoff/spike-outputs/surface_0.5.0.json`.
+3. Build an `EmissionConfig` whose `intermediate_artefacts` dict carries the parsed JSON for each artefact present (keys match the artefact basenames without `.json`: `classification`, `inventory`, `element_mapping`, `element_mapping_amendments`, `dependency_plan`, `mellea_api_ref`, `mellea_doc_index`, `expected_signature`).
+4. Invoke `mellea_skills_compiler.compile.descriptor_emission.compile_via_descriptor(spec_text, surface, config=EmissionConfig(intermediate_artefacts=..., ...), write_to=<skill-root>/<package_name>/)`. This:
+   a. Builds the prompt — system block = schema doc + filtered surface (9 modules) + 1-shot example + the 8-artefact section (one `cache_control: ephemeral` breakpoint over the whole block); user block = the skill spec.
+   b. Streams from Claude (`aws/claude-sonnet-4-6`, `max_tokens=64000`) per the Phase 1 locked-in config.
+   c. Extracts the `<descriptor>...</descriptor>` JSON from the response.
+   d. Validates the descriptor against `descriptor.schema.v0.x.json` via `mellea_skills_compiler.descriptor.validator.validate()`. When `expected_signature.json` is present, P3.5.D's `R-SEM-SIGNATURE-MATCH` rule enforces the locked I/O signature.
+   e. Renders the descriptor through the Phase 2 renderer (`mellea_skills_compiler.renderer.render_descriptor` + `render_schemas` + `render_init` + `render_fixtures` + `render_melleafy_json` + `render_setup_md` + `render_readme_md`) → `pipeline.py`, `schemas.py`, `__init__.py`, `fixtures.py`, `melleafy.json`, `SETUP.md`, `README.md`, `source_map.json`.
+   f. Runs the smoke check (`py_compile` + import under dummy backend).
+5. On any sub-step failure, if `--repair-mode` was also set, the repair loop (`mellea_skills_compiler.compile.repair.compile_with_repair`) handles bounded retries (max 2 per stage) and may auto-escalate this skill to legacy by writing `<skill-root>/.melleafy-routing.json` per `melleafy-handoff/process/regression-and-extension-policy.md` §(b).
+6. Step 6 (`mellea-fy-artifacts`) and Step 7 (`mellea-fy-validate`) run as usual.
+
+**Why the 8-artefact prompt matters**: each artefact removes a decision the LLM would otherwise re-derive (and sometimes get wrong). `dependency_plan.json` carries the 8 disposition kinds; the LLM does NOT pick dispositions — it transcribes them. `element_mapping.json` + `element_mapping_amendments.json` carry the tag → symbol decisions. `classification.json` constrains the modality + interaction style. Skipping any of these means asking the LLM to learn what the analytical pipeline has already decided.
+
+**Flag mapping from `mellea-skills compile` to descriptor-mode**:
+
+| CLI flag | Descriptor-mode behaviour |
+|---|---|
+| `--use-descriptor` | Required to enter this path. |
+| `--model` / `-m` | Overrides `EmissionConfig.model` (default `aws/claude-sonnet-4-6`). |
+| `--timeout` | Not directly applicable — streaming + 64K tokens has its own per-stream behaviour. |
+| `--repair-mode` / `-r` | Switches the entry point from `compile_via_descriptor` to `compile_with_repair`. |
+| `--no-run` | Skips the smoke check (step 3f). |
+| `--refresh-cache` | Forces a P1.C cache refresh before emission. |
+| `--skill-backend` / `--skill-model` | Apply to the rendered package's runtime defaults (no compile-time effect). |
+
+When `--use-descriptor` is NOT set, this step follows the existing free-form Python emission flow below.
 
 ---
 

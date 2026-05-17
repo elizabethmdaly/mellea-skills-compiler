@@ -1,0 +1,345 @@
+{
+  "descriptor_version": "0.2",
+  "mellea_version": "0.5.0",
+  "skill": {
+    "name": "find-bugs",
+    "classification": "DSL"
+  },
+  "inputs": [
+    {
+      "name": "diff",
+      "schema": {
+        "kind": "str"
+      },
+      "description": "Full git diff of the current branch vs the default branch."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "findings",
+      "schema": {
+        "kind": "model_ref",
+        "ref": "#/schemas/FindingsReport"
+      }
+    }
+  ],
+  "schemas": {
+    "Severity": {
+      "kind": "enum",
+      "members": [
+        "Critical",
+        "High",
+        "Medium",
+        "Low"
+      ]
+    },
+    "ChecklistVerdict": {
+      "kind": "enum",
+      "members": [
+        "issue",
+        "clean",
+        "unverified"
+      ]
+    },
+    "SecurityCategory": {
+      "kind": "enum",
+      "members": [
+        "Injection",
+        "XSS",
+        "Authentication",
+        "Authorization_IDOR",
+        "CSRF",
+        "Race_conditions",
+        "Session",
+        "Cryptography",
+        "Information_disclosure",
+        "DoS",
+        "Business_logic"
+      ]
+    },
+    "ModifiedFiles": {
+      "kind": "model",
+      "fields": {
+        "files": {
+          "type": "list[str]"
+        }
+      }
+    },
+    "FileAttackSurface": {
+      "kind": "model",
+      "fields": {
+        "file_path": {
+          "type": "str"
+        },
+        "user_inputs": {
+          "type": "list[str]"
+        },
+        "db_queries": {
+          "type": "list[str]"
+        },
+        "auth_checks": {
+          "type": "list[str]"
+        },
+        "session_ops": {
+          "type": "list[str]"
+        },
+        "external_calls": {
+          "type": "list[str]"
+        },
+        "crypto_ops": {
+          "type": "list[str]"
+        }
+      }
+    },
+    "SecurityCheckResult": {
+      "kind": "model",
+      "fields": {
+        "category": {
+          "type": "enum_ref",
+          "ref": "#/schemas/SecurityCategory"
+        },
+        "verdict": {
+          "type": "enum_ref",
+          "ref": "#/schemas/ChecklistVerdict"
+        },
+        "finding": {
+          "type": "str",
+          "optional": true
+        },
+        "evidence": {
+          "type": "str",
+          "optional": true
+        }
+      }
+    },
+    "SecurityChecklist": {
+      "kind": "model",
+      "fields": {
+        "file_path": {
+          "type": "str"
+        },
+        "checks": {
+          "type": "list[SecurityCheckResult]"
+        }
+      }
+    },
+    "IssueReport": {
+      "kind": "model",
+      "fields": {
+        "file_line": {
+          "type": "str"
+        },
+        "severity": {
+          "type": "enum_ref",
+          "ref": "#/schemas/Severity"
+        },
+        "problem": {
+          "type": "str"
+        },
+        "evidence": {
+          "type": "str"
+        },
+        "fix": {
+          "type": "str"
+        },
+        "references": {
+          "type": "list[str]",
+          "optional": true
+        }
+      }
+    },
+    "VerifiedIssues": {
+      "kind": "model",
+      "fields": {
+        "file_path": {
+          "type": "str"
+        },
+        "confirmed": {
+          "type": "list[IssueReport]"
+        }
+      }
+    },
+    "FindingsReport": {
+      "kind": "model",
+      "fields": {
+        "issues": {
+          "type": "list[IssueReport]"
+        },
+        "reviewed_files": {
+          "type": "list[str]"
+        },
+        "checklist_summary": {
+          "type": "dict[str, str]"
+        },
+        "unverified_areas": {
+          "type": "list[str]"
+        }
+      }
+    }
+  },
+  "state": [
+    {
+      "id": "backend",
+      "symbol": "mellea.backends.openai.OpenAIBackend",
+      "args": {
+        "model_id": {
+          "env": "MODEL_ID"
+        }
+      }
+    },
+    {
+      "id": "session",
+      "symbol": "mellea.stdlib.session.MelleaSession",
+      "args": {
+        "backend": {
+          "ref": "backend"
+        }
+      }
+    }
+  ],
+  "pipeline": [
+    {
+      "id": "extract_files",
+      "kind": "call",
+      "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+      "bound_to": {
+        "ref": "session"
+      },
+      "args": {
+        "description": {
+          "template": "Phase 1 \u2014 From this git diff, list every modified file path.\n\n{diff}"
+        },
+        "format": {
+          "schema_ref": "#/schemas/ModifiedFiles"
+        }
+      }
+    },
+    {
+      "id": "map_attack_surface",
+      "kind": "composition",
+      "operator": "map",
+      "over": {
+        "ref": "extract_files",
+        "select": "files"
+      },
+      "item_id": "file_path",
+      "collect": "list",
+      "body": [
+        {
+          "id": "attack_surface_step",
+          "kind": "call",
+          "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+          "bound_to": {
+            "ref": "session"
+          },
+          "args": {
+            "description": {
+              "template": "Phase 2 \u2014 For file `{file_path}` in this diff, list user inputs, database queries, auth/authorization checks, session/state operations, external calls, and cryptographic operations.\n\n{diff}"
+            },
+            "format": {
+              "schema_ref": "#/schemas/FileAttackSurface"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "map_checklists",
+      "kind": "composition",
+      "operator": "map",
+      "over": {
+        "ref": "map_attack_surface"
+      },
+      "item_id": "attack_surface",
+      "collect": "list",
+      "body": [
+        {
+          "id": "checklist_step",
+          "kind": "call",
+          "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+          "bound_to": {
+            "ref": "session"
+          },
+          "args": {
+            "description": {
+              "template": "Phase 3 \u2014 Run the 11-item security checklist on file `{attack_surface.file_path}` using its attack-surface map. For every category set verdict to 'issue', 'clean', or 'unverified'. For 'issue' verdicts include finding + evidence drawn from the diff."
+            },
+            "format": {
+              "schema_ref": "#/schemas/SecurityChecklist"
+            },
+            "grounding_context": {
+              "value": {}
+            },
+            "requirements": [
+              {
+                "symbol": "mellea.stdlib.requirements.Requirement",
+                "args": {
+                  "description": {
+                    "value": "Cover every one of the 11 checklist categories \u2014 no category may be omitted."
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "map_verify",
+      "kind": "composition",
+      "operator": "map",
+      "over": {
+        "ref": "map_checklists"
+      },
+      "item_id": "checklist",
+      "collect": "list",
+      "body": [
+        {
+          "id": "verify_step",
+          "kind": "call",
+          "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+          "bound_to": {
+            "ref": "session"
+          },
+          "args": {
+            "description": {
+              "template": "Phase 4 \u2014 For file `{checklist.file_path}`, verify each 'issue' verdict in the checklist: check the diff context, ensure it isn't already handled, and only confirm issues you have HIGH confidence are real. Drop unverified ones."
+            },
+            "format": {
+              "schema_ref": "#/schemas/VerifiedIssues"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "audit",
+      "kind": "call",
+      "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+      "bound_to": {
+        "ref": "session"
+      },
+      "args": {
+        "description": {
+          "template": "Phase 5 \u2014 Pre-conclusion audit. Build the FindingsReport: gather every confirmed issue across all files, list reviewed files, summarise per-category verdict, and call out any areas you could not fully verify. Prioritise security vulnerabilities > bugs > code quality. Skip stylistic issues. If nothing significant, say so \u2014 do not invent issues."
+        },
+        "format": {
+          "schema_ref": "#/schemas/FindingsReport"
+        },
+        "requirements": [
+          {
+            "symbol": "mellea.stdlib.requirements.Requirement",
+            "args": {
+              "description": {
+                "value": "Every issue in the report must be one that was confirmed in the verification step. Do not invent new issues here."
+              }
+            }
+          }
+        ]
+      },
+      "captures": {
+        "result": "#/outputs/findings"
+      }
+    }
+  ]
+}

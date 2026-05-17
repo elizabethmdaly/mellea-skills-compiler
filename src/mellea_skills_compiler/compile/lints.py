@@ -24,13 +24,31 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Callable, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 
 _BUNDLED_DIRS = ("scripts", "references", "assets")
 _ENTRY_SIGNATURE_NAME_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 _CANONICAL_ENTRY_NAME = "run_pipeline"
+
+
+class LintSeverity(str, Enum):
+    """Severity classification for a lint.
+
+    - ``ERROR``   — failure always blocks compile and triggers repair routing.
+    - ``WARNING`` — failure surfaces in the report; does NOT block compile
+                    (unless ``--strict`` is set, see ``run_lints``).
+    - ``INFO``    — telemetry only; never blocks; not part of repair routing.
+
+    The enum subclasses ``str`` so json-serialisation in step_7_report.json
+    is trivial (the value is the literal string).
+    """
+
+    ERROR = "error"
+    WARNING = "warning"
+    INFO = "info"
 
 
 @dataclass
@@ -45,10 +63,92 @@ class LintFailure:
 @dataclass
 class LintResult:
     lint_id: str
-    verdict: str  # "pass" | "fail" | "skipped"
+    verdict: str  # "pass" | "fail" | "warning" | "skipped"
     files_checked: int = 0
     skipped_reason: Optional[str] = None
     failures: List[LintFailure] = field(default_factory=list)
+    # Severity defaults to ERROR for back-compat with any consumer that
+    # constructs a LintResult without specifying it. Real severities are
+    # injected by ``run_lints`` from ``_LINT_SEVERITY`` (centralised table).
+    severity: LintSeverity = LintSeverity.ERROR
+
+
+# verdict values that signal real issues to surface to the operator.
+# "fail" blocks the compile; "warning" is advisory and the compile continues.
+_BLOCKING_VERDICTS = frozenset({"fail"})
+_ADVISORY_VERDICTS = frozenset({"warning"})
+
+
+# ─── Severity classification table ───
+#
+# Centralised: lint functions themselves stay untouched (their pass/fail
+# detection logic is unchanged), and this single dict is what the gate
+# consults. Adding a new lint requires adding an entry here — see the
+# ``test_each_lint_has_declared_severity`` regression test.
+#
+# Classification rationale lives in `.claude/commands/mellea-fy-validate.md`
+# (severity table). Briefly:
+#   - ERROR:   wrong code → runtime crash on first execution (always blocks).
+#   - WARNING: defensive heuristic; Mellea/runtime may be resilient, or the
+#              check is project-style rather than runtime-correctness.
+#   - INFO:    drift/telemetry; never blocks even in strict mode? — yes,
+#              strict mode promotes only WARNING (project policy), not INFO.
+_LINT_SEVERITY: Dict[str, LintSeverity] = {
+    # ── ERROR: always-breaks-runtime (14) ───────────────────────────────
+    # ``parseable`` is enforced by the slash command (Tier 1) before this
+    # module runs; entry kept here so any future Python port inherits the
+    # right severity.
+    "parseable": LintSeverity.ERROR,
+    "import-soundness": LintSeverity.ERROR,
+    "stdlib-arity": LintSeverity.ERROR,
+    "pipeline-entry-canonical": LintSeverity.ERROR,
+    "fixture-signature-bound": LintSeverity.ERROR,
+    "instruct-has-description": LintSeverity.ERROR,
+    "instruct-result-parse-before-access": LintSeverity.ERROR,
+    "generative-forbidden-params": LintSeverity.ERROR,
+    "generative-call-passes-session": LintSeverity.ERROR,
+    "validator-soundness": LintSeverity.ERROR,
+    "grounding-context-types": LintSeverity.ERROR,
+    "format-annotation": LintSeverity.ERROR,
+    "variable-safety": LintSeverity.ERROR,
+    "session-boundary": LintSeverity.ERROR,
+    # ── ERROR: deployment-context-sensitive (3) ─────────────────────────
+    "bundled-asset-path-resolution": LintSeverity.ERROR,
+    "runtime-defaults-bound": LintSeverity.ERROR,
+    "import-side-effects": LintSeverity.ERROR,
+    # ``fixtures-loader-contract`` stays ERROR — missing fixtures/__init__.py
+    # is a real file-presence requirement; the smoke-check loader breaks
+    # without it.
+    "fixtures-loader-contract": LintSeverity.ERROR,
+    # ── WARNING: defensive heuristics (5) ───────────────────────────────
+    # KB2: Mellea ships a default RejectionSamplingStrategy; a complex
+    # schema without an explicit strategy/fallback often still works.
+    "complex-schema-needs-strategy-or-fallback": LintSeverity.WARNING,
+    # Pattern advice for extraction quality, not a runtime correctness
+    # invariant.
+    "optional-extraction-guidance": LintSeverity.WARNING,
+    # Persona/style guidance — never breaks runtime if absent.
+    "prefix-persona": LintSeverity.WARNING,
+    # Project policy (no watsonx backend) — not a runtime correctness issue.
+    "no-watsonx": LintSeverity.WARNING,
+    # Style: requires explicit type annotations on run_pipeline params.
+    # Pipelines work without annotations; this is for downstream tooling.
+    "run-pipeline-params-typed": LintSeverity.WARNING,
+    # ── INFO: telemetry / drift (1) ─────────────────────────────────────
+    # Descriptor↔rendered-package consistency; useful drift signal but
+    # the package can still run when this diverges.
+    "melleafy-json-consistency": LintSeverity.INFO,
+}
+
+
+def _apply_severity(result: LintResult) -> LintResult:
+    """Stamp ``result.severity`` from the central table.
+
+    Falls back to ERROR if the lint id is unknown (conservative — better
+    to block on an un-classified lint than to silently downgrade).
+    """
+    result.severity = _LINT_SEVERITY.get(result.lint_id, LintSeverity.ERROR)
+    return result
 
 
 @dataclass
@@ -57,10 +157,20 @@ class LintRunResult:
     lints: List[LintResult]
     package_path: str
     checked_at: str
+    blocking_failures: int = 0
+    warnings: int = 0
+    info_failures: int = 0
+    strict: bool = False
+    # Populated when ``run_lints(..., smoke_check="auto"|"always")`` runs.
+    smoke_check: Optional["SmokeCheckOutcome"] = None
 
     @property
     def failed(self) -> bool:
         return self.overall_verdict == "fail"
+
+    @property
+    def has_warnings(self) -> bool:
+        return any(r.verdict in _ADVISORY_VERDICTS for r in self.lints) or self.warnings > 0
 
 
 # ─── Lint: fixtures-loader-contract ───
@@ -1603,7 +1713,26 @@ def lint_no_watsonx(package_dir: Path) -> LintResult:
 # ─── Lint: optional-extraction-guidance (KB11) ───
 
 
-_EXTRACTION_KEYWORDS: Tuple[str, ...] = ("extract", "do not ask", "if the")
+# Patterns that signal an Optional field is conditional/extracted-from-context
+# rather than a question to ask the user. The bar is "does the description
+# tell the model when to leave this null?" — any of these phrasings count.
+#
+# - "extract" / "do not ask": explicit imperative directives
+# - "if " / "when ": conditional language ("if jurisdiction is Germany",
+#   "when sector is finance"). Note "if the" is a subset of "if "; we keep
+#   the broader form to catch real-world EU-regulatory phrasings like
+#   "if jurisdiction != EU-only".
+# - "only": restrictive language ("Germany only:", "only when X")
+# - "applicable": almost always appears in conditional contexts
+#   ("if applicable", "when applicable", "not-applicable")
+_EXTRACTION_KEYWORDS: Tuple[str, ...] = (
+    "extract",
+    "do not ask",
+    "if ",
+    "when ",
+    "only",
+    "applicable",
+)
 _SCHEMA_NAME_SUFFIXES: Tuple[str, ...] = ("Schema", "Intent")
 
 
@@ -1654,12 +1783,21 @@ def _collect_format_referenced_schemas(package_dir: Path) -> Set[str]:
 
 
 def lint_optional_extraction_guidance(package_dir: Path) -> LintResult:
-    """KB11: Every Optional field on a P2 schema MUST carry extraction guidance.
+    """KB11: Optional field descriptions should signal extraction-from-context
+    rather than ask-the-user.
 
     Mellea's `format=<BaseModel>` invocation asks the model to populate every
     declared field; Optional fields default to asking the user. The fix is
     to put extraction guidance into the Field description so the model
     extracts from context instead of asking.
+
+    Severity — ADVISORY (warning, does not block compile). This is a quality
+    check, not a correctness check: a missed extraction hint produces a more
+    chatty compiled skill, not a runtime failure. Keyword-based natural-
+    language detection is inherently brittle (see
+    `melleafy-handoff/analyses/2026-05-15-kb11-keyword-matching-brittleness.md`
+    for the design discussion and the structural-metadata follow-up plan),
+    so we surface findings as warnings rather than block compiles on them.
     """
     result = LintResult(lint_id="optional-extraction-guidance", verdict="pass")
 
@@ -1778,16 +1916,21 @@ def lint_optional_extraction_guidance(package_dir: Path) -> LintResult:
                         message=(
                             f"Optional field `{field_name}` on `{cls.name}`: "
                             f"`Field(description=...)` lacks extraction "
-                            f"guidance. Description must contain one of "
-                            f"'extract', 'do not ask', 'if the' (case-"
-                            f"insensitive). Current: {description!r}."
+                            f"guidance. Description should contain a "
+                            f"conditional/imperative cue like 'extract', "
+                            f"'do not ask', 'if', 'when', 'only', or "
+                            f"'applicable' (case-insensitive). Current: "
+                            f"{description!r}."
                         ),
                         rule_ref="KB11 (Optional field extraction guidance)",
                     )
                 )
 
     if result.failures:
-        result.verdict = "fail"
+        # KB11 is advisory: a missed extraction hint makes the compiled skill
+        # chattier than intended but does not crash. Emit as warning so the
+        # operator sees the finding without blocking the compile.
+        result.verdict = "warning"
     return result
 
 
@@ -2859,7 +3002,788 @@ def lint_complex_schema_needs_strategy_or_fallback(
     return result
 
 
+# ─── Lint: grounding-context-types ───
+#
+# Mellea's backend walks `m.instruct(grounding_context=...)` dict values
+# and expects each value to be a CBlock, Component, or ModelOutputThunk
+# (in practice: a string that gets wrapped). Anything else — a list,
+# a dict, a list-of-dicts produced by `[obj.model_dump() for obj in ...]`
+# — crashes at runtime with:
+#
+#     ValueError: parts should only contain CBlocks, Components, or
+#     ModelOutputThunks; found `[{'risk_id...` (type: <class 'list'>)
+#
+# The fix is to wrap every grounding_context value with `str(...)` (or use
+# a f-string) so Mellea sees a string everywhere.
+
+
+_GROUNDING_CTX_FILES: Tuple[str, ...] = (
+    "pipeline.py",
+    "slots.py",
+    "constrained_slots.py",
+)
+
+# AST node types whose VALUE is guaranteed-not-a-string at runtime. These
+# crash deterministically (the dpia-sentinel regression: a list comprehension
+# producing a list of dicts as the `risks` grounding_context entry).
+_DEFINITE_COLLECTION_NODE_TYPES: Tuple[type, ...] = (
+    ast.List,
+    ast.Dict,
+    ast.Set,
+    ast.Tuple,
+    ast.ListComp,
+    ast.DictComp,
+    ast.SetComp,
+    ast.GeneratorExp,
+)
+
+
+def _is_str_call(node: ast.AST) -> bool:
+    """True iff `node` is a `str(...)` Call expression."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name) and func.id == "str":
+        return True
+    return False
+
+
+def _grounding_value_kind(value: ast.expr) -> str:
+    """Classify a single grounding_context dict-value AST node.
+
+    Returns:
+      - "ok"          — string literal, f-string, or `str(...)` call
+      - "definite"    — guaranteed-collection type that crashes at runtime
+      - "ambiguous"   — Name / Attribute / other expression that *might* be
+                        a string at runtime but the lint can't tell
+    """
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        return "ok"
+    if isinstance(value, ast.JoinedStr):  # f-string
+        return "ok"
+    if _is_str_call(value):
+        return "ok"
+    if isinstance(value, _DEFINITE_COLLECTION_NODE_TYPES):
+        return "definite"
+    return "ambiguous"
+
+
+def lint_grounding_context_types(package_dir: Path) -> LintResult:
+    """Every `grounding_context=` dict-literal value should be a string.
+
+    Two severity tiers:
+      - **Definite collections** (literal `[...]`, `{...}`, `(...)`,
+        comprehensions) → hard `fail` — these crash deterministically at
+        `m.instruct()` runtime.
+      - **Ambiguous** (`Name`, `Attribute`, arbitrary expressions) →
+        emitted as findings but the lint verdict is `warning` (advisory).
+        These *might* be strings at runtime; the lint cannot tell. Prose
+        contract in `mellea-fy-validate.md` describes this case as warning-
+        only.
+
+    Final lint verdict:
+      - `fail` if any definite-collection violation
+      - `warning` if only ambiguous findings
+      - `pass` otherwise
+
+    Scope: pipeline.py, slots.py, constrained_slots.py.
+    """
+    result = LintResult(lint_id="grounding-context-types", verdict="pass")
+
+    files_to_check: List[Path] = []
+    for fname in _GROUNDING_CTX_FILES:
+        p = package_dir / fname
+        if p.exists():
+            files_to_check.append(p)
+    result.files_checked = len(files_to_check)
+
+    has_definite = False
+    has_ambiguous = False
+
+    for py_file in files_to_check:
+        rel = py_file.relative_to(package_dir).as_posix()
+        try:
+            tree = ast.parse(py_file.read_text(), filename=str(py_file))
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for kw in node.keywords:
+                if kw.arg != "grounding_context":
+                    continue
+                if not isinstance(kw.value, ast.Dict):
+                    continue
+                # Walk each dict value
+                for key_node, value_node in zip(kw.value.keys, kw.value.values):
+                    kind = _grounding_value_kind(value_node)
+                    if kind == "ok":
+                        continue
+                    key_label = (
+                        repr(key_node.value)
+                        if isinstance(key_node, ast.Constant)
+                        else "<dynamic-key>"
+                    )
+                    line = getattr(value_node, "lineno", None) or getattr(
+                        node, "lineno", None
+                    )
+                    column = getattr(value_node, "col_offset", None)
+                    if kind == "definite":
+                        has_definite = True
+                        result.failures.append(
+                            LintFailure(
+                                file=rel,
+                                line=line,
+                                column=column,
+                                message=(
+                                    f"grounding_context key {key_label} has a "
+                                    f"collection-literal value (list, dict, "
+                                    f"tuple, set, or comprehension). Mellea's "
+                                    f"backend walks grounding_context values "
+                                    f"and expects each to be a CBlock / "
+                                    f"Component / ModelOutputThunk — in "
+                                    f"practice, a string. Collection-literal "
+                                    f"values crash at m.instruct() with "
+                                    f"`ValueError: parts should only contain "
+                                    f"CBlocks, Components, or "
+                                    f"ModelOutputThunks; found <list>`. Fix: "
+                                    f"wrap with `str(...)`, e.g. "
+                                    f"`{key_label}: str([r.model_dump() for r "
+                                    f"in risks])`."
+                                ),
+                                rule_ref="grounding-context-types (hard, collection literal)",
+                            )
+                        )
+                    else:  # ambiguous
+                        has_ambiguous = True
+                        result.failures.append(
+                            LintFailure(
+                                file=rel,
+                                line=line,
+                                column=column,
+                                message=(
+                                    f"grounding_context key {key_label} has a "
+                                    f"non-string-literal value (Name, "
+                                    f"Attribute, or other expression). It "
+                                    f"may be a string at runtime, but the "
+                                    f"lint cannot verify. To be safe and "
+                                    f"explicit, wrap with `str(...)` — e.g. "
+                                    f"`{key_label}: str(<expr>)`."
+                                ),
+                                rule_ref="grounding-context-types (advisory, ambiguous)",
+                            )
+                        )
+
+    if has_definite:
+        result.verdict = "fail"
+    elif has_ambiguous:
+        result.verdict = "warning"
+    return result
+
+
+# ─── Lint: format-annotation ───
+#
+# Every `m.instruct(...)` call whose result is later parsed (via
+# `Model.model_validate_json(thunk.value)`, `_parse_instruct_result(thunk, Model)`,
+# or `_safe_parse_with_fallback(thunk, Model, ...)`) MUST carry a `format=`
+# keyword. Without it, the LLM returns free-form JSON-shaped text instead
+# of constrained-decoding output, and the Pydantic parse fails (or worse,
+# silently succeeds on a poorly-shaped JSON object).
+
+
+_FORMAT_ANNOTATION_FILES: Tuple[str, ...] = (
+    "pipeline.py",
+    "slots.py",
+    "constrained_slots.py",
+)
+
+
+def _instruct_call_has_format_keyword(call: ast.Call) -> bool:
+    """True iff the m.instruct call has `format=...` kwarg."""
+    return any(kw.arg == "format" for kw in call.keywords)
+
+
+def lint_format_annotation(package_dir: Path) -> LintResult:
+    """`m.instruct(...)` calls whose result is parsed must include `format=`.
+
+    Detection:
+      1. AST-parse pipeline.py / slots.py / constrained_slots.py.
+      2. For every `Call` that is `m.instruct(...)` assigned to a Name target
+         (`thunk = m.instruct(...)`), record whether it has `format=` and
+         which variable holds the result.
+      3. Walk for subsequent uses of that variable as:
+           - argument to `<Model>.model_validate_json(<thunk>.value)`
+           - first positional arg to `_parse_instruct_result(<thunk>, ...)`
+           - first positional arg to `_safe_parse_with_fallback(<thunk>, ...)`
+      4. If any such parse-use is found AND the original instruct call had
+         no `format=` kwarg → hard failure on the m.instruct call line.
+
+    Hard failure message names the variable + suggests adding `format=Model`.
+    """
+    result = LintResult(lint_id="format-annotation", verdict="pass")
+
+    files_to_check: List[Path] = []
+    for fname in _FORMAT_ANNOTATION_FILES:
+        p = package_dir / fname
+        if p.exists():
+            files_to_check.append(p)
+    result.files_checked = len(files_to_check)
+
+    for py_file in files_to_check:
+        rel = py_file.relative_to(package_dir).as_posix()
+        try:
+            tree = ast.parse(py_file.read_text(), filename=str(py_file))
+        except SyntaxError:
+            continue
+
+        # Map: thunk_var_name -> (has_format, ast.Call node)
+        instruct_assignments: dict = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            if len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            if not (
+                isinstance(node.value, ast.Call) and _is_m_instruct_call(node.value)
+            ):
+                continue
+            instruct_assignments[target.id] = (
+                _instruct_call_has_format_keyword(node.value),
+                node.value,
+            )
+
+        if not instruct_assignments:
+            continue
+
+        # Walk for parse-uses of any thunk var
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+
+            # Pattern 1: <Model>.model_validate_json(thunk.value)
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "model_validate_json"
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Attribute)
+                and node.args[0].attr == "value"
+                and isinstance(node.args[0].value, ast.Name)
+            ):
+                thunk_name = node.args[0].value.id
+                info = instruct_assignments.get(thunk_name)
+                if info and not info[0]:  # has_format is False
+                    instruct_call = info[1]
+                    result.failures.append(
+                        LintFailure(
+                            file=rel,
+                            line=getattr(instruct_call, "lineno", None),
+                            column=getattr(instruct_call, "col_offset", None),
+                            message=(
+                                f"m.instruct() result `{thunk_name}` is "
+                                f"parsed via `<Model>.model_validate_json"
+                                f"({thunk_name}.value)` but the m.instruct "
+                                f"call has no `format=` keyword. Without "
+                                f"`format=`, the model returns free-form "
+                                f"text instead of constrained-decoded JSON; "
+                                f"the parse will fail or silently produce "
+                                f"a malformed object. Fix: add "
+                                f"`format=<Model>` to the m.instruct call."
+                            ),
+                            rule_ref="format-annotation",
+                        )
+                    )
+                continue
+
+            # Patterns 2/3: _parse_instruct_result(thunk, ...) or
+            # _safe_parse_with_fallback(thunk, ...)
+            callee = (
+                func.id if isinstance(func, ast.Name)
+                else func.attr if isinstance(func, ast.Attribute)
+                else None
+            )
+            if callee not in (
+                "_parse_instruct_result",
+                "_safe_parse_with_fallback",
+            ):
+                continue
+            if not node.args:
+                continue
+            first = node.args[0]
+            if not isinstance(first, ast.Name):
+                continue
+            info = instruct_assignments.get(first.id)
+            if info and not info[0]:
+                instruct_call = info[1]
+                result.failures.append(
+                    LintFailure(
+                        file=rel,
+                        line=getattr(instruct_call, "lineno", None),
+                        column=getattr(instruct_call, "col_offset", None),
+                        message=(
+                            f"m.instruct() result `{first.id}` is parsed "
+                            f"via `{callee}({first.id}, ...)` but the "
+                            f"m.instruct call has no `format=` keyword. "
+                            f"Without `format=`, the model returns free-"
+                            f"form text and the helper's "
+                            f"`model_validate_json` call inside will fail. "
+                            f"Fix: add `format=<Model>` to the m.instruct "
+                            f"call."
+                        ),
+                        rule_ref="format-annotation",
+                    )
+                )
+
+    # Dedup by (file, line) — same instruct call may have multiple parse uses
+    seen: Set[Tuple[str, Optional[int]]] = set()
+    deduped: List[LintFailure] = []
+    for f in result.failures:
+        key = (f.file, f.line)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(f)
+    result.failures = deduped
+
+    if result.failures:
+        result.verdict = "fail"
+    return result
+
+
+# ─── Lint: variable-safety ───
+#
+# Two sub-checks per prose contract:
+#   A. No uninitialised names in except/finally blocks. Pattern:
+#        try: payload = build()
+#        except ...:
+#            log(payload)  # ← `payload` not bound before try; NameError on exception
+#      Correct pattern: bind before try (`payload = None\ntry: payload = build()`).
+#   B. No shadowing of Python builtins in function argument names. Names like
+#      `dict`, `list`, `id`, `type`, `input`, `open`, `filter`, `map` shadow
+#      stdlib calls inside the function and produce subtle correctness bugs.
+
+
+_VARIABLE_SAFETY_FILES: Tuple[str, ...] = (
+    "pipeline.py",
+    "slots.py",
+    "constrained_slots.py",
+    "requirements.py",
+    "schemas.py",
+    "tools.py",
+    "loader.py",
+    "main.py",
+)
+
+# Builtins we flag — names that are commonly mis-used as arg names AND have a
+# meaningful semantic in their shadowed form. Not exhaustive — covers the
+# patterns that have caused real bugs in compiled packages.
+_SHADOWED_BUILTINS: frozenset = frozenset({
+    "dict",
+    "list",
+    "set",
+    "tuple",
+    "str",
+    "int",
+    "float",
+    "bool",
+    "bytes",
+    "type",
+    "id",
+    "input",
+    "open",
+    "filter",
+    "map",
+    "sum",
+    "min",
+    "max",
+    "range",
+    "len",
+    "any",
+    "all",
+    "format",
+    "print",
+    "iter",
+    "next",
+    "vars",
+    "dir",
+    "hash",
+})
+
+
+def _names_bound_before(stmts: list, target_idx: int) -> set:
+    """Return the set of Name targets bound by Assigns in stmts[:target_idx].
+
+    Covers simple `Name = ...` and `Name: ann = ...` assignments. Does NOT
+    cover augmented assignments, function/class defs, imports, or with-statement
+    `as` bindings (which would expand the recall but also the implementation).
+    """
+    names: set = set()
+    for stmt in stmts[:target_idx]:
+        if isinstance(stmt, ast.Assign):
+            for t in stmt.targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            names.add(stmt.target.id)
+    return names
+
+
+def _names_bound_in_block(stmts: list) -> set:
+    """Names bound by Assign / AnnAssign anywhere in a statement list."""
+    names: set = set()
+    for stmt in stmts:
+        if isinstance(stmt, ast.Assign):
+            for t in stmt.targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            names.add(stmt.target.id)
+    return names
+
+
+def _names_referenced_in_block(stmts: list) -> set:
+    """All Name.Load references appearing within a statement list (recursive)."""
+    refs: set = set()
+    for stmt in stmts:
+        for sub in ast.walk(stmt):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                refs.add(sub.id)
+    return refs
+
+
+def lint_variable_safety(package_dir: Path) -> LintResult:
+    """Two sub-checks: uninit-in-except (A) and builtin-shadowing args (B).
+
+    Sub-check A: every Name referenced in an `except` or `finally` block of a
+    `try` must have been bound either (i) by an Assign/AnnAssign in the
+    enclosing scope BEFORE the `try` statement, or (ii) bound in the `try`
+    body somewhere (the optimistic case where the assignment happens to run
+    before the exception). The unsafe case the lint flags: a Name only ever
+    bound INSIDE the try body, referenced in except/finally, and not bound
+    before the try — NameError-on-exception.
+
+    Sub-check B: function argument names that shadow Python builtins
+    (e.g. `def f(dict, list)`) — produces subtle bugs because the shadowed
+    function can no longer be called inside the function body.
+
+    Scope: all .py files in the compiled package's top-level directory.
+    """
+    result = LintResult(lint_id="variable-safety", verdict="pass")
+
+    files_to_check: List[Path] = []
+    for fname in _VARIABLE_SAFETY_FILES:
+        p = package_dir / fname
+        if p.exists():
+            files_to_check.append(p)
+    result.files_checked = len(files_to_check)
+
+    for py_file in files_to_check:
+        rel = py_file.relative_to(package_dir).as_posix()
+        try:
+            tree = ast.parse(py_file.read_text(), filename=str(py_file))
+        except SyntaxError:
+            continue
+
+        # Sub-check B: builtin-shadowing arg names
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for arg in (
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+            ):
+                if arg.arg in _SHADOWED_BUILTINS:
+                    result.failures.append(
+                        LintFailure(
+                            file=rel,
+                            line=getattr(arg, "lineno", getattr(node, "lineno", None)),
+                            column=getattr(arg, "col_offset", None),
+                            message=(
+                                f"function `{node.name}` argument `{arg.arg}` "
+                                f"shadows the Python builtin `{arg.arg}`. "
+                                f"Inside the function, `{arg.arg}(...)` will "
+                                f"call the argument instead of the stdlib "
+                                f"function. Rename to avoid the shadow."
+                            ),
+                            rule_ref="variable-safety[B] (builtin shadowing)",
+                        )
+                    )
+
+        # Sub-check A: uninit names in except/finally
+        # Walk every scope (module, FunctionDef, AsyncFunctionDef) and locate
+        # its statement list. For each Try statement in that list, check
+        # except handlers + finalbody for refs to names not bound before the try.
+        scopes = [tree] + [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        for scope in scopes:
+            body = getattr(scope, "body", [])
+            for i, stmt in enumerate(body):
+                if not isinstance(stmt, ast.Try):
+                    continue
+                bound_before = _names_bound_before(body, i)
+                # Names bound in the try-body are "optimistically" bound for
+                # the except/finally — exception may have fired AFTER the
+                # assign. We treat them as bound to avoid false positives on
+                # the common pattern `try: x = build(); except: log(x)`.
+                bound_in_try = _names_bound_in_block(stmt.body)
+
+                for handler in stmt.handlers:
+                    refs = _names_referenced_in_block(handler.body)
+                    unsafe = refs - bound_before - bound_in_try
+                    # Filter to names that ARE assigned somewhere inside the
+                    # try (otherwise it's just a free reference, probably a
+                    # closure / global — not in scope).
+                    for name in sorted(unsafe & bound_in_try | (unsafe & _names_bound_in_block(stmt.body))):
+                        pass  # placeholder; we already computed unsafe correctly
+                    # Better: report unsafe names that have ANY usage inside try
+                    # but aren't bound BEFORE try. We've already filtered.
+                    only_in_try = unsafe & bound_in_try
+                    # Names only-in-try AND referenced in except: that's the
+                    # risky pattern. But we already let bound_in_try off the
+                    # hook above (subtracted). So unsafe here is names neither
+                    # bound before nor bound in try — those are pure free refs.
+                    # We want the OTHER set: names bound ONLY in try (not before).
+                    risky = (bound_in_try - bound_before) & refs
+                    for name in sorted(risky):
+                        result.failures.append(
+                            LintFailure(
+                                file=rel,
+                                line=getattr(handler, "lineno", None),
+                                column=getattr(handler, "col_offset", None),
+                                message=(
+                                    f"name `{name}` is referenced in an "
+                                    f"`except` block but only bound inside "
+                                    f"the `try` body. If the exception fires "
+                                    f"before the assignment, the except "
+                                    f"handler raises NameError. Fix: bind "
+                                    f"`{name} = None` (or a sentinel) BEFORE "
+                                    f"the try statement so it always exists "
+                                    f"in the except scope."
+                                ),
+                                rule_ref="variable-safety[A] (uninit-in-except)",
+                            )
+                        )
+
+                # Same for finally
+                if stmt.finalbody:
+                    refs = _names_referenced_in_block(stmt.finalbody)
+                    risky = (bound_in_try - bound_before) & refs
+                    for name in sorted(risky):
+                        result.failures.append(
+                            LintFailure(
+                                file=rel,
+                                line=getattr(stmt, "lineno", None),
+                                column=None,
+                                message=(
+                                    f"name `{name}` is referenced in a "
+                                    f"`finally` block but only bound inside "
+                                    f"the `try` body. Finally runs even on "
+                                    f"early exception; if the assignment "
+                                    f"hasn't happened yet, finally raises "
+                                    f"NameError. Fix: bind `{name}` before "
+                                    f"the try."
+                                ),
+                                rule_ref="variable-safety[A] (uninit-in-finally)",
+                            )
+                        )
+
+    if result.failures:
+        result.verdict = "fail"
+    return result
+
+
+# ─── Lint: import-side-effects ───
+#
+# No module-level Call statements outside a small allowlist. Module-level
+# calls execute at import time, which can: (a) make a package un-importable
+# if the call has side effects (network, fs, env-dependent), (b) cause
+# spec-time issues where importing a package for inspection triggers real
+# action, (c) break test isolation.
+
+
+_IMPORT_SIDE_EFFECTS_FILES: Tuple[str, ...] = (
+    "pipeline.py",
+    "slots.py",
+    "constrained_slots.py",
+    "requirements.py",
+    "schemas.py",
+    "tools.py",
+    "loader.py",
+    "main.py",
+    "config.py",
+)
+
+
+# Allowlisted module-level callables — these are documented safe per the
+# prose contract.
+_ALLOWED_TOP_LEVEL_CALL_NAMES: frozenset = frozenset({
+    "getLogger",  # logging.getLogger() — idempotent registry lookup
+    "get",        # os.environ.get(...) for config (heuristic; see below)
+    "Final",      # typing.Final (not actually a call but appears in some legacy)
+})
+
+
+def _expr_callee_chain(node: ast.expr) -> Optional[str]:
+    """Return the dotted callee chain of a Call.func, or None.
+
+    Examples:
+      `getLogger(__name__)` → "getLogger"
+      `logging.getLogger(...)` → "logging.getLogger"
+      `os.environ.get(...)` → "os.environ.get"
+    """
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        chain = node.attr
+        cur = node.value
+        while isinstance(cur, ast.Attribute):
+            chain = cur.attr + "." + chain
+            cur = cur.value
+        if isinstance(cur, ast.Name):
+            chain = cur.id + "." + chain
+        return chain
+    return None
+
+
+def _is_allowed_top_level_call(call: ast.Call) -> bool:
+    """Allowlist: logging.getLogger, os.environ.get, simple env reads."""
+    chain = _expr_callee_chain(call.func)
+    if chain is None:
+        return False
+    # bare leaf names
+    leaf = chain.rsplit(".", 1)[-1]
+    if leaf in _ALLOWED_TOP_LEVEL_CALL_NAMES:
+        return True
+    if chain in ("logging.getLogger", "os.environ.get", "os.getenv"):
+        return True
+    return False
+
+
+def lint_import_side_effects(package_dir: Path) -> LintResult:
+    """No module-level Calls outside the allowlist.
+
+    A module-level `Expr` whose value is a `Call` (e.g. `load_dotenv()` at
+    the top of a file) executes at import time. The allowlist permits:
+      - `logging.getLogger(__name__)` / bare `getLogger(...)`
+      - `os.environ.get(...)` / `os.getenv(...)`
+
+    Anything else — `load_dotenv()`, `requests.get()`, `init_database()` —
+    is a hard failure. Module-level assignments where the RHS is a Call are
+    NOT flagged (`LOGGER = logging.getLogger(__name__)` is fine because the
+    callee is allowlisted; `CONFIG = load_dotenv()` would be flagged because
+    `load_dotenv` is not allowlisted).
+    """
+    result = LintResult(lint_id="import-side-effects", verdict="pass")
+
+    files_to_check: List[Path] = []
+    for fname in _IMPORT_SIDE_EFFECTS_FILES:
+        p = package_dir / fname
+        if p.exists():
+            files_to_check.append(p)
+    result.files_checked = len(files_to_check)
+
+    for py_file in files_to_check:
+        rel = py_file.relative_to(package_dir).as_posix()
+        try:
+            tree = ast.parse(py_file.read_text(), filename=str(py_file))
+        except SyntaxError:
+            continue
+
+        for stmt in tree.body:
+            # Bare Call statement at module level
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                if _is_allowed_top_level_call(stmt.value):
+                    continue
+                chain = _expr_callee_chain(stmt.value.func) or "<unresolved>"
+                result.failures.append(
+                    LintFailure(
+                        file=rel,
+                        line=getattr(stmt, "lineno", None),
+                        column=getattr(stmt, "col_offset", None),
+                        message=(
+                            f"module-level call `{chain}(...)` executes at "
+                            f"import time. Outside the allowlist (logging."
+                            f"getLogger, os.environ.get, os.getenv), this is "
+                            f"forbidden because import-time side effects make"
+                            f" the package un-importable for inspection / "
+                            f"introduce test-order coupling / fail in non-"
+                            f"runtime contexts. Move into a function call "
+                            f"site or the run_pipeline entry."
+                        ),
+                        rule_ref="import-side-effects (R19 property 4)",
+                    )
+                )
+            # Assignment with Call RHS at module level — fail only if callee
+            # is not allowlisted. Don't flag legitimate
+            # `LOGGER = logging.getLogger(...)` patterns.
+            elif isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+                if _is_allowed_top_level_call(stmt.value):
+                    continue
+                chain = _expr_callee_chain(stmt.value.func) or "<unresolved>"
+                # Be conservative: only flag if the callee is a known
+                # side-effecting name. We don't know every name; the prose
+                # contract is permissive about safe-looking call expressions
+                # at module level. The clearly-bad set:
+                if chain in ("load_dotenv", "dotenv.load_dotenv", "requests.get",
+                             "requests.post", "urlopen", "urllib.request.urlopen"):
+                    result.failures.append(
+                        LintFailure(
+                            file=rel,
+                            line=getattr(stmt, "lineno", None),
+                            column=getattr(stmt, "col_offset", None),
+                            message=(
+                                f"module-level assignment `<var> = {chain}"
+                                f"(...)` executes the callee at import. "
+                                f"`{chain}` is known to have side effects "
+                                f"(env mutation, network I/O) and is "
+                                f"forbidden outside an explicit function "
+                                f"scope. Move the call inside `run_pipeline` "
+                                f"or another lazy entry point."
+                            ),
+                            rule_ref="import-side-effects (R19 property 4)",
+                        )
+                    )
+
+    if result.failures:
+        result.verdict = "fail"
+    return result
+
+
 # ─── Runner ───
+
+
+# Lints documented in `mellea-fy-validate.md` Tier-2 but deliberately not
+# implemented in `ALL_LINTS` — typically because they require infrastructure
+# we don't have (cross-file ref resolution graph) or are out-of-scope-for-now
+# (doc-citation depends on docs.mellea.ai fetch state). Each entry MUST
+# carry a comment explaining why it's deferred; the coverage-assertion test
+# enforces this allowlist matches what's in the prose.
+_LLM_OWNED_LINTS_ALLOWLIST: frozenset = frozenset({
+    # `cross-reference` sub-checks A-E (sub-check F is ported as
+    # `run-pipeline-params-typed`). The remaining sub-checks resolve
+    # mapping-target → generated symbol references across files, intra-
+    # package imports, tool dispatch wiring, and dead slots/requirements.
+    # Requires a cross-file ref graph; deferred for now.
+    "cross-reference",
+    # `doc-citation` reads `mellea-fy-behaviours.md` from the COMPILER repo
+    # (not the compiled package) and checks cited paths against the doc
+    # index. Scope is unusual — it validates the compiler's own behaviours
+    # doc, not the package output. Deferred until we decide whether to make
+    # this a build-time check on the compiler repo itself.
+    "doc-citation",
+    # `known-behaviours` is an umbrella in the prose; its sub-checks (KB1,
+    # KB2, KB3, KB4, KB6, KB7, KB11) are individually ported as separate
+    # lints. The umbrella ID itself never fires as its own lint.
+    "known-behaviours",
+})
 
 
 ALL_LINTS: Tuple[Callable[[Path], LintResult], ...] = (
@@ -2882,31 +3806,306 @@ ALL_LINTS: Tuple[Callable[[Path], LintResult], ...] = (
     lint_melleafy_json_consistency,
     lint_instruct_result_parse_before_access,
     lint_complex_schema_needs_strategy_or_fallback,
+    lint_grounding_context_types,
+    lint_format_annotation,
+    lint_variable_safety,
+    lint_import_side_effects,
 )
 
 
-def run_lints(package_dir: Path) -> LintRunResult:
-    """Run all implemented Step 7 structural lints; write step_7_report.json."""
-    results: List[LintResult] = [lint_fn(package_dir) for lint_fn in ALL_LINTS]
-    overall = "fail" if any(r.verdict == "fail" for r in results) else "pass"
+@dataclass
+class SmokeCheckOutcome:
+    """Outcome of the evidence-based smoke check that wraps ``run_lints``.
+
+    Stored on ``LintRunResult.smoke_check`` and serialised into
+    ``step_7_report.json`` under the top-level ``smoke_check`` key.
+    """
+
+    verdict: str  # "pass" | "fail" | "skipped"
+    fixture_used: Optional[str] = None
+    duration_seconds: Optional[float] = None
+    backend_available: bool = False
+    skipped_reason: Optional[str] = None
+    error: Optional[str] = None
+
+
+# ─── Backend detection helper (Phase 2) ───
+#
+# Mocked-out by tests via ``monkeypatch.setattr`` so we never spawn a real
+# ollama subprocess in CI.
+def _detect_backend_available(
+    timeout_seconds: float = 2.0,
+    expected_model_substring: str = "granite4.1",
+) -> Tuple[bool, Optional[str]]:
+    """Return ``(available, reason)``.
+
+    ``available`` is True iff ``ollama list`` returns within ``timeout_seconds``
+    and its output mentions ``expected_model_substring`` (default
+    ``granite4.1``). On any failure (missing binary, timeout, non-zero exit,
+    model absent), returns ``(False, <reason>)``.
+
+    This is a heuristic — the real smoke executor will surface a more
+    detailed reason if the backend is genuinely unreachable when invoked.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("ollama") is None:
+        return False, "ollama binary not found on PATH"
+    try:
+        proc = subprocess.run(
+            ["ollama", "list"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"`ollama list` timed out after {timeout_seconds}s"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"`ollama list` failed: {type(exc).__name__}: {exc}"
+    if proc.returncode != 0:
+        return False, f"`ollama list` exit code {proc.returncode}"
+    if expected_model_substring not in (proc.stdout or ""):
+        return (
+            False,
+            f"model {expected_model_substring!r} not present in `ollama list` output",
+        )
+    return True, None
+
+
+def _run_smoke_check_inline(
+    package_dir: Path,
+    *,
+    expected_model_substring: str = "granite4.1",
+) -> SmokeCheckOutcome:
+    """Run the existing fixture smoke-check infrastructure and translate
+    its verdict into the Phase 2 outcome shape.
+
+    The package's ``pipeline`` module is imported; if that fails (Tier 1
+    issue), the outcome is SKIPPED with reason ``tier_1_import_failed`` —
+    we don't claim FAIL because the parseability problem is reported
+    elsewhere.
+    """
+    backend_available, backend_reason = _detect_backend_available(
+        expected_model_substring=expected_model_substring,
+    )
+    if not backend_available:
+        return SmokeCheckOutcome(
+            verdict="skipped",
+            backend_available=False,
+            skipped_reason=backend_reason or "backend unavailable",
+        )
+
+    # Defer the import to here so callers that pass ``smoke_check="never"``
+    # don't pay the import cost.
+    try:
+        from mellea_skills_compiler.compile.smoke_check import run_smoke_check
+    except Exception as exc:  # noqa: BLE001
+        return SmokeCheckOutcome(
+            verdict="skipped",
+            backend_available=backend_available,
+            skipped_reason=f"smoke_check infrastructure import failed: {exc}",
+        )
+
+    try:
+        run_result = run_smoke_check(package_dir, all_fixtures=False)
+    except ModuleNotFoundError as exc:
+        # The package's pipeline module isn't importable — a Tier 1 issue.
+        return SmokeCheckOutcome(
+            verdict="skipped",
+            backend_available=backend_available,
+            skipped_reason="tier_1_import_failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return SmokeCheckOutcome(
+            verdict="skipped",
+            backend_available=backend_available,
+            skipped_reason="smoke_check infrastructure error",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    if not run_result.fixtures:
+        return SmokeCheckOutcome(
+            verdict="skipped",
+            backend_available=backend_available,
+            skipped_reason="no fixtures available",
+        )
+
+    first = run_result.fixtures[0]
+    if first.verdict == "passed":
+        return SmokeCheckOutcome(
+            verdict="pass",
+            fixture_used=first.fixture_id,
+            duration_seconds=first.duration_seconds,
+            backend_available=backend_available,
+        )
+    if first.verdict == "skipped":
+        return SmokeCheckOutcome(
+            verdict="skipped",
+            fixture_used=first.fixture_id,
+            duration_seconds=first.duration_seconds,
+            backend_available=backend_available,
+            skipped_reason=first.skipped_reason or "fixture skipped",
+        )
+    # failed
+    return SmokeCheckOutcome(
+        verdict="fail",
+        fixture_used=first.fixture_id,
+        duration_seconds=first.duration_seconds,
+        backend_available=backend_available,
+        error=first.failure_message,
+    )
+
+
+def run_lints(
+    package_dir: Path,
+    *,
+    strict: bool = False,
+    smoke_check: str = "never",
+) -> LintRunResult:
+    """Run all implemented Step 7 structural lints; write step_7_report.json.
+
+    Gate semantics (graduated severity, format_version 1.1):
+
+    - Each lint declares a ``severity`` in the central ``_LINT_SEVERITY`` table.
+    - ``overall_verdict`` is ``"fail"`` iff any lint with ``verdict == "fail"``
+      AND ``severity == ERROR`` is present. WARNING-severity and INFO-severity
+      failures DO NOT contribute to the overall verdict.
+    - ``strict=True`` restores the pre-graduated-severity behaviour: any
+      lint failure blocks (WARNING-severity failures are treated as ERROR
+      for gate purposes; INFO is still telemetry-only).
+    - The per-lint ``verdict`` field is unchanged so existing report
+      consumers (the slash command, the repair loop) keep working.
+
+    Evidence-based downgrade (Phase 2) — controlled by ``smoke_check``:
+
+    - ``"never"`` (default for backwards compatibility): no smoke check.
+    - ``"auto"``: run smoke check when the backend is available; if it
+      passes and only WARNING-severity lints failed, those warnings stay
+      advisory. If smoke fails on a warnings-only run, the warnings are
+      *escalated* to blocking for this run (evidence confirmed the
+      defensive lint was right).
+    - ``"always"``: same as ``auto``, but a missing backend produces
+      ``overall_verdict = "fail"`` with the smoke verdict ``"skipped"``.
+    """
+    results: List[LintResult] = [
+        _apply_severity(lint_fn(package_dir)) for lint_fn in ALL_LINTS
+    ]
+
+    blocking_failures = sum(
+        1
+        for r in results
+        if r.verdict == "fail" and r.severity == LintSeverity.ERROR
+    )
+    warnings = sum(
+        1
+        for r in results
+        if r.verdict == "fail" and r.severity == LintSeverity.WARNING
+    )
+    info_failures = sum(
+        1
+        for r in results
+        if r.verdict == "fail" and r.severity == LintSeverity.INFO
+    )
+
+    if strict:
+        # WARNING failures are promoted to blocking; INFO stays telemetry-only.
+        # (The escape hatch is for users who want the pre-refactor gate; INFO
+        # was not historically a blocking class either, so leaving it out
+        # matches the documented behaviour of ``--strict``.)
+        overall = "fail" if (blocking_failures or warnings) else "pass"
+    else:
+        overall = "fail" if blocking_failures else "pass"
+
+    # ─── Evidence-based smoke check (Phase 2) ───
+    smoke_outcome: Optional[SmokeCheckOutcome] = None
+    smoke_mode = smoke_check
+    if smoke_mode not in {"never", "auto", "always"}:
+        raise ValueError(
+            f"smoke_check must be one of {{'never', 'auto', 'always'}}, got {smoke_mode!r}"
+        )
+    escalated_warnings = False
+    if smoke_mode != "never":
+        if blocking_failures and not strict:
+            # ERROR-severity failures already block; running smoke would
+            # only confirm what we already know. Skip with a clear reason.
+            smoke_outcome = SmokeCheckOutcome(
+                verdict="skipped",
+                backend_available=False,
+                skipped_reason="error-severity lint failure(s) — smoke not run",
+            )
+        else:
+            smoke_outcome = _run_smoke_check_inline(package_dir)
+            if smoke_mode == "always" and smoke_outcome.verdict == "skipped":
+                # Caller demanded smoke; treat unavailability as a failure.
+                overall = "fail"
+            elif (
+                smoke_outcome.verdict == "fail"
+                and warnings > 0
+                and blocking_failures == 0
+                and not strict
+            ):
+                # WARNING-only failure + smoke confirmed the defensive lint
+                # was correct. Escalate to blocking for this run.
+                overall = "fail"
+                escalated_warnings = True
+
     run_result = LintRunResult(
         overall_verdict=overall,
         lints=results,
         package_path=str(package_dir),
         checked_at=datetime.now(timezone.utc).isoformat(),
+        blocking_failures=blocking_failures,
+        warnings=warnings,
+        info_failures=info_failures,
+        strict=strict,
+        smoke_check=smoke_outcome,
     )
 
     intermediate = package_dir / "intermediate"
     intermediate.mkdir(parents=True, exist_ok=True)
     report = {
-        "format_version": "1.0",
+        "format_version": "1.1",
         "checked_at": run_result.checked_at,
         "package_path": run_result.package_path,
         "overall_verdict": run_result.overall_verdict,
+        "blocking_failures": blocking_failures,
+        "warnings": warnings,
+        "info_failures": info_failures,
+        "strict": strict,
+        "smoke_check_mode": smoke_mode,
+        "warnings_escalated_by_smoke": escalated_warnings,
+        "smoke_check": (
+            {
+                "verdict": smoke_outcome.verdict,
+                "fixture_used": smoke_outcome.fixture_used,
+                "duration_seconds": smoke_outcome.duration_seconds,
+                "backend_available": smoke_outcome.backend_available,
+                "skipped_reason": smoke_outcome.skipped_reason,
+                "error": smoke_outcome.error,
+            }
+            if smoke_outcome is not None
+            else None
+        ),
         "lints": [
             {
                 "lint_id": r.lint_id,
                 "verdict": r.verdict,
+                "severity": r.severity.value,
+                # For lints downgraded by evidence (WARNING that smoke
+                # confirmed) we surface an ``effective_severity`` so
+                # consumers know which warnings were escalated to blocking
+                # for *this run*.
+                "effective_severity": (
+                    "error"
+                    if (
+                        escalated_warnings
+                        and r.verdict == "fail"
+                        and r.severity == LintSeverity.WARNING
+                    )
+                    else r.severity.value
+                ),
                 "files_checked": r.files_checked,
                 "skipped_reason": r.skipped_reason,
                 "failures": [asdict(f) for f in r.failures],

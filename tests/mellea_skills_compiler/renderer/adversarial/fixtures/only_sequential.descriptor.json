@@ -1,0 +1,54 @@
+{
+  "descriptor_version": "0.1",
+  "mellea_version": "0.5.0",
+  "skill": { "name": "only-sequential", "classification": "DSL" },
+  "inputs": [
+    { "name": "query", "schema": { "kind": "str" } }
+  ],
+  "outputs": [
+    { "name": "result", "schema": { "kind": "model_ref", "ref": "#/schemas/Echo" } }
+  ],
+  "schemas": {
+    "Echo": {
+      "kind": "model",
+      "fields": {
+        "text": { "type": "str" }
+      }
+    }
+  },
+  "state": [
+    {
+      "id": "backend",
+      "symbol": "mellea.backends.openai.OpenAIBackend",
+      "args": { "model_id": { "env": "MODEL_ID" } }
+    },
+    {
+      "id": "session",
+      "symbol": "mellea.stdlib.session.MelleaSession",
+      "args": { "backend": { "ref": "backend" } }
+    }
+  ],
+  "pipeline": [
+    {
+      "id": "first_call",
+      "kind": "call",
+      "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+      "bound_to": { "ref": "session" },
+      "args": {
+        "description": { "template": "Step 1: read query {query}" },
+        "format": { "schema_ref": "#/schemas/Echo" }
+      }
+    },
+    {
+      "id": "second_call",
+      "kind": "call",
+      "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+      "bound_to": { "ref": "session" },
+      "args": {
+        "description": { "template": "Step 2: refine {first_call.text}" },
+        "format": { "schema_ref": "#/schemas/Echo" }
+      },
+      "captures": { "result": "#/outputs/result" }
+    }
+  ]
+}

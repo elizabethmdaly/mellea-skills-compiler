@@ -15,6 +15,48 @@ from mellea_skills_compiler.toolkit.logging import configure_logger
 LOGGER = configure_logger()
 
 
+# Native Granite Guardian risks that should ALWAYS be checked, regardless of
+# what Nexus identifies for the specific use case. These target the hallucination
+# / off-topic failure modes that surface as quality bugs in compiled skills
+# (the 2026-05-15 empirical audit showed Nexus's per-use-case risk set —
+# typically harm + social_bias + jailbreak — caught zero of the hallucination
+# findings on the eu-ai-act-classification fixture).
+#
+# - `groundedness`: checks whether the model output is grounded in the
+#   provided context. Catches fabricated facts the model wasn't given input
+#   for (e.g. "Energy-Intensive Digital Services Provider" sector inferred
+#   when no sector was in the scenario).
+# - `answer_relevance`: checks whether the response addresses the actual
+#   query. Catches off-topic drift.
+#
+# Both are native dimensions in Granite Guardian (4.x and later); the
+# `guardian_prompt` is the bare tag the model recognises.
+MANDATORY_GUARDIAN_RISKS: list[NexusRisk] = [
+    NexusRisk(
+        name="Groundedness",
+        description=(
+            "Verify the response is grounded in the provided context. "
+            "Flags claims the model could not have derived from the input "
+            "(hallucinations, fabricated entities, invented citations)."
+        ),
+        guardian_prompt="groundedness",
+        is_native=True,
+        taxonomy=GovernanceTaxonomy.IBM_GRANITE_GUARDIAN,
+    ),
+    NexusRisk(
+        name="Answer Relevance",
+        description=(
+            "Verify the response addresses the actual user query rather than "
+            "drifting to adjacent topics. Flags off-topic responses and "
+            "non-answers."
+        ),
+        guardian_prompt="answer_relevance",
+        is_native=True,
+        taxonomy=GovernanceTaxonomy.IBM_GRANITE_GUARDIAN,
+    ),
+]
+
+
 def generate_policy_manifest(
     use_case: str,
     nexus,
@@ -97,6 +139,22 @@ def generate_policy_manifest(
                 )
             )
 
+    # Inject MANDATORY_GUARDIAN_RISKS (groundedness, answer_relevance) that
+    # should always be checked, regardless of Nexus's per-use-case output.
+    # Deduplicated by guardian_prompt so Nexus-identified versions of the
+    # same risk are not overwritten.
+    existing_prompts = {r.guardian_prompt for r in nexus_risks}
+    for mandatory in MANDATORY_GUARDIAN_RISKS:
+        if mandatory.guardian_prompt in existing_prompts:
+            continue
+        nexus_risks.append(mandatory)
+        all_governance_risk_names.append(mandatory.name)
+        LOGGER.info(
+            "  [Guardian] %s (native, mandatory) → %s",
+            mandatory.name,
+            mandatory.guardian_prompt,
+        )
+
     # -- 2. Use the actions which are directly linked the risks
     identified_risks_governance_actions = risk_lists.get("mixed_control_items", [])
     all_governance_actions: list[GovernanceAction] = []
@@ -151,9 +209,14 @@ def generate_policy_markdown(manifest: PolicyManifest) -> str:
             "## 1. Runtime Risk Checks (Granite Guardian)",
             "",
             "The following risks are checked at runtime on every LLM generation "
-            "via the Granite Guardian 3.3-8B model. Risk descriptions are sourced "
-            "from the IBM Granite Guardian taxonomy in AI Atlas Nexus and used as "
-            "Guardian system prompts.",
+            "via the configured Granite Guardian model (see "
+            "`mellea_skills_compiler.enums:OLLAMA_GUARDIAN_MODEL`). Risk "
+            "descriptions are sourced from the IBM Granite Guardian taxonomy "
+            "in AI Atlas Nexus, with `groundedness` and `answer_relevance` "
+            "always included as mandatory native risks for hallucination / "
+            "off-topic detection. Each native risk's `guardian_prompt` is the "
+            "bare tag (e.g. `harm`, `groundedness`); custom risks send the "
+            "full description as Guardian criteria.",
             "",
         ]
     )

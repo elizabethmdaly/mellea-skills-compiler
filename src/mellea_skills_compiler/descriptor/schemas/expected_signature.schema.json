@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://melleafy.dev/schemas/expected_signature.v1.json",
+  "title": "expected_signature",
+  "description": "Output contract for intermediate/expected_signature.json (Step 2/2.6, P3.5.D). Derived deterministically from element_mapping.json + classification.json + inventory.json by /mellea-fy-map. Consumed by Step 4 (fixture generation), Step 5 (descriptor emission — inlined as HARD CONSTRAINT), and the R-SEM-SIGNATURE-MATCH descriptor validator rule. Locks the run_pipeline I/O signature so fixtures generated before descriptor emission match the descriptor's declared inputs/outputs after emission.",
+  "type": "object",
+  "required": ["format_version", "function_name", "inputs", "outputs", "schemas"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$",
+      "description": "Format version of this signature document (e.g. '1.0'). Bumped when the on-disk shape changes."
+    },
+    "function_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The canonical entry-point function name in the generated package. Per Rule 3-2 in /mellea-fy-generate, this is always 'run_pipeline'."
+    },
+    "inputs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/signature_param" },
+      "description": "Ordered list of run_pipeline input parameters. Order matches the rendered signature."
+    },
+    "outputs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/signature_param" },
+      "description": "Ordered list of run_pipeline outputs. For modalities with a single return value, this is a length-1 list. The first entry's type forms the return annotation."
+    },
+    "schemas": {
+      "type": "array",
+      "description": "Pydantic-style schemas referenced by inputs/outputs. Each schema may also be re-declared by the descriptor under #/schemas/; the field set and types must match exactly.",
+      "items": { "$ref": "#/$defs/schema_def" }
+    },
+    "source_element_refs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Optional. Element ids from inventory.json that this signature was derived from (for provenance + debugging signature drift)."
+    },
+    "modality": {
+      "type": "string",
+      "description": "Optional. The classification.json modality this signature was derived for. Records the basis for the chosen entry-point shape (see /mellea-fy-generate Rule R21 modality table)."
+    }
+  },
+  "$defs": {
+    "signature_param": {
+      "type": "object",
+      "required": ["name", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$",
+          "description": "Python identifier. For inputs, must match the run_pipeline parameter name; for outputs, the conventional 'result' or the return-binding name (e.g. 'findings_report')."
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Python type expression as a string. Either a primitive ('str', 'int', 'float', 'bool', 'bytes', 'dict', 'list'), a parameterised generic ('list[str]', 'dict[str, int]', 'Iterator[str]', 'list[FindingReport]'), or a schema name declared under .schemas[].name. Optional types are expressed via 'T | None'."
+        },
+        "schema_ref": {
+          "type": "string",
+          "pattern": "^#/schemas/",
+          "description": "Optional. When type is a custom schema, this is the descriptor-style schema reference ('#/schemas/<SchemaName>') the renderer will emit. Must point to a schema declared under .schemas[]."
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false,
+          "description": "True iff the parameter has a default value (input) or may legally be absent (output). Inputs marked optional MAY be omitted from a fixture's inputs dict per Rule 4-1 subset semantics."
+        },
+        "description": {
+          "type": "string",
+          "description": "Optional. Human-readable description of the parameter — passed into the renderer for docstrings."
+        }
+      }
+    },
+    "schema_def": {
+      "type": "object",
+      "required": ["name", "kind"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Z][a-zA-Z0-9_]*$",
+          "description": "PascalCase schema name. Referenced by signature_param.schema_ref ('#/schemas/<name>') and re-declared on the descriptor under .schemas.<name>."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["model", "enum"],
+          "description": "Schema kind matching descriptor SchemaDef vocabulary. 'model' for Pydantic models, 'enum' for string enums."
+        },
+        "fields": {
+          "type": "array",
+          "description": "Required when kind == 'model'. Ordered list of fields the schema declares. The R-SEM-SIGNATURE-MATCH validator compares these against the descriptor's schema fields by name + type.",
+          "items": { "$ref": "#/$defs/schema_field" }
+        },
+        "members": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "description": "Required when kind == 'enum'. The string members of the enum."
+        }
+      }
+    },
+    "schema_field": {
+      "type": "object",
+      "required": ["name", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$"
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Same Python type-expression grammar as signature_param.type. May reference a schema by its bare name."
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    }
+  }
+}

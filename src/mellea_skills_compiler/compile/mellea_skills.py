@@ -82,31 +82,300 @@ def _get_spec_md_path(spec_path: Path):
     return spec_file_path
 
 
-def validate(package_dir: Path, *, no_run: bool, all_fixtures: bool) -> None:
-    """Shared implementation for the validate command and the compile auto-chain."""
+def _tolerant_name_extract(spec_path: Path) -> dict:
+    """Extract the ``name:`` field from a spec's frontmatter without strict
+    YAML parsing.
+
+    Used as a fallback when ``parse_spec_file`` raises (typically because
+    the spec's ``description:`` value contains unquoted colons / parens
+    that YAML can't disambiguate). The slash command tolerates this and
+    so must the wrapper — otherwise package-name derivation falls back to
+    the directory name and the wrapper / LLM end up writing to different
+    ``<package>_mellea/`` directories.
+
+    Returns a dict shaped like ``parse_spec_file(...).get("frontmatter")``
+    but containing only ``name`` (and only if found). Returns an empty
+    dict when no frontmatter block exists or no ``name:`` line is in it.
+    """
+    import re as _re
+
+    try:
+        text = spec_path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    match = _re.match(r"^---\s*\n(.*?)\n---\s*\n", text, _re.DOTALL)
+    if not match:
+        return {}
+    fm_block = match.group(1)
+    # Match the first top-level (un-indented) `name:` line.
+    name_match = _re.search(
+        r"^name:\s*(?P<value>.+?)\s*$", fm_block, _re.MULTILINE
+    )
+    if not name_match:
+        return {}
+    raw = name_match.group("value").strip()
+    # Strip surrounding quotes if present.
+    if (raw.startswith("'") and raw.endswith("'")) or (
+        raw.startswith('"') and raw.endswith('"')
+    ):
+        raw = raw[1:-1]
+    return {"name": raw} if raw else {}
+
+
+def _build_claude_argv(
+    *,
+    spec_path: Path,
+    model: str,
+    system_prompt: str,
+    compile_settings_path: Optional[Path],
+    repair_mode: bool,
+    use_descriptor: bool = False,
+) -> list[str]:
+    """Build the ``claude -p`` argv for the /mellea-fy compile session.
+
+    Extracted from :func:`compile` (Phase 3.5.A §3 — refactor invariant test
+    in §12.2 of the parity plan): when ``use_descriptor`` is ``False`` the
+    resulting argv MUST be byte-identical to the pre-Phase-3.5.A build. The
+    only addition for descriptor mode is appending ``--use-descriptor`` to
+    the quoted slash-command invocation (which the slash-command orchestrator
+    in ``.claude/commands/mellea-fy.md`` parses out of ``$ARGUMENTS``).
+
+    Args:
+        spec_path: Path forwarded as the slash-command argument.
+        model: Claude model id (already verified by the caller).
+        system_prompt: The wrapper's compile-time system prompt.
+        compile_settings_path: Optional per-invocation settings file.
+        repair_mode: ``True`` switches the slash command from
+            ``./mellea-fy`` to ``./mellea-fy-repair``.
+        use_descriptor: Phase 3.5.A — when ``True`` appends
+            ``--use-descriptor`` to the slash-command argument so Step 5
+            routes through descriptor IR emission + render.
+
+    Returns:
+        The argv list as it will be passed to :func:`subprocess.Popen`.
+    """
+    argv: list[str] = [
+        "claude",
+        "-p",
+        "--model",
+        f"{model}",
+        "--append-system-prompt",
+        system_prompt,
+        "--allowed-tools",
+        "Read,Write,Edit",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        "acceptEdits",
+    ]
+    if compile_settings_path is not None:
+        argv.extend(["--settings", str(compile_settings_path)])
+
+    slash_command = "./mellea-fy-repair" if repair_mode else "./mellea-fy"
+    slash_args = str(spec_path)
+    if use_descriptor:
+        slash_args = f"{slash_args} --use-descriptor"
+    argv.append(f"'{slash_command} {slash_args}'")
+    return argv
+
+
+def _spawn_claude(
+    *,
+    claude_argv: list[str],
+    subprocess_env: dict,
+    intermediate_dir: Path,
+    timeout: int,
+    processing,
+) -> None:
+    """Run the prepared ``claude -p`` subprocess and stream its output.
+
+    Extracted from :func:`compile` (Phase 3.5.A §3). Encapsulates:
+
+    * spawning the subprocess with the prepared argv + env,
+    * a background thread that captures stderr lines,
+    * the stdout streaming loop that pretty-prints assistant text and
+      persists every ``claude -p`` stream-json event to
+      ``intermediate/claude_stream.jsonl``,
+    * timeout enforcement,
+    * non-zero return-code translation to :class:`subprocess.SubprocessError`.
+
+    The caller is responsible for tearing down anything outside this helper
+    (proxy server, status spinner stop, etc.) — exceptions propagate.
+    """
+    process = None
+    try:
+        process = subprocess.Popen(
+            claude_argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=subprocess_env,
+        )
+
+        stderr_lines: list[str] = []
+
+        def read_stderr() -> None:
+            for line in iter(process.stderr.readline, ""):
+                if line:
+                    stderr_lines.append(line.strip())
+
+        stderr_thread = threading.Thread(target=read_stderr)
+        stderr_thread.daemon = True
+        stderr_thread.start()
+
+        stream_dump_path = intermediate_dir / "claude_stream.jsonl"
+        stream_dump_path.parent.mkdir(parents=True, exist_ok=True)
+        stream_dump = stream_dump_path.open("w")
+
+        start_time = time.time()
+        processing.start()
+        try:
+            while True:
+                elapsed = time.time() - start_time
+                if elapsed >= timeout:
+                    raise TimeoutError(
+                        f"Mellea-fy skill compilation failed due to timeout. "
+                        f"Process timed out after {elapsed}s (limit: {timeout}s)"
+                    )
+
+                output = process.stdout.readline()
+                if output == "" and process.poll() is not None:
+                    processing.stop()
+                    break
+
+                if output:
+                    stream_dump.write(output)
+                    stream_dump.flush()
+                    try:
+                        response = json.loads(output.strip())
+                        if response.get("type", None) == ClaudeResponseType.ASSISTANT:
+                            for message_content in response.get("message", {}).get(
+                                "content", []
+                            ):
+                                if (
+                                    message_content.get("type", None)
+                                    == ClaudeResponseMessageType.TEXT
+                                ):
+                                    console.print(
+                                        f"[cyan]{message_content.get('text', '')}[/]\n"
+                                    )
+                    except json.decoder.JSONDecodeError as e:
+                        console.print("Claude message parsing error: " + str(e))
+        finally:
+            stream_dump.close()
+
+        stderr_thread.join(timeout=1)
+        return_code = process.wait(timeout=1)
+        if return_code != 0:
+            raise subprocess.SubprocessError(
+                f"Mellea-fy skill compilation failed with return code {return_code}. "
+                f"Error: {' '.join(stderr_lines)}"
+            )
+    except Exception:
+        if process and process.poll() is None:
+            process.kill()
+            process.wait()
+        raise
+
+
+def validate(
+    package_dir: Path,
+    *,
+    no_run: bool,
+    all_fixtures: bool,
+    strict: bool = False,
+    smoke_check_mode: str = "never",
+) -> None:
+    """Shared implementation for the validate command and the compile auto-chain.
+
+    ``strict``: when True, any lint failure (regardless of severity) blocks
+    compile. Default False — only ERROR-severity lint failures block. See
+    ``.claude/commands/mellea-fy-validate.md`` for the severity table.
+
+    ``smoke_check_mode``: ``"never"`` (default — historic behaviour where
+    smoke is handled separately by ``run_smoke_check`` below the gate),
+    ``"auto"`` (in-gate smoke when backend available), or ``"always"``
+    (in-gate smoke required; failure if backend absent). The historical
+    post-lint smoke-check (`--no-run` honoured) still runs after the gate;
+    `smoke_check_mode` controls the *in-gate evidence downgrade*, which
+    is what determines whether a WARNING-only lint result can be escalated
+    by smoke evidence.
+    """
     if not package_dir.exists() or not package_dir.is_dir():
         raise Exception("Package directory does not exist: %s", package_dir)
 
-    from mellea_skills_compiler.compile.lints import run_lints
+    from mellea_skills_compiler.compile.lints import LintSeverity, run_lints
 
-    lint_result = run_lints(package_dir)
+    lint_result = run_lints(
+        package_dir, strict=strict, smoke_check=smoke_check_mode
+    )
     if lint_result.failed:
         for lint in lint_result.lints:
             if lint.verdict != "fail":
                 continue
-            LOGGER.error("[%s] %d failure(s):", lint.lint_id, len(lint.failures))
-            for failure in lint.failures:
-                location = failure.file
-                if failure.line is not None:
-                    location = f"{location}:{failure.line}"
-                LOGGER.error("  %s — %s", location, failure.message)
+            # In strict mode, surface WARNING-severity failures as errors too
+            # because they're being treated as blocking.
+            if lint.severity == LintSeverity.ERROR or strict:
+                LOGGER.error(
+                    "[%s][%s] %d failure(s):",
+                    lint.lint_id,
+                    lint.severity.value,
+                    len(lint.failures),
+                )
+                for failure in lint.failures:
+                    location = failure.file
+                    if failure.line is not None:
+                        location = f"{location}:{failure.line}"
+                    LOGGER.error("  %s — %s", location, failure.message)
         raise Exception(
             "Step 7 lints failed. Report at %s/intermediate/step_7_report.json",
             package_dir,
         )
 
+    # Surface non-blocking findings — these are now both legacy "warning"-
+    # verdict lints AND new graduated-severity WARNING/INFO failures that
+    # didn't block the gate. The operator should still see them.
+    for lint in lint_result.lints:
+        # Legacy advisory-verdict path (some lints emit verdict="warning"
+        # directly rather than verdict="fail" with WARNING severity).
+        if lint.verdict == "warning":
+            LOGGER.warning(
+                "[%s] %d advisory finding(s) (does not block compile):",
+                lint.lint_id,
+                len(lint.failures),
+            )
+            for failure in lint.failures:
+                location = failure.file
+                if failure.line is not None:
+                    location = f"{location}:{failure.line}"
+                LOGGER.warning("  %s — %s", location, failure.message)
+            continue
+        # Graduated-severity path: WARNING/INFO failures that didn't block.
+        if lint.verdict == "fail" and lint.severity != LintSeverity.ERROR:
+            log_fn = (
+                LOGGER.warning
+                if lint.severity == LintSeverity.WARNING
+                else LOGGER.info
+            )
+            log_fn(
+                "[%s][%s] %d finding(s) (does not block compile):",
+                lint.lint_id,
+                lint.severity.value,
+                len(lint.failures),
+            )
+            for failure in lint.failures:
+                location = failure.file
+                if failure.line is not None:
+                    location = f"{location}:{failure.line}"
+                log_fn("  %s — %s", location, failure.message)
+
     LOGGER.info(
-        "Step 7 structural lints passed (%d lints checked).", len(lint_result.lints)
+        "Step 7 structural lints passed (%d lints checked; %d warning(s), %d info finding(s)).",
+        len(lint_result.lints),
+        lint_result.warnings,
+        lint_result.info_failures,
     )
 
     if no_run:
@@ -151,6 +420,9 @@ def compile(
     refresh_cache: bool = False,
     skill_backend: Optional[str] = None,
     skill_model: Optional[str] = None,
+    use_descriptor: bool = False,
+    strict: bool = False,
+    smoke_check_mode: str = "never",
 ) -> None:
     # clears screen
     subprocess.call("clear")
@@ -261,11 +533,24 @@ def compile(
     # the Path(__file__).parent path-resolution invariant.
     skill_dir = spec_path if spec_path.is_dir() else spec_path.parent
     _frontmatter: dict | None = None
-    if not spec_path.is_dir() and spec_path.suffix == ".md":
+    # Locate the spec.md/SKILL.md regardless of whether the input is a file
+    # or a workspace directory. Parsing its frontmatter is what lets the
+    # wrapper's package-name choice match the slash command's choice (which
+    # always reads frontmatter). Without this step, dir-input compiles emit
+    # files into one `<dir-name>_mellea/` while the LLM writes intermediates
+    # into a different `<frontmatter-name>_mellea/`.
+    _spec_for_frontmatter = _get_spec_md_path(spec_path)
+    if _spec_for_frontmatter is not None:
         try:
-            _frontmatter = parse_spec_file(spec_path).get("frontmatter")
+            _frontmatter = parse_spec_file(_spec_for_frontmatter).get("frontmatter")
         except Exception:
-            _frontmatter = None
+            # parse_spec_file uses strict yaml.safe_load and fails on specs
+            # whose `description:` contains unquoted colons / parens. The
+            # slash command tolerates this; the wrapper must too. Fall back
+            # to a forgiving regex extraction of just the `name:` field
+            # (everything else can stay None — we only need name for the
+            # package-directory choice).
+            _frontmatter = _tolerant_name_extract(_spec_for_frontmatter)
     package_name = derive_package_name(spec_path, _frontmatter)
     package_dir = skill_dir / package_name
     try:
@@ -338,104 +623,31 @@ def compile(
         )
         compile_settings_path = None
 
-    # Start compilation process
-    process = None
-    claude_argv = [
-        "claude",
-        "-p",
-        "--model",
-        f"{model}",
-        "--append-system-prompt",
-        system_prompt,
-        "--allowed-tools",
-        "Read,Write,Edit",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--permission-mode",
-        "acceptEdits",
-    ]
-
-    if compile_settings_path is not None:
-        claude_argv.extend(["--settings", str(compile_settings_path)])
-
-    claude_argv.append(
-        f"'{"./mellea-fy-repair" if repair_mode else "./mellea-fy"} {str(spec_path)}'"
+    # Start compilation process. Both legacy and descriptor branches use the
+    # same /mellea-fy slash command via the same `_spawn_claude` helper; the
+    # `use_descriptor` flag is appended to the slash-command argument so the
+    # orchestrator routes Step 5 accordingly.
+    claude_argv = _build_claude_argv(
+        spec_path=spec_path,
+        model=model,
+        system_prompt=system_prompt,
+        compile_settings_path=compile_settings_path,
+        repair_mode=repair_mode,
+        use_descriptor=use_descriptor,
     )
 
-    # Set Mellea-fy process start time
-    start_time = time.time()
-
-    # Create processing animation
     processing = console.status(
         "[italic bold yellow]Processing...[/]", spinner_style="status.spinner"
     )
 
     try:
-        process = subprocess.Popen(
-            claude_argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            env=subprocess_env,
+        _spawn_claude(
+            claude_argv=claude_argv,
+            subprocess_env=subprocess_env,
+            intermediate_dir=intermediate_dir,
+            timeout=timeout,
+            processing=processing,
         )
-
-        stderr_lines = []
-
-        def read_stderr():
-            for line in iter(process.stderr.readline, ""):
-                if line:
-                    stderr_lines.append(line.strip())
-
-        # Thread for reading stderr
-        stderr_thread = threading.Thread(target=read_stderr)
-        stderr_thread.daemon = True
-        stderr_thread.start()
-
-        # Read stdout in main thread
-        processing.start()
-        while True:
-            elapsed = time.time() - start_time
-            if elapsed >= timeout:
-                raise TimeoutError(
-                    f"Mellea-fy skill compilation failed due to timeout. Process timed out after {elapsed}s (limit: {timeout}s)"
-                )
-
-            # Read output
-            output = process.stdout.readline()
-
-            if output == "" and process.poll() is not None:
-                processing.stop()
-                break
-
-            if output:
-                try:
-                    response = json.loads(output.strip())
-                    if response.get("type", None) == ClaudeResponseType.ASSISTANT:
-                        for message_content in response.get("message", {}).get(
-                            "content", []
-                        ):
-                            if (
-                                message_content.get("type", None)
-                                == ClaudeResponseMessageType.TEXT
-                            ):
-                                console.print(
-                                    f"[cyan]{message_content.get('text', '')}[/]\n"
-                                )
-                except json.decoder.JSONDecodeError as e:
-                    console.print("Claude message parsing error: " + str(e))
-
-        # Wait for stderr thread
-        stderr_thread.join(timeout=1)
-
-        # Print error if process failed.
-        return_code = process.wait(timeout=1)
-        if return_code != 0:
-            raise subprocess.SubprocessError(
-                f"Mellea-fy skill compilation failed with return code {return_code}. "
-                f"Error: {' '.join(stderr_lines)}"
-            )
 
         # copy spec file into the compiled directory (name may differ from frontmatter
         # because melleafy normalises hyphens → underscores per Rule OUT-2)
@@ -474,7 +686,13 @@ def compile(
             )
 
             # validate compiled skill pipeline
-            validate(mellea_dirs[0], no_run=no_run, all_fixtures=False)
+            validate(
+                mellea_dirs[0],
+                no_run=no_run,
+                all_fixtures=False,
+                strict=strict,
+                smoke_check_mode=smoke_check_mode,
+            )
 
             if spec_md_path:
                 shutil.copy(spec_md_path, mellea_dirs[0] / SpecFileFormat.SKILL_FILE_MD)
@@ -485,15 +703,9 @@ def compile(
 
     except (TimeoutError, subprocess.SubprocessError):
         processing.stop()
-        if process and process.poll() is None:
-            process.kill()
-            process.wait()
         raise
     except Exception as e:
         processing.stop()
-        if process and process.poll() is None:
-            process.kill()
-            process.wait()
         raise Exception(f"Mellea-fy skill compilation failed: {str(e)}") from e
     finally:
         proxy_server.shutdown()

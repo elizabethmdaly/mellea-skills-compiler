@@ -1,0 +1,54 @@
+{
+  "descriptor_version": "0.1",
+  "mellea_version": "0.5.0",
+  "skill": { "name": "only-retry", "classification": "DSL" },
+  "inputs": [
+    { "name": "prompt", "schema": { "kind": "str" } }
+  ],
+  "outputs": [
+    { "name": "answer", "schema": { "kind": "model_ref", "ref": "#/schemas/CheckedAnswer" } }
+  ],
+  "schemas": {
+    "CheckedAnswer": {
+      "kind": "model",
+      "fields": {
+        "text": { "type": "str" },
+        "is_valid": { "type": "bool" }
+      }
+    }
+  },
+  "state": [
+    {
+      "id": "backend",
+      "symbol": "mellea.backends.openai.OpenAIBackend",
+      "args": { "model_id": { "env": "MODEL_ID" } }
+    },
+    {
+      "id": "session",
+      "symbol": "mellea.stdlib.session.MelleaSession",
+      "args": { "backend": { "ref": "backend" } }
+    }
+  ],
+  "pipeline": [
+    {
+      "id": "retried_answer",
+      "kind": "composition",
+      "operator": "retry_with_feedback",
+      "max_attempts": 3,
+      "failure_check": { "ref": "draft_answer", "select": "is_valid" },
+      "body": [
+        {
+          "id": "draft_answer",
+          "kind": "call",
+          "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+          "bound_to": { "ref": "session" },
+          "args": {
+            "description": { "template": "Draft answer for: {prompt}" },
+            "format": { "schema_ref": "#/schemas/CheckedAnswer" }
+          }
+        }
+      ],
+      "captures": { "result": "#/outputs/answer" }
+    }
+  ]
+}

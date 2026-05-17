@@ -1,0 +1,113 @@
+{
+  "descriptor_version": "0.1",
+  "mellea_version": "0.5.0",
+  "skill": { "name": "parallel-with-inner-map", "classification": "DSL" },
+  "inputs": [
+    { "name": "query", "schema": { "kind": "str" } }
+  ],
+  "outputs": [
+    { "name": "report", "schema": { "kind": "model_ref", "ref": "#/schemas/Report" } }
+  ],
+  "schemas": {
+    "ItemList": {
+      "kind": "model",
+      "fields": {
+        "items": { "type": "list[str]" }
+      }
+    },
+    "ItemSummary": {
+      "kind": "model",
+      "fields": {
+        "summary": { "type": "str" }
+      }
+    },
+    "Snapshot": {
+      "kind": "model",
+      "fields": {
+        "text": { "type": "str" }
+      }
+    },
+    "Report": {
+      "kind": "model",
+      "fields": {
+        "combined": { "type": "str" }
+      }
+    }
+  },
+  "state": [
+    {
+      "id": "backend",
+      "symbol": "mellea.backends.openai.OpenAIBackend",
+      "args": { "model_id": { "env": "MODEL_ID" } }
+    },
+    {
+      "id": "session",
+      "symbol": "mellea.stdlib.session.MelleaSession",
+      "args": { "backend": { "ref": "backend" } }
+    }
+  ],
+  "pipeline": [
+    {
+      "id": "enumerate_items",
+      "kind": "call",
+      "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+      "bound_to": { "ref": "session" },
+      "args": {
+        "description": { "template": "Enumerate items for: {query}" },
+        "format": { "schema_ref": "#/schemas/ItemList" }
+      }
+    },
+    {
+      "id": "fanout",
+      "kind": "composition",
+      "operator": "parallel",
+      "branches": [
+        [
+          {
+            "id": "per_item_summary",
+            "kind": "composition",
+            "operator": "map",
+            "over": { "ref": "enumerate_items", "select": "items" },
+            "item_id": "item",
+            "collect": "list",
+            "body": [
+              {
+                "id": "summarise_item",
+                "kind": "call",
+                "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+                "bound_to": { "ref": "session" },
+                "args": {
+                  "description": { "template": "Summarise item {item}" },
+                  "format": { "schema_ref": "#/schemas/ItemSummary" }
+                }
+              }
+            ]
+          }
+        ],
+        [
+          {
+            "id": "snapshot",
+            "kind": "call",
+            "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+            "bound_to": { "ref": "session" },
+            "args": {
+              "description": { "template": "Take a snapshot for: {query}" },
+              "format": { "schema_ref": "#/schemas/Snapshot" }
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "merge",
+      "kind": "call",
+      "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+      "bound_to": { "ref": "session" },
+      "args": {
+        "description": { "template": "Merge findings for: {query}" },
+        "format": { "schema_ref": "#/schemas/Report" }
+      },
+      "captures": { "result": "#/outputs/report" }
+    }
+  ]
+}

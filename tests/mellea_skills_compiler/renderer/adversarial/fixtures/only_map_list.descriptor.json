@@ -1,0 +1,71 @@
+{
+  "descriptor_version": "0.1",
+  "mellea_version": "0.5.0",
+  "skill": { "name": "only-map-list", "classification": "DSL" },
+  "inputs": [
+    { "name": "query", "schema": { "kind": "str" } }
+  ],
+  "outputs": [
+    { "name": "results", "schema": { "kind": "list", "of": { "ref": "#/schemas/ItemReport" } } }
+  ],
+  "schemas": {
+    "ItemList": {
+      "kind": "model",
+      "fields": {
+        "items": { "type": "list[str]" }
+      }
+    },
+    "ItemReport": {
+      "kind": "model",
+      "fields": {
+        "name": { "type": "str" },
+        "summary": { "type": "str" }
+      }
+    }
+  },
+  "state": [
+    {
+      "id": "backend",
+      "symbol": "mellea.backends.openai.OpenAIBackend",
+      "args": { "model_id": { "env": "MODEL_ID" } }
+    },
+    {
+      "id": "session",
+      "symbol": "mellea.stdlib.session.MelleaSession",
+      "args": { "backend": { "ref": "backend" } }
+    }
+  ],
+  "pipeline": [
+    {
+      "id": "list_items",
+      "kind": "call",
+      "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+      "bound_to": { "ref": "session" },
+      "args": {
+        "description": { "template": "Enumerate items relevant to: {query}" },
+        "format": { "schema_ref": "#/schemas/ItemList" }
+      }
+    },
+    {
+      "id": "per_item_reports",
+      "kind": "composition",
+      "operator": "map",
+      "over": { "ref": "list_items", "select": "items" },
+      "item_id": "item",
+      "collect": "list",
+      "body": [
+        {
+          "id": "report_step",
+          "kind": "call",
+          "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+          "bound_to": { "ref": "session" },
+          "args": {
+            "description": { "template": "Summarise item {item}" },
+            "format": { "schema_ref": "#/schemas/ItemReport" }
+          }
+        }
+      ],
+      "captures": { "result": "#/outputs/results" }
+    }
+  ]
+}

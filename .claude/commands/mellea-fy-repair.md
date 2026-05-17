@@ -169,6 +169,8 @@ Assess body completeness of `pipeline.py`. A Step 3 skeleton has empty bodies (`
 
 **Partial (lint failures present)**: if `overall_verdict` is `"fail"`, extract the failing lint IDs and their messages from the report — these are needed for Phase 3 repair routing.
 
+**Severity-aware routing (format_version ≥ 1.1)**: `overall_verdict` already accounts for severity — it is `"fail"` only when at least one `error`-severity lint fails. Repair routing considers ONLY `error`-severity failures from the `lints` array (each entry now carries a `severity` field: `"error"`, `"warning"`, or `"info"`). `warning` and `info` failures are advisory; they are surfaced in the report but do NOT trigger automated repair attempts. See `mellea-fy-validate.md` for the per-lint severity table.
+
 ---
 
 ## Phase 3: Resume point determination and repair routing
@@ -192,7 +194,7 @@ After auditing all steps, compute the **first non-valid step** — that is the r
 
 ### Step 7 lint-specific repair routing
 
-Read `step_7_report.json` to determine which lints failed, then apply:
+Read `step_7_report.json` to determine which lints failed. **Filter to `severity == "error"` entries only** — `warning`/`info` failures never trigger repair, even when present. Then apply:
 
 | Lint failure type                                                                                                                                                                                                                    | Action                                                                                                                                                                                    |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -202,6 +204,19 @@ Read `step_7_report.json` to determine which lints failed, then apply:
 | `category-specific`                                                                                                                                                                                                                  | Cannot auto-repair — halt immediately. Report exact files and secrets/credential patterns found; these require manual inspection                                                          |
 | Tier 3 `melleafy-json-consistency`                                                                                                                                                                                                   | Resume at Step 6 — regenerate `melleafy.json` and related artifacts; pass exact consistency sub-check failures as context to `/mellea-fy-artifacts`                                       |
 | `timed_out` lints                                                                                                                                                                                                                    | Re-run `/mellea-fy-validate` once; if the same lint times out again, treat as a halt                                                                                                      |
+
+### Per-lint fix prescriptions (F1, forward reference)
+
+When `step_7_report.json` is read for repair routing, the repair loop also calls `compile.repair_templates.get_repair_template(lint_id, failure, package_dir=...)` per failure. The returned markdown (if any) is appended to the Claude repair prompt under a "Per-lint fix prescriptions" section. Lints without a registered template fall back to the generic repair prompt above.
+
+Wave 1 templates (live in `src/mellea_skills_compiler/compile/repair_templates.py`):
+
+- `runtime-defaults-bound`
+- `bundled-asset-path-resolution`
+- `stdlib-arity` (interpolates the canonical signature from `intermediate/mellea_api_ref.json`)
+- `instruct-result-parse-before-access`
+
+Note: the template module is in place but the orchestrator wiring that actually appends the prescriptions to the repair prompt is a separate task (F1 integration). Until that lands, this slash command's behaviour is unchanged — the templates exist only as a callable Python API.
 
 ### Partial artifact handling
 

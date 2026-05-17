@@ -1,0 +1,98 @@
+{
+  "descriptor_version": "0.1",
+  "mellea_version": "0.5.0",
+  "skill": { "name": "only-branch", "classification": "DSL" },
+  "inputs": [
+    { "name": "query", "schema": { "kind": "str" } }
+  ],
+  "outputs": [
+    { "name": "result", "schema": { "kind": "model_ref", "ref": "#/schemas/Response" } }
+  ],
+  "schemas": {
+    "TriageKind": {
+      "kind": "enum",
+      "members": ["high", "low"]
+    },
+    "Triage": {
+      "kind": "model",
+      "fields": {
+        "kind": { "type": "enum_ref", "ref": "#/schemas/TriageKind" }
+      }
+    },
+    "Response": {
+      "kind": "model",
+      "fields": {
+        "text": { "type": "str" }
+      }
+    }
+  },
+  "state": [
+    {
+      "id": "backend",
+      "symbol": "mellea.backends.openai.OpenAIBackend",
+      "args": { "model_id": { "env": "MODEL_ID" } }
+    },
+    {
+      "id": "session",
+      "symbol": "mellea.stdlib.session.MelleaSession",
+      "args": { "backend": { "ref": "backend" } }
+    }
+  ],
+  "pipeline": [
+    {
+      "id": "triage",
+      "kind": "call",
+      "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+      "bound_to": { "ref": "session" },
+      "args": {
+        "description": { "template": "Triage the query as 'high' or 'low': {query}" },
+        "format": { "schema_ref": "#/schemas/Triage" }
+      }
+    },
+    {
+      "id": "dispatch",
+      "kind": "composition",
+      "operator": "branch",
+      "on": { "ref": "triage", "select": "kind" },
+      "cases": {
+        "high": [
+          {
+            "id": "escalate",
+            "kind": "call",
+            "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+            "bound_to": { "ref": "session" },
+            "args": {
+              "description": { "template": "Escalation response for: {query}" },
+              "format": { "schema_ref": "#/schemas/Response" }
+            }
+          }
+        ],
+        "low": [
+          {
+            "id": "ack",
+            "kind": "call",
+            "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+            "bound_to": { "ref": "session" },
+            "args": {
+              "description": { "template": "Light-touch ack for: {query}" },
+              "format": { "schema_ref": "#/schemas/Response" }
+            }
+          }
+        ],
+        "_default": [
+          {
+            "id": "fallback",
+            "kind": "call",
+            "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+            "bound_to": { "ref": "session" },
+            "args": {
+              "description": { "template": "Default response for: {query}" },
+              "format": { "schema_ref": "#/schemas/Response" }
+            }
+          }
+        ]
+      },
+      "captures": { "result": "#/outputs/result" }
+    }
+  ]
+}

@@ -1,0 +1,87 @@
+{
+  "descriptor_version": "0.1",
+  "mellea_version": "0.5.0",
+  "skill": { "name": "only-parallel", "classification": "DSL" },
+  "inputs": [
+    { "name": "query", "schema": { "kind": "str" } }
+  ],
+  "outputs": [
+    { "name": "report", "schema": { "kind": "model_ref", "ref": "#/schemas/Report" } }
+  ],
+  "schemas": {
+    "PerspectiveA": {
+      "kind": "model",
+      "fields": {
+        "summary": { "type": "str" }
+      }
+    },
+    "PerspectiveB": {
+      "kind": "model",
+      "fields": {
+        "summary": { "type": "str" }
+      }
+    },
+    "Report": {
+      "kind": "model",
+      "fields": {
+        "combined": { "type": "str" }
+      }
+    }
+  },
+  "state": [
+    {
+      "id": "backend",
+      "symbol": "mellea.backends.openai.OpenAIBackend",
+      "args": { "model_id": { "env": "MODEL_ID" } }
+    },
+    {
+      "id": "session",
+      "symbol": "mellea.stdlib.session.MelleaSession",
+      "args": { "backend": { "ref": "backend" } }
+    }
+  ],
+  "pipeline": [
+    {
+      "id": "fanout",
+      "kind": "composition",
+      "operator": "parallel",
+      "branches": [
+        [
+          {
+            "id": "perspective_a",
+            "kind": "call",
+            "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+            "bound_to": { "ref": "session" },
+            "args": {
+              "description": { "template": "Perspective A on: {query}" },
+              "format": { "schema_ref": "#/schemas/PerspectiveA" }
+            }
+          }
+        ],
+        [
+          {
+            "id": "perspective_b",
+            "kind": "call",
+            "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+            "bound_to": { "ref": "session" },
+            "args": {
+              "description": { "template": "Perspective B on: {query}" },
+              "format": { "schema_ref": "#/schemas/PerspectiveB" }
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "merge",
+      "kind": "call",
+      "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+      "bound_to": { "ref": "session" },
+      "args": {
+        "description": { "template": "Merge perspectives for: {query}" },
+        "format": { "schema_ref": "#/schemas/Report" }
+      },
+      "captures": { "result": "#/outputs/report" }
+    }
+  ]
+}

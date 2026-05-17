@@ -4,8 +4,10 @@
 
 You are a Mellea decomposition specialist. Given a path to an agent `.md` file, produce an executable Python package using the Mellea generative programming library. This orchestrator file describes the overall workflow; step-specific guidance lives in the sub-commands listed below.
 
-**Your input**: `$ARGUMENTS` — path to an agent `.md` file (or workspace directory for multi-file source runtimes).
+**Your input**: `$ARGUMENTS` — path to an agent `.md` file (or workspace directory for multi-file source runtimes), optionally followed by compilation flags (e.g. `--use-descriptor`). The first positional token is the spec path; remaining tokens starting with `--` are flags. See §Compilation flags below for the full list.
 **Your output**: A generated Python package plus intermediate artifacts and a mapping report.
+
+**Argument parsing**: split `$ARGUMENTS` on whitespace. The first non-flag token is the spec path. Any token of the form `--<flag>` (or `--<flag>=<value>`) is a compilation flag that MUST be carried through to the relevant sub-command. In particular, `--use-descriptor` MUST be propagated to `/mellea-fy-generate` so Step 5 takes the descriptor-mode code path; without this propagation the flag is silently dropped and the default legacy Step 5 runs.
 
 ---
 
@@ -110,7 +112,7 @@ intermediate/
 
 **One BaseModel per session** — schema priming (KB 5) is the most impactful Known Behaviour. All generated code must respect the one-schema-per-session rule. See `/mellea-fy-behaviours` for the full KB list.
 
-**Lints are non-configurable** — Step 7's 14 lints all run unconditionally. There is no `--skip-lint` flag. Tier 1 and structural Tier 2 lint failures trigger a bounded repair loop: `/mellea-fy-generate` is re-invoked (failing files only, with exact lint messages as context) for up to 2 rounds before halting. `session-boundary` and `category-specific` failures always halt immediately — no repair is attempted. See `/mellea-fy-validate` for lint details.
+**Lint severity drives gate behaviour** — Step 7's lints run unconditionally; their classified severity (`error` / `warning` / `info`) decides whether a failure blocks compilation. Only `error`-severity failures block compile and trigger the bounded repair loop: `/mellea-fy-generate` is re-invoked (failing files only, with exact lint messages as context) for up to 2 rounds before halting. `warning` and `info` failures surface in the report but DO NOT trigger repair. `session-boundary` and `category-specific` errors always halt immediately — no repair is attempted. Pass `--strict` to restore the legacy "every failure blocks" behaviour (warnings promote to blocking; info stays telemetry-only). See `mellea-fy-validate.md` for the full severity table and lint details.
 
 ## Output directory layout
 
@@ -214,3 +216,21 @@ Pass `--dependencies=<mode>` to control disposition elicitation:
 | `strict`        | Halt before writing files if any disposition would produce a stub    |
 
 Default: `auto`.
+
+## Compilation flags
+
+Pass these flags on the `mellea-skills compile` CLI to control the compile path. The slash-command workflow reads them from `$ARGUMENTS` and routes Step 5 accordingly.
+
+| Flag | Behaviour |
+|---|---|
+| `--use-descriptor` | Route Step 5 through descriptor IR emission + render instead of free-form Python emission. Default: off. Step 7 (the 14 lints) continues to run on the rendered output as a renderer safety net per plan §10.5. See `mellea-fy-generate.md` §"Descriptor mode (`--use-descriptor`)" for details. |
+| `--repair-mode` (`-r`) | Bounded repair loop on validation/render/smoke failure. With `--use-descriptor`, repairs splice corrected nodes into the descriptor; with the default legacy path, repairs target failing Python files. See `mellea-fy-validate.md` for repair semantics. |
+| `--no-run` | Skip the post-compile fixture smoke check. |
+| `--refresh-cache` | Force-refresh the grounding/docs cache (`~/.cache/mellea-skills-compiler/`) before compile. |
+| `--model` / `-m` | Override the model used for compilation. Defaults from `runtime_defaults.json`. |
+| `--skill-backend` | Override the runtime LLM backend the compiled skill uses. Does NOT affect compilation. |
+| `--skill-model` | Override the runtime model the compiled skill uses. Does NOT affect compilation. |
+
+**Descriptor mode is a Step-5-only swap.** Steps 0–4 (classify, inventory, map, deps, fixtures) and Step 6 (artefacts) run identically in both modes. Step 7 (the 14 lints) also runs identically — its *role* changes (from "catch LLM Python mistakes" to "catch renderer-emitted Python regressions"), but the lint code does not. This is the explicit plan §10.5 commitment.
+
+Until Phase 5 flips the default, descriptor mode is opt-in via `--use-descriptor`. The legacy free-form Python path remains the default for backward compatibility.

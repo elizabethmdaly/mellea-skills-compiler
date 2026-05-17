@@ -17,14 +17,25 @@ _COMPANION_DIRS = ("scripts", "references", "assets")
 def derive_package_name(spec_path: Path, frontmatter: dict | None) -> str:
     """Apply Rule OUT-2 (lowercase, hyphens/spaces → underscores, append `_mellea`).
 
-    For .md sources, prefer the frontmatter `name:` field; fall back to the
-    parent directory name. For directory inputs (multi-file runtimes), use
-    the directory name.
+    Resolution order (matches the slash command's convention):
+
+    1. Frontmatter ``name:`` field, if present. This is the source of truth
+       per Rule OUT-2 in ``.claude/commands/mellea-fy.md`` — the slash
+       command reads frontmatter, and the wrapper MUST agree so file
+       writes land in the same package directory.
+    2. For multi-file runtimes (CrewAI, LangGraph, Letta — typically
+       directory inputs with no ``spec.md`` / ``SKILL.md``), fall back to
+       the directory name.
+    3. For bare ``.md`` file inputs without frontmatter, fall back to the
+       parent directory name.
     """
-    if spec_path.is_dir():
+    frontmatter_name = (frontmatter or {}).get("name")
+    if frontmatter_name:
+        raw = frontmatter_name
+    elif spec_path.is_dir():
         raw = spec_path.name
     else:
-        raw = (frontmatter or {}).get("name") or spec_path.parent.name
+        raw = spec_path.parent.name
     name = str(raw).lower().replace("-", "_").replace(" ", "_")
     while "__" in name:
         name = name.replace("__", "_")

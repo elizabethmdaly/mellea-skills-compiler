@@ -1,6 +1,6 @@
 # Melleafy Step 4: Fixture Generation
 
-**Version**: 4.1.1 | **Prereq**: Step 3 complete (skeleton emitted with finalised `run_pipeline` signature) | **Produces**: `<package_name>/fixtures/`
+**Version**: 4.2.0 | **Prereq**: Step 3 complete (skeleton emitted with finalised `run_pipeline` signature) AND `intermediate/expected_signature.json` present (Step 2 emits it; P3.5.D) | **Produces**: `<package_name>/fixtures/`
 
 > **Output path rule** (Rule OUT-4): `fixtures/` is written **inside `<package_name>/`** — NOT at the skill root. It is test-only and intentionally excluded from the installed package by `pyproject.toml`'s `[tool.setuptools.packages.find]`. Run fixtures via `python -m pytest <package_name>/fixtures/` from the skill root.
 
@@ -8,11 +8,23 @@ Step 4 generates 5–8 test fixtures covering ≥3 C-categories. Fixtures are th
 
 > **Rule 4-1 — Batched fixture generation as JSON**: Generate all fixture specifications in a single LLM invocation. The invocation receives the `run_pipeline` signature, the element mapping summary, and the C-category coverage requirement, and returns **one JSON object conforming to `.claude/schemas/fixtures_emission.schema.json`** — not Python source. The deterministic writer at `.claude/melleafy/writers/fixtures_writer.py` renders the per-fixture `.py` files plus `fixtures/__init__.py` from that JSON. **The model never writes Python source for fixtures directly.** This makes shape drift (pytest-style tests, `INPUT`-only modules, hand-rolled `__init__.py` exports) structurally unreachable — every legal JSON instance produces a contract-correct fixture package.
 
+> **Fallback when the model does not emit `fixtures_emission.json`**: if the slash command exits with the per-fixture `.py` files on disk but without writing `intermediate/fixtures_emission.json`, the wrapper reverse-engineers the IR from the surviving `fixtures/*.py` files BEFORE the writer's wipe-then-render runs. Each fixture file declares `make_<fid>() -> tuple[dict, str, str]`; the wrapper AST-parses the return value (or falls back to importing the module if any element is non-literal), reassembles a schema-compliant `fixtures_emission.json`, and writes it to `intermediate/`. The writer then renders the same fixtures from the synthesised IR, keeping the package's on-disk state and its IR self-consistent. The model is still expected to emit the IR directly — this fallback is the last line of defence, mirroring the `config_emission.json` fallback documented in `mellea-fy-generate.md` (Track 1 #4). The synthesizer lives at `mellea_skills_compiler.compile.writer_renderer.synthesize_fixtures_emission_from_existing`.
+
 ---
 
 ## CRITICAL: Input parameter matching
 
 **The keys in every fixture's `inputs` object MUST be a subset of the parameter names of the `run_pipeline` function in `pipeline.py`.** This is not optional. The smoke-check invokes `run_pipeline(**inputs)`; any extra key raises `TypeError: got an unexpected keyword argument '<key>'` at fixture-run time. Empirically observed regression: a `nis2-navigator` fixture passed `{'session_id': ..., 'regulatory_updates': ...}` to a pipeline that compiled without the matching parameter set, and the smoke-check crashed. Before emitting JSON, verify the exact parameter names from the generated pipeline function. The schema cannot enforce this — it is the model's responsibility to match. The `fixture-signature-bound` lint (Step 7) enforces this mechanically: any `inputs` key not in the entry parameter set is a hard failure. Optional/defaulted parameters MAY be omitted (subset semantics); `**kwargs` in the signature exempts a fixture from the check entirely.
+
+### Source of truth: `intermediate/expected_signature.json` (P3.5.D)
+
+When `intermediate/expected_signature.json` is present (it is, after P3.5.D — Step 2 always emits it), it is the **canonical source of truth** for the `run_pipeline` signature. Read it before generating any fixture:
+
+- Every fixture's `inputs` keys MUST be a subset of `expected_signature.inputs[].name`.
+- Fixture values MUST be type-compatible with `expected_signature.inputs[].type` (e.g. an input typed `list[str]` requires a JSON list of strings).
+- Optional inputs (`expected_signature.inputs[].optional == true`) MAY be omitted from any fixture.
+
+If `expected_signature.json` is absent (legacy / pre-P3.5.D path), fall back to today's behaviour: read the `run_pipeline` signature from the emitted skeleton in `<package_name>/pipeline.py`. The `fixture-signature-bound` lint (Step 7) catches drift either way.
 
 ---
 

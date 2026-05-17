@@ -99,6 +99,37 @@ def compile(
             "(default from mellea_skills_compiler/compile/claude/data/runtime_defaults.json).",
         ),
     ] = None,
+    use_descriptor: Annotated[
+        bool,
+        typer.Option(
+            "--use-descriptor",
+            help="Route Step 5 through descriptor IR emission + render instead of "
+            "free-form Python emission. Default off until the Phase 5 flip. "
+            "When set, --timeout is not directly applicable (streaming + 64K). "
+            "See .claude/commands/mellea-fy-generate.md §'Descriptor mode' and "
+            "descriptor-schema-v0.x.md for the IR spec.",
+        ),
+    ] = False,
+    strict: Annotated[
+        bool,
+        typer.Option(
+            "--strict",
+            help="Fail compile on any lint failure, regardless of severity. "
+            "Use this to restore pre-graduated-severity behaviour. "
+            "Default: only ERROR-severity failures block compilation. "
+            "See .claude/commands/mellea-fy-validate.md for the per-lint severity table.",
+        ),
+    ] = False,
+    smoke_check: Annotated[
+        str,
+        typer.Option(
+            "--smoke-check",
+            help="Evidence-based smoke check after lints. 'auto' (default): "
+            "run if backend available; 'always': require backend, fail if "
+            "unavailable; 'never': skip entirely (use --strict to compensate). "
+            "One of: auto|always|never.",
+        ),
+    ] = "auto",
 ):
     """
     Compile Mellea skill specification into a Mellea pipeline using mellea-fy Claude command.
@@ -109,7 +140,27 @@ def compile(
     smoke-check passed (or skipped because backend was unreachable).
     """
     spec_path = Path(spec_path)
+    if smoke_check not in {"auto", "always", "never"}:
+        LOGGER.error(
+            "--smoke-check must be one of auto|always|never, got %r", smoke_check
+        )
+        raise typer.Exit(code=2)
     try:
+        if use_descriptor:
+            _run_descriptor_compile(
+                spec_path=spec_path,
+                model=model,
+                timeout=timeout,
+                repair_mode=repair_mode,
+                no_run=no_run,
+                refresh_cache=refresh_cache,
+                skill_backend=skill_backend,
+                skill_model=skill_model,
+                strict=strict,
+                smoke_check=smoke_check,
+            )
+            return
+
         from mellea_skills_compiler.compile import mellea_skills
 
         mellea_skills.compile(
@@ -121,10 +172,97 @@ def compile(
             refresh_cache=refresh_cache,
             skill_backend=skill_backend,
             skill_model=skill_model,
+            strict=strict,
+            smoke_check_mode=smoke_check,
         )
     except Exception as e:
         LOGGER.error(str(e))
         raise typer.Exit(code=1)
+
+
+def _resolve_descriptor_spec_path(spec_path: Path) -> Path:
+    """Resolve a CLI `spec_path` argument to a concrete spec file.
+
+    Thin wrapper around
+    :func:`mellea_skills_compiler.compile.spec_path_resolver.resolve_spec_path`
+    that returns just the spec file (matching the legacy callsite shape).
+    Kept for backward compatibility with any direct callers.
+
+    Widened (Phase 3.5.A §2.1) so a directory with no ``spec.md`` / ``SKILL.md``
+    falls back to the first ``.md`` file found in the directory, and a
+    direct ``.md`` file path resolves to itself. Precedence inside a
+    directory remains ``SKILL.md`` → ``spec.md`` → first ``*.md`` alphabetical.
+    """
+    from mellea_skills_compiler.compile.spec_path_resolver import (
+        SpecPathResolutionError,
+        resolve_spec_path,
+    )
+
+    try:
+        return resolve_spec_path(spec_path).spec_file
+    except SpecPathResolutionError as exc:
+        # Preserve the legacy contract: callers expect ``ValueError`` /
+        # ``FileNotFoundError`` here, not a custom subtype.
+        raise ValueError(str(exc)) from exc
+
+
+def _run_descriptor_compile(
+    *,
+    spec_path: Path,
+    model: Optional[str],
+    timeout: int,
+    repair_mode: bool,
+    no_run: bool,
+    refresh_cache: bool,
+    skill_backend: Optional[str],
+    skill_model: Optional[str],
+    strict: bool = False,
+    smoke_check: str = "auto",
+) -> None:
+    """Descriptor-IR branch of `compile` (Phase 3.5.A wiring).
+
+    Spawns the same ``claude`` subprocess the legacy path spawns, driving the
+    full 10-step ``/mellea-fy`` workflow with Step 5 swapped for descriptor IR
+    emission + render. The slash-command orchestrator parses
+    ``--use-descriptor`` out of ``$ARGUMENTS`` (see ``.claude/commands/mellea-fy.md``)
+    and routes Step 5 accordingly.
+
+    Prior to Phase 3.5.A this routed to an in-process
+    :func:`mellea_skills_compiler.compile.descriptor_emission.compile_via_descriptor`
+    call, which skipped Steps 0–4 and Step 6 entirely. That in-process
+    entrypoint is preserved for unit tests, ``scripts/batch_descriptor_test.py``,
+    and ``scripts/corpus_compare.py`` (one-shot mode), but end-user
+    invocations now go through the full ``/mellea-fy`` workflow so descriptor
+    mode is functionally equivalent to legacy.
+    """
+    from mellea_skills_compiler.compile import mellea_skills
+    from mellea_skills_compiler.compile.spec_path_resolver import (
+        SpecPathResolutionError,
+        resolve_spec_path,
+    )
+
+    # Validate the spec-path shape early with the widened resolver so the user
+    # gets a clear error when neither a .md file nor a workspace directory is
+    # supplied. `mellea_skills.compile` itself accepts the same shapes via the
+    # legacy `_get_spec_md_path`; we resolve here purely for early validation.
+    try:
+        resolve_spec_path(spec_path)
+    except SpecPathResolutionError as exc:
+        raise ValueError(str(exc)) from exc
+
+    mellea_skills.compile(
+        spec_path,
+        model,
+        timeout,
+        repair_mode=repair_mode,
+        no_run=no_run,
+        refresh_cache=refresh_cache,
+        skill_backend=skill_backend,
+        skill_model=skill_model,
+        use_descriptor=True,
+        strict=strict,
+        smoke_check_mode=smoke_check,
+    )
 
 
 @app.command(
@@ -152,6 +290,25 @@ def validate(
             help="Run all fixtures (default: first only).",
         ),
     ] = False,
+    strict: Annotated[
+        bool,
+        typer.Option(
+            "--strict",
+            help="Fail validation on any lint failure, regardless of severity. "
+            "Default: only ERROR-severity failures block. "
+            "See .claude/commands/mellea-fy-validate.md for the per-lint severity table.",
+        ),
+    ] = False,
+    smoke_check: Annotated[
+        str,
+        typer.Option(
+            "--smoke-check",
+            help="Evidence-based in-gate smoke check. 'auto': run if backend "
+            "available; 'always': require backend; 'never' (default): skip "
+            "the in-gate smoke (legacy post-lint smoke still runs unless "
+            "--no-run is set). One of: auto|always|never.",
+        ),
+    ] = "never",
 ):
     """
     Run Step 7 structural lints and (unless --no-run) the fixture smoke-check.
@@ -161,11 +318,20 @@ def validate(
       11 — at least one lint failed
       12 — smoke-check failed (lint pass, but a fixture raised an exception)
     """
+    if smoke_check not in {"auto", "always", "never"}:
+        LOGGER.error(
+            "--smoke-check must be one of auto|always|never, got %r", smoke_check
+        )
+        raise typer.Exit(code=2)
     try:
         from mellea_skills_compiler.compile import mellea_skills
 
         mellea_skills.validate(
-            Path(pipeline_dir), no_run=no_run, all_fixtures=all_fixtures
+            Path(pipeline_dir),
+            no_run=no_run,
+            all_fixtures=all_fixtures,
+            strict=strict,
+            smoke_check_mode=smoke_check,
         )
     except Exception as e:
         LOGGER.error(str(e))

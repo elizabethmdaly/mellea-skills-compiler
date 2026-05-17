@@ -1,0 +1,460 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://melleafy.dev/schemas/descriptor.v0.2.json",
+  "title": "Mellea-fy Descriptor v0.2",
+  "type": "object",
+  "required": [
+    "descriptor_version",
+    "mellea_version",
+    "skill",
+    "inputs",
+    "outputs",
+    "schemas",
+    "state",
+    "pipeline"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "descriptor_version": {
+      "type": "string",
+      "const": "0.2"
+    },
+    "mellea_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Free-form authorial commentary, ignored by the renderer."
+    },
+    "skill": {
+      "type": "object",
+      "required": ["name", "classification"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "classification": {
+          "type": "string",
+          "enum": ["DSL", "COMP", "DOM", "MIXED"]
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tools": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allowed": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "denied": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "inputs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Slot" }
+    },
+    "outputs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Slot" }
+    },
+    "schemas": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/SchemaDef" }
+    },
+    "state": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/StateEntry" }
+    },
+    "pipeline": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/PipelineNode" }
+    }
+  },
+  "$defs": {
+    "Slot": {
+      "type": "object",
+      "required": ["name", "schema"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "schema": { "$ref": "#/$defs/SchemaRef" },
+        "description": { "type": "string" }
+      }
+    },
+    "SchemaRef": {
+      "type": "object",
+      "oneOf": [
+        {
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "str" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "int" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "float" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "bool" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "required": ["kind", "ref"],
+          "properties": {
+            "kind": { "enum": ["model_ref", "enum_ref", "pydantic_model"] },
+            "ref": { "type": "string", "pattern": "^#/schemas/" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "required": ["kind", "of"],
+          "properties": {
+            "kind": { "const": "list" },
+            "of": { "$ref": "#/$defs/SchemaRef" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SchemaDef": {
+      "type": "object",
+      "oneOf": [
+        {
+          "required": ["kind", "members"],
+          "properties": {
+            "kind": { "const": "enum" },
+            "members": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "required": ["kind", "fields"],
+          "properties": {
+            "kind": { "const": "model" },
+            "fields": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/$defs/SchemaField" }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SchemaField": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "type": "string" },
+        "optional": { "type": "boolean", "default": false },
+        "ref": { "type": "string", "pattern": "^#/schemas/" }
+      },
+      "additionalProperties": false
+    },
+    "Ref": {
+      "type": "object",
+      "required": ["ref"],
+      "additionalProperties": false,
+      "properties": {
+        "ref": { "type": "string", "minLength": 1 },
+        "select": {
+          "type": "string",
+          "description": "Dotted path applied to the resolved value, e.g. 'files' or 'candidates.0'. v0.2 only requires attribute access; index access is TBD."
+        }
+      }
+    },
+    "ArgValue": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["value"],
+          "additionalProperties": false,
+          "properties": {
+            "value": {}
+          }
+        },
+        {
+          "type": "object",
+          "required": ["template"],
+          "additionalProperties": false,
+          "properties": {
+            "template": { "type": "string" }
+          }
+        },
+        { "$ref": "#/$defs/Ref" },
+        {
+          "type": "object",
+          "required": ["schema_ref"],
+          "additionalProperties": false,
+          "properties": {
+            "schema_ref": { "type": "string", "pattern": "^#/schemas/" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["env"],
+          "additionalProperties": false,
+          "properties": {
+            "env": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["symbol"],
+          "additionalProperties": false,
+          "properties": {
+            "symbol": { "type": "string", "minLength": 1 },
+            "args": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/$defs/ArgValue" }
+            }
+          }
+        },
+        {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ArgValue" }
+        }
+      ]
+    },
+    "StateEntry": {
+      "type": "object",
+      "required": ["id", "symbol"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z_][a-z0-9_]*$" },
+        "symbol": { "type": "string", "minLength": 1 },
+        "scope": {
+          "type": "string",
+          "enum": ["module", "function"],
+          "default": "function"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/ArgValue" }
+        }
+      }
+    },
+    "PipelineNode": {
+      "oneOf": [
+        { "$ref": "#/$defs/CallNode" },
+        { "$ref": "#/$defs/CompositionNode" }
+      ]
+    },
+    "CallNode": {
+      "type": "object",
+      "required": ["id", "kind", "symbol", "args"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z_][a-z0-9_]*$" },
+        "kind": { "const": "call" },
+        "symbol": { "type": "string", "minLength": 1 },
+        "bound_to": { "$ref": "#/$defs/Ref" },
+        "args": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/ArgValue" }
+        },
+        "captures": {
+          "type": "object",
+          "additionalProperties": { "type": "string", "pattern": "^#/outputs/" }
+        },
+        "on_parse_failure": {
+          "type": "object",
+          "required": ["strategy"],
+          "additionalProperties": false,
+          "properties": {
+            "strategy": { "enum": ["raise", "default"] },
+            "default": {}
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "CompositionNode": {
+      "oneOf": [
+        { "$ref": "#/$defs/SequentialNode" },
+        { "$ref": "#/$defs/BranchNode" },
+        { "$ref": "#/$defs/ParallelNode" },
+        { "$ref": "#/$defs/MapNode" },
+        { "$ref": "#/$defs/RetryNode" },
+        { "$ref": "#/$defs/FilterNode" }
+      ]
+    },
+    "SequentialNode": {
+      "type": "object",
+      "required": ["id", "kind", "operator", "body"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z_][a-z0-9_]*$" },
+        "kind": { "const": "composition" },
+        "operator": { "const": "sequential" },
+        "body": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/PipelineNode" }
+        },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "BranchNode": {
+      "type": "object",
+      "required": ["id", "kind", "operator", "on", "cases"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z_][a-z0-9_]*$" },
+        "kind": { "const": "composition" },
+        "operator": { "const": "branch" },
+        "on": { "$ref": "#/$defs/Ref" },
+        "cases": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/PipelineNode" }
+          }
+        },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "ParallelNode": {
+      "type": "object",
+      "required": ["id", "kind", "operator", "branches"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z_][a-z0-9_]*$" },
+        "kind": { "const": "composition" },
+        "operator": { "const": "parallel" },
+        "branches": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/PipelineNode" }
+          }
+        },
+        "collect": {
+          "type": "string",
+          "enum": ["dict_by_branch_id", "list"],
+          "default": "dict_by_branch_id"
+        },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "MapNode": {
+      "type": "object",
+      "required": ["id", "kind", "operator", "over", "body", "collect", "item_id"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z_][a-z0-9_]*$" },
+        "kind": { "const": "composition" },
+        "operator": { "const": "map" },
+        "over": { "$ref": "#/$defs/Ref" },
+        "item_id": { "type": "string", "pattern": "^[a-z_][a-z0-9_]*$" },
+        "body": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/PipelineNode" }
+        },
+        "collect": {
+          "type": "string",
+          "enum": ["list", "dict_by_key"]
+        },
+        "key_field": { "type": "string" },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "RetryNode": {
+      "type": "object",
+      "required": ["id", "kind", "operator", "body", "max_attempts", "failure_check"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z_][a-z0-9_]*$" },
+        "kind": { "const": "composition" },
+        "operator": { "const": "retry_with_feedback" },
+        "body": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/PipelineNode" }
+        },
+        "max_attempts": { "type": "integer", "minimum": 1 },
+        "failure_check": { "$ref": "#/$defs/Ref" },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "FilterNode": {
+      "type": "object",
+      "required": ["id", "kind", "operator", "over", "predicate", "item_id"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z_][a-z0-9_]*$" },
+        "kind": { "const": "composition" },
+        "operator": { "const": "filter" },
+        "over": { "$ref": "#/$defs/Ref" },
+        "item_id": { "type": "string", "pattern": "^[a-z_][a-z0-9_]*$" },
+        "predicate": { "$ref": "#/$defs/Predicate" },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "Predicate": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "select", "value"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "field_equals" },
+            "select": { "type": "string" },
+            "value": {},
+            "negate": { "type": "boolean", "default": false }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "select", "values"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "field_in" },
+            "select": { "type": "string" },
+            "values": { "type": "array" },
+            "negate": { "type": "boolean", "default": false }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "select"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "field_truthy" },
+            "select": { "type": "string" },
+            "negate": { "type": "boolean", "default": false }
+          }
+        }
+      ]
+    }
+  }
+}

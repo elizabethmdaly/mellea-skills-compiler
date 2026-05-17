@@ -22,6 +22,7 @@ from mellea_skills_compiler.compile.lints import (
     lint_fixtures_loader_contract,
     lint_generative_call_passes_session,
     lint_generative_forbidden_params,
+    lint_grounding_context_types,
     lint_import_soundness,
     lint_instruct_has_description,
     lint_instruct_result_parse_before_access,
@@ -1793,6 +1794,76 @@ class TestOptionalExtractionGuidance:
             pkg = _make_package(Path(tmp), {"schemas.py": schemas})
             assert lint_optional_extraction_guidance(pkg).verdict == "pass"
 
+    def test_passes_with_only_keyword(self):
+        """'Germany only:' style conditional descriptions are extraction guidance.
+
+        Regression: nis2-navigator-oliver-schmidt-prietz schemas.py:44
+        used "Germany only: BSI registration required ..." for a Germany-
+        conditional Optional field. The original keyword list ("extract",
+        "do not ask", "if the") did not recognize "only" as a conditional
+        signal, blocking a valid compile.
+        """
+        schemas = (
+            "from typing import Optional\n"
+            "from pydantic import BaseModel, Field\n"
+            "class ScopeClassificationResult(BaseModel):\n"
+            "    bsi_registration_required: Optional[bool] = Field(\n"
+            "        default=None,\n"
+            "        description=\"Germany only: BSI registration required per "
+            "§ 34 BSIG-neu\",\n"
+            "    )\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(Path(tmp), {"schemas.py": schemas})
+            assert lint_optional_extraction_guidance(pkg).verdict == "pass"
+
+    def test_passes_with_when_keyword(self):
+        """'When X is Y' conditional phrasing is extraction guidance."""
+        schemas = (
+            "from typing import Optional\n"
+            "from pydantic import BaseModel, Field\n"
+            "class ScopeSchema(BaseModel):\n"
+            "    sector_data: Optional[str] = Field(\n"
+            "        default=None,\n"
+            "        description=\"Populate when sector is financial.\",\n"
+            "    )\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(Path(tmp), {"schemas.py": schemas})
+            assert lint_optional_extraction_guidance(pkg).verdict == "pass"
+
+    def test_passes_with_applicable_keyword(self):
+        """'If applicable' / 'not-applicable' style phrasings count."""
+        schemas = (
+            "from typing import Optional\n"
+            "from pydantic import BaseModel, Field\n"
+            "class ScopeClassificationResult(BaseModel):\n"
+            "    bsi_registration_status: Optional[str] = Field(\n"
+            "        default=None,\n"
+            "        description=\"Germany only: completed / overdue / "
+            "not-applicable\",\n"
+            "    )\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(Path(tmp), {"schemas.py": schemas})
+            assert lint_optional_extraction_guidance(pkg).verdict == "pass"
+
+    def test_passes_with_if_conditional_phrasing(self):
+        """'if jurisdiction != X' uses bare 'if ' (not 'if the') and should pass."""
+        schemas = (
+            "from typing import Optional\n"
+            "from pydantic import BaseModel, Field\n"
+            "class AssessmentReport(BaseModel):\n"
+            "    jurisdiction_specific: Optional[dict] = Field(\n"
+            "        default=None,\n"
+            "        description=\"National transposition specifics if "
+            "jurisdiction != EU-only\",\n"
+            "    )\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(Path(tmp), {"schemas.py": schemas})
+            assert lint_optional_extraction_guidance(pkg).verdict == "pass"
+
     def test_fails_with_no_field_at_all(self):
         schemas = (
             "from typing import Optional\n"
@@ -1805,10 +1876,12 @@ class TestOptionalExtractionGuidance:
         with tempfile.TemporaryDirectory() as tmp:
             pkg = _make_package(Path(tmp), {"schemas.py": schemas})
             result = lint_optional_extraction_guidance(pkg)
-            assert result.verdict == "fail"
+            # KB11 is advisory (warning), not blocking.
+            assert result.verdict == "warning"
             assert len(result.failures) == 2
 
-    def test_fails_with_field_no_extraction_keyword(self):
+    def test_warns_with_field_no_extraction_keyword(self):
+        """KB11 is advisory; finding emits as `warning`, not `fail`."""
         schemas = (
             "from typing import Optional\n"
             "from pydantic import BaseModel, Field\n"
@@ -1820,10 +1893,10 @@ class TestOptionalExtractionGuidance:
         with tempfile.TemporaryDirectory() as tmp:
             pkg = _make_package(Path(tmp), {"schemas.py": schemas})
             result = lint_optional_extraction_guidance(pkg)
-            assert result.verdict == "fail"
+            assert result.verdict == "warning"
             assert "departure_date" in result.failures[0].message
 
-    def test_fails_with_field_no_description(self):
+    def test_warns_with_field_no_description(self):
         schemas = (
             "from typing import Optional\n"
             "from pydantic import BaseModel, Field\n"
@@ -1832,7 +1905,7 @@ class TestOptionalExtractionGuidance:
         )
         with tempfile.TemporaryDirectory() as tmp:
             pkg = _make_package(Path(tmp), {"schemas.py": schemas})
-            assert lint_optional_extraction_guidance(pkg).verdict == "fail"
+            assert lint_optional_extraction_guidance(pkg).verdict == "warning"
 
     def test_ignores_non_schema_intent_classes(self):
         schemas = (
@@ -1865,7 +1938,7 @@ class TestOptionalExtractionGuidance:
                 {"schemas.py": schemas, "pipeline.py": pipeline},
             )
             result = lint_optional_extraction_guidance(pkg)
-            assert result.verdict == "fail"
+            assert result.verdict == "warning"
             assert "RoleAssessment" in result.failures[0].message
 
     def test_skipped_when_schemas_absent(self):
@@ -2677,6 +2750,183 @@ class TestComplexSchemaNeedsStrategyOrFallback:
                 lint_complex_schema_needs_strategy_or_fallback(pkg).verdict
                 == "pass"
             )
+
+
+# ─── TestGroundingContextTypes ───
+
+
+class TestGroundingContextTypes:
+    """Test cases for lint_grounding_context_types.
+
+    Regression target: `dpia-sentinel-oliver-schmidt-prietz` pipeline.py:227
+    passed `grounding_context={"risks": [r.model_dump() for r in risk.risks]}`
+    — a list comprehension producing a list of dicts. At m.instruct() runtime
+    Mellea's backend walked grounding_context values, failed to convert the
+    list into a CBlock/Component/ModelOutputThunk, and raised
+    `ValueError: parts should only contain CBlocks, Components, or
+    ModelOutputThunks; found <list>`.
+    """
+
+    def test_passes_with_string_literal_values(self):
+        pipeline = (
+            "from mellea import start_session\n"
+            "from .schemas import S\n"
+            "def f():\n"
+            "    with start_session('o','m') as m:\n"
+            "        return m.instruct('go', format=S, grounding_context={'a': 'hello', 'b': 'world'})\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(Path(tmp), {"pipeline.py": pipeline})
+            assert lint_grounding_context_types(pkg).verdict == "pass"
+
+    def test_passes_with_str_call(self):
+        pipeline = (
+            "from mellea import start_session\n"
+            "from .schemas import S\n"
+            "def f(x):\n"
+            "    with start_session('o','m') as m:\n"
+            "        return m.instruct('go', format=S, grounding_context={'x': str(x)})\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(Path(tmp), {"pipeline.py": pipeline})
+            assert lint_grounding_context_types(pkg).verdict == "pass"
+
+    def test_passes_with_fstring(self):
+        pipeline = (
+            "from mellea import start_session\n"
+            "from .schemas import S\n"
+            "def f(x):\n"
+            "    with start_session('o','m') as m:\n"
+            "        return m.instruct('go', format=S, grounding_context={'x': f'value={x}'})\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(Path(tmp), {"pipeline.py": pipeline})
+            assert lint_grounding_context_types(pkg).verdict == "pass"
+
+    def test_fails_with_list_comprehension(self):
+        """The dpia-sentinel regression — list comprehension as a value."""
+        pipeline = (
+            "from mellea import start_session\n"
+            "from .schemas import MitigationPlan\n"
+            "def f(risks):\n"
+            "    with start_session('o','m') as m:\n"
+            "        return m.instruct('go', format=MitigationPlan, "
+            "grounding_context={'risks': [r.model_dump() for r in risks]})\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(Path(tmp), {"pipeline.py": pipeline})
+            result = lint_grounding_context_types(pkg)
+            assert result.verdict == "fail"
+            assert any(
+                "collection-literal" in f.message.lower()
+                or "list" in f.message.lower()
+                for f in result.failures
+            )
+
+    def test_fails_with_list_literal(self):
+        pipeline = (
+            "from mellea import start_session\n"
+            "from .schemas import S\n"
+            "def f():\n"
+            "    with start_session('o','m') as m:\n"
+            "        return m.instruct('go', format=S, grounding_context={'items': ['a', 'b']})\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(Path(tmp), {"pipeline.py": pipeline})
+            assert lint_grounding_context_types(pkg).verdict == "fail"
+
+    def test_fails_with_dict_literal(self):
+        pipeline = (
+            "from mellea import start_session\n"
+            "from .schemas import S\n"
+            "def f():\n"
+            "    with start_session('o','m') as m:\n"
+            "        return m.instruct('go', format=S, grounding_context={'obj': {'k': 'v'}})\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(Path(tmp), {"pipeline.py": pipeline})
+            assert lint_grounding_context_types(pkg).verdict == "fail"
+
+    def test_warns_with_bare_name(self):
+        """Name/Attribute values are ambiguous — could be a string at runtime."""
+        pipeline = (
+            "from mellea import start_session\n"
+            "from .schemas import S\n"
+            "def f(some_var):\n"
+            "    with start_session('o','m') as m:\n"
+            "        return m.instruct('go', format=S, grounding_context={'x': some_var})\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(Path(tmp), {"pipeline.py": pipeline})
+            result = lint_grounding_context_types(pkg)
+            assert result.verdict == "warning"
+            assert len(result.failures) == 1
+
+    def test_warns_with_attribute_access(self):
+        pipeline = (
+            "from mellea import start_session\n"
+            "from .schemas import S\n"
+            "def f(obj):\n"
+            "    with start_session('o','m') as m:\n"
+            "        return m.instruct('go', format=S, grounding_context={'x': obj.field})\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(Path(tmp), {"pipeline.py": pipeline})
+            assert lint_grounding_context_types(pkg).verdict == "warning"
+
+    def test_mixed_definite_and_ambiguous_returns_fail(self):
+        """Any definite collection elevates the overall verdict to fail."""
+        pipeline = (
+            "from mellea import start_session\n"
+            "from .schemas import S\n"
+            "def f(v, risks):\n"
+            "    with start_session('o','m') as m:\n"
+            "        return m.instruct('go', format=S, grounding_context={"
+            "'ambiguous': v, 'definite': [r for r in risks]})\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(Path(tmp), {"pipeline.py": pipeline})
+            result = lint_grounding_context_types(pkg)
+            assert result.verdict == "fail"
+            assert len(result.failures) == 2
+
+    def test_passes_when_no_grounding_context(self):
+        pipeline = (
+            "from mellea import start_session\n"
+            "from .schemas import S\n"
+            "def f():\n"
+            "    with start_session('o','m') as m:\n"
+            "        return m.instruct('go', format=S)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(Path(tmp), {"pipeline.py": pipeline})
+            assert lint_grounding_context_types(pkg).verdict == "pass"
+
+    def test_skips_unparseable_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(
+                Path(tmp), {"pipeline.py": "def broken(:\n    pass\n"}
+            )
+            assert lint_grounding_context_types(pkg).verdict == "pass"
+
+    def test_walks_slots_and_constrained_slots(self):
+        bad = (
+            "from mellea import start_session\n"
+            "from .schemas import S\n"
+            "def f(items):\n"
+            "    with start_session('o','m') as m:\n"
+            "        return m.instruct('go', format=S, "
+            "grounding_context={'items': [x for x in items]})\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(
+                Path(tmp),
+                {"slots.py": bad, "constrained_slots.py": bad},
+            )
+            result = lint_grounding_context_types(pkg)
+            assert result.verdict == "fail"
+            files = sorted(f.file for f in result.failures)
+            assert files == ["constrained_slots.py", "slots.py"]
 
 
 # ─── TestRunLints ───

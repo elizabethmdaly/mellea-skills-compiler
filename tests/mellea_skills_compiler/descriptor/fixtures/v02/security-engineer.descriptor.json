@@ -1,0 +1,219 @@
+{
+  "descriptor_version": "0.2",
+  "mellea_version": "0.5.0",
+  "skill": {
+    "name": "security-engineer",
+    "classification": "DOM"
+  },
+  "inputs": [
+    {
+      "name": "request",
+      "schema": {
+        "kind": "str"
+      },
+      "description": "A security-related user query (architecture design, compliance assessment, incident response, etc.)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "response",
+      "schema": {
+        "kind": "model_ref",
+        "ref": "#/schemas/SecurityResponse"
+      }
+    }
+  ],
+  "schemas": {
+    "ResponseKind": {
+      "kind": "enum",
+      "members": [
+        "architecture",
+        "compliance",
+        "incident_response",
+        "vulnerability_management",
+        "monitoring",
+        "other"
+      ]
+    },
+    "Severity": {
+      "kind": "enum",
+      "members": [
+        "critical",
+        "high",
+        "medium",
+        "low",
+        "informational"
+      ]
+    },
+    "ComplianceFramework": {
+      "kind": "enum",
+      "members": [
+        "SOC2",
+        "PCI_DSS",
+        "HIPAA",
+        "GDPR",
+        "ISO_27001"
+      ]
+    },
+    "ArchitectureBlock": {
+      "kind": "model",
+      "fields": {
+        "title": {
+          "type": "str"
+        },
+        "language": {
+          "type": "str"
+        },
+        "code": {
+          "type": "str"
+        },
+        "explanation": {
+          "type": "str"
+        }
+      }
+    },
+    "ComplianceFinding": {
+      "kind": "model",
+      "fields": {
+        "framework": {
+          "type": "enum_ref",
+          "ref": "#/schemas/ComplianceFramework"
+        },
+        "control_id": {
+          "type": "str"
+        },
+        "status": {
+          "type": "str"
+        },
+        "evidence": {
+          "type": "str"
+        }
+      }
+    },
+    "IncidentAction": {
+      "kind": "model",
+      "fields": {
+        "step": {
+          "type": "int"
+        },
+        "action": {
+          "type": "str"
+        },
+        "automated": {
+          "type": "bool"
+        },
+        "owner": {
+          "type": "str",
+          "optional": true
+        }
+      }
+    },
+    "SecurityResponse": {
+      "kind": "model",
+      "fields": {
+        "kind": {
+          "type": "enum_ref",
+          "ref": "#/schemas/ResponseKind"
+        },
+        "summary": {
+          "type": "str"
+        },
+        "principles_applied": {
+          "type": "list[str]"
+        },
+        "architecture_blocks": {
+          "type": "list[ArchitectureBlock]"
+        },
+        "compliance_findings": {
+          "type": "list[ComplianceFinding]"
+        },
+        "incident_plan": {
+          "type": "list[IncidentAction]"
+        },
+        "severity": {
+          "type": "enum_ref",
+          "ref": "#/schemas/Severity",
+          "optional": true
+        },
+        "next_steps": {
+          "type": "list[str]"
+        }
+      }
+    }
+  },
+  "state": [
+    {
+      "id": "backend",
+      "symbol": "mellea.backends.openai.OpenAIBackend",
+      "args": {
+        "model_id": {
+          "env": "MODEL_ID"
+        }
+      }
+    },
+    {
+      "id": "session",
+      "symbol": "mellea.stdlib.session.MelleaSession",
+      "args": {
+        "backend": {
+          "ref": "backend"
+        }
+      }
+    }
+  ],
+  "pipeline": [
+    {
+      "id": "respond",
+      "kind": "call",
+      "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+      "bound_to": {
+        "ref": "session"
+      },
+      "args": {
+        "description": {
+          "template": "You are a security engineer specializing in infrastructure security, compliance automation, and security operations.\n\nCore security domains: Infrastructure Security (network, IAM, encryption, secrets), Application Security (SAST/DAST, dependency scanning, secure development), Compliance (SOC2, PCI-DSS, HIPAA, GDPR automation and monitoring), Incident Response (security monitoring, threat detection, automation), Cloud Security (CSPM, cloud-native security).\n\nArchitecture principles you MUST apply: Zero Trust (never trust, always verify, least privilege); Defense in Depth (multiple layers); Security by Design (built-in from architecture phase); Continuous Monitoring (real-time alerting); Automation First (automated controls and incident response).\n\nFor infrastructure-as-code responses you may emit Terraform (HCL), Python, or Bash. For compliance responses you produce per-framework control assessments (SOC2 / PCI-DSS / HIPAA / GDPR). For incident response you produce a numbered automation plan with owners.\n\nAlways prioritize: (1) Zero Trust Architecture, (2) Automation First, (3) Continuous Monitoring, (4) Compliance by Design, (5) Incident Preparedness. Always include comprehensive logging, monitoring, and audit trails for security controls.\n\nClassify the user's request as one of: architecture, compliance, incident_response, vulnerability_management, monitoring, other. Populate the SecurityResponse fields appropriate to the kind; leave the rest as empty lists.\n\nUser request:\n{request}"
+        },
+        "format": {
+          "schema_ref": "#/schemas/SecurityResponse"
+        },
+        "requirements": [
+          {
+            "symbol": "mellea.stdlib.requirements.Requirement",
+            "args": {
+              "description": {
+                "value": "principles_applied must reference at least one of: Zero Trust, Defense in Depth, Security by Design, Continuous Monitoring, Automation First."
+              }
+            }
+          },
+          {
+            "symbol": "mellea.stdlib.requirements.Requirement",
+            "args": {
+              "description": {
+                "value": "When kind is 'architecture', architecture_blocks must be non-empty. When kind is 'compliance', compliance_findings must be non-empty. When kind is 'incident_response', incident_plan must be non-empty."
+              }
+            }
+          }
+        ]
+      },
+      "captures": {
+        "result": "#/outputs/response"
+      }
+    }
+  ],
+  "notes": [
+    "Frontmatter `tools: Read, Write, Edit, Bash` and `model: opus` are NOT first-class in descriptor v0. The model override is shoehorned via the MODEL_ID env var, as descriptor-schema-v0.md \u00a7'Known v0 gaps' anticipated.",
+    "The spec is ~970 lines of persona + embedded Terraform/Python/Bash reference material. The descriptor can carry the persona prelude in the prompt template, but it cannot carry the embedded code blocks as separate knowledge artefacts \u2014 they have to be either baked into the prompt verbatim or omitted. This is a real architectural pinch point.",
+    "Output is a SecurityResponse model whose populated fields depend on the request kind (architecture / compliance / incident response). Discriminated unions would express this cleanly; v0 schema only has flat models. Workaround: optional fields per response kind."
+  ],
+  "capabilities": {
+    "tools": {
+      "allowed": [
+        "Read",
+        "Write",
+        "Edit",
+        "Bash"
+      ],
+      "denied": []
+    }
+  }
+}
