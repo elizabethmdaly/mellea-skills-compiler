@@ -28,21 +28,9 @@ import pytest
 from mellea_skills_compiler.renderer import RenderResult, render_descriptor
 from mellea_skills_compiler.renderer.schemas import render_schemas
 
-# Repo layout: tests/mellea_skills_compiler/renderer/golden/conftest.py -> repo root is 4 parents up.
-REPO_ROOT = Path(__file__).resolve().parents[4]
-DESCRIPTORS_DIR = (
-    REPO_ROOT
-    / "melleafy-handoff"
-    / "kickoff"
-    / "spike-outputs"
-    / "descriptors"
-)
-SURFACE_PATH = (
-    REPO_ROOT
-    / "melleafy-handoff"
-    / "kickoff"
-    / "spike-outputs"
-    / "surface_0.5.0.json"
+from tests.mellea_skills_compiler.conftest import (
+    DESCRIPTOR_FIXTURE_DIR as DESCRIPTORS_DIR,
+    SURFACE_PATH,
 )
 
 

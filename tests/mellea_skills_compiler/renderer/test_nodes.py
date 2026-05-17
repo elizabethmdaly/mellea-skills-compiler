@@ -11,6 +11,7 @@ from mellea_skills_compiler.renderer.core import RenderContext
 from mellea_skills_compiler.renderer.nodes import (
     build_call,
     emit_call_node,
+    emit_call_node_stmts,
     emit_state,
     lower_arg,
     lower_template,

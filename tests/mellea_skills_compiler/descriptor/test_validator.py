@@ -163,21 +163,13 @@ def test_acceptance_criterion_1_known_good_descriptor(tmp_path):
     import json
     from pathlib import Path
 
-    descriptor_path = (
-        Path(__file__).parents[3]
-        / "melleafy-handoff"
-        / "kickoff"
-        / "spike-outputs"
-        / "descriptors"
-        / "sentry-find-bugs.descriptor.json"
+    from tests.mellea_skills_compiler.conftest import (
+        DESCRIPTOR_FIXTURE_DIR,
+        SURFACE_PATH,
     )
-    surface_path = (
-        Path(__file__).parents[3]
-        / "melleafy-handoff"
-        / "kickoff"
-        / "spike-outputs"
-        / "surface_0.5.0.json"
-    )
+
+    descriptor_path = DESCRIPTOR_FIXTURE_DIR / "sentry-find-bugs.descriptor.json"
+    surface_path = SURFACE_PATH
     descriptor = json.loads(descriptor_path.read_text())
     surface = json.loads(surface_path.read_text())
 

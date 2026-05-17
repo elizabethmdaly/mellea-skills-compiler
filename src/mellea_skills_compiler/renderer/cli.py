@@ -19,6 +19,7 @@ import datetime as _dt
 import json
 import sys
 from importlib import metadata as _md
+from importlib.resources import files as _resource_files
 from pathlib import Path
 
 from mellea_skills_compiler.renderer import RendererError, render_descriptor
@@ -30,6 +31,15 @@ from mellea_skills_compiler.renderer.artefacts import (
     render_setup_md,
 )
 from mellea_skills_compiler.renderer.schemas import render_schemas
+
+
+# Bundled surface JSON (Phase 0.2 spike output) — ships with the package via
+# ``src/mellea_skills_compiler/mellea_surface/data/`` and is located through
+# :mod:`importlib.resources` so it resolves whether running from a checkout or
+# an installed wheel.
+_DEFAULT_SURFACE_PATH = Path(
+    str(_resource_files("mellea_skills_compiler.mellea_surface") / "data" / "surface_0.5.0.json")
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -45,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     render_p.add_argument(
         "--surface",
         type=Path,
-        default=Path("melleafy-handoff/kickoff/spike-outputs/surface_0.5.0.json"),
+        default=_DEFAULT_SURFACE_PATH,
         help="Path to the introspected surface.json (default: Phase 0.2 spike output)",
     )
 
@@ -55,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     pkg_p.add_argument(
         "--surface",
         type=Path,
-        default=Path("melleafy-handoff/kickoff/spike-outputs/surface_0.5.0.json"),
+        default=_DEFAULT_SURFACE_PATH,
     )
     pkg_p.add_argument(
         "--mellea-version",

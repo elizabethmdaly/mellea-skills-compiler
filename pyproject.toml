@@ -49,3 +49,13 @@ mellea-skills = "mellea_skills_compiler.cli:app"
 
 [tool.pdm.build]
 package-dir = "src"
+# Bundled runtime data: the introspected Mellea surface JSON, the
+# descriptor schema markdown, and the one-shot descriptor example used as
+# defaults by :mod:`mellea_skills_compiler.compile.descriptor_emission`
+# and :mod:`mellea_skills_compiler.renderer.cli`. These ship with the wheel
+# and are resolved through :mod:`importlib.resources`.
+includes = [
+    "src/mellea_skills_compiler/mellea_surface/data/*.json",
+    "src/mellea_skills_compiler/descriptor/data/*.md",
+    "src/mellea_skills_compiler/compile/data/*.json",
+]

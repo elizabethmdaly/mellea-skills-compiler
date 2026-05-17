@@ -21,16 +21,9 @@ import pytest
 from mellea_skills_compiler.renderer import RenderResult, render_descriptor
 from mellea_skills_compiler.renderer.schemas import render_schemas
 
-# tests/mellea_skills_compiler/renderer/adversarial/conftest.py -> 4 parents to repo root.
-REPO_ROOT = Path(__file__).resolve().parents[4]
+from tests.mellea_skills_compiler.conftest import SURFACE_PATH
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
-SURFACE_PATH = (
-    REPO_ROOT
-    / "melleafy-handoff"
-    / "kickoff"
-    / "spike-outputs"
-    / "surface_0.5.0.json"
-)
 
 
 @dataclass

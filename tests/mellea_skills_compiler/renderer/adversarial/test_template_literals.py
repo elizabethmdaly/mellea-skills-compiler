@@ -36,14 +36,7 @@ from mellea_skills_compiler.renderer import render_descriptor
 from mellea_skills_compiler.renderer.schemas import render_schemas
 
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
-SURFACE_PATH = (
-    REPO_ROOT
-    / "melleafy-handoff"
-    / "kickoff"
-    / "spike-outputs"
-    / "surface_0.5.0.json"
-)
+from tests.mellea_skills_compiler.conftest import SURFACE_PATH
 
 
 @pytest.fixture(scope="module")

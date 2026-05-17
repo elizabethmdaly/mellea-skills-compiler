@@ -57,22 +57,12 @@ import pytest
 from mellea_skills_compiler.descriptor import validate
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-SURFACE_PATH = (
-    REPO_ROOT
-    / "melleafy-handoff"
-    / "kickoff"
-    / "spike-outputs"
-    / "surface_0.5.0.json"
+from tests.mellea_skills_compiler.conftest import (
+    DESCRIPTOR_FIXTURE_DIR,
+    SURFACE_PATH,
 )
-SENTRY_PATH = (
-    REPO_ROOT
-    / "melleafy-handoff"
-    / "kickoff"
-    / "spike-outputs"
-    / "descriptors"
-    / "sentry-find-bugs.descriptor.json"
-)
+
+SENTRY_PATH = DESCRIPTOR_FIXTURE_DIR / "sentry-find-bugs.descriptor.json"
 
 
 # --- Module-level constants for the rule codes under test --------------------

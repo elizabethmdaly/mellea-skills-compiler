@@ -9,11 +9,40 @@ Registers shared markers. Currently:
 
 Mirrors the ``network`` marker pattern in
 `tests/mellea_skills_compiler/cache/conftest.py`.
+
+Also exposes shared path helpers for the in-repo data fixtures:
+
+- :data:`SURFACE_PATH` — bundled introspected Mellea surface JSON.
+- :data:`SCHEMA_DOC_PATH` — bundled descriptor schema markdown.
+- :data:`DESCRIPTOR_FIXTURE_DIR` — hand-authored Phase 0.2 descriptors
+  used as renderer / validator inputs (under ``tests/fixtures/descriptors/``).
 """
 
 from __future__ import annotations
 
+from importlib.resources import files as _resource_files
+from pathlib import Path
+
 import pytest
+
+
+# --- Shared fixture paths ---------------------------------------------------
+#
+# Runtime defaults ship with the package under ``src/...data/``; we resolve
+# them through :mod:`importlib.resources` so tests don't depend on the
+# (gitignored) developer ``melleafy-handoff/`` tree.
+
+SURFACE_PATH: Path = Path(
+    str(_resource_files("mellea_skills_compiler.mellea_surface") / "data" / "surface_0.5.0.json")
+)
+SCHEMA_DOC_PATH: Path = Path(
+    str(_resource_files("mellea_skills_compiler.descriptor") / "data" / "descriptor-schema-v0.md")
+)
+
+# Descriptor fixtures live under ``tests/fixtures/descriptors/`` so they don't
+# ship in wheels. ``parents[2]`` = the repo's ``tests/`` directory.
+_TESTS_DIR = Path(__file__).resolve().parents[1]
+DESCRIPTOR_FIXTURE_DIR: Path = _TESTS_DIR / "fixtures" / "descriptors"
 
 
 def pytest_configure(config: pytest.Config) -> None:

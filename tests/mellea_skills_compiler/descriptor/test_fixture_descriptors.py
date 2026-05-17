@@ -23,12 +23,9 @@ import pytest
 from mellea_skills_compiler.descriptor import validate
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-SOURCE_DIR = (
-    REPO_ROOT / "melleafy-handoff" / "kickoff" / "spike-outputs" / "descriptors"
-)
-SURFACE_PATH = (
-    REPO_ROOT / "melleafy-handoff" / "kickoff" / "spike-outputs" / "surface_0.5.0.json"
+from tests.mellea_skills_compiler.conftest import (
+    DESCRIPTOR_FIXTURE_DIR as SOURCE_DIR,
+    SURFACE_PATH,
 )
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "v02"
 

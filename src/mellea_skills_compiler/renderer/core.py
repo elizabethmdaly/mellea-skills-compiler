@@ -29,7 +29,7 @@ from mellea_skills_compiler.renderer import (
     registered_operator_names,
 )
 from mellea_skills_compiler.renderer.nodes import (
-    emit_call_node,
+    emit_call_node_stmts,
     emit_state,
     lower_type,
     resolve_symbol,
@@ -60,6 +60,13 @@ class RenderContext:
       - the source map (descriptor-node id <-> Python line span)
       - v0.3: ``is_async`` flag (skill-level async transitive transform)
       - v0.3: ``source_elements_map`` (E-id → descriptor node id, ``mapping_report.md``)
+      - ``referenced_ids``: pre-computed set of descriptor-node ids that are
+        referenced downstream (via ``{"ref": <id>}`` in any args/operator
+        slot, or as the function's return value). Consumed by
+        ``emit_call_node`` to decide whether to emit the two-statement
+        thunk + parse form for ``m.instruct(..., format=Schema)`` calls
+        whose result is read downstream. Populated by ``render_descriptor``
+        prior to walking the pipeline.
     """
 
     descriptor: dict[str, Any]
@@ -73,6 +80,7 @@ class RenderContext:
     source_map: SourceMap = field(default_factory=SourceMap)
     is_async: bool = False
     source_elements_map: dict[str, list[str]] = field(default_factory=dict)
+    referenced_ids: set[str] = field(default_factory=set)
 
     # --- Construction helpers ------------------------------------------
 
@@ -227,7 +235,7 @@ def emit_pipeline_body(
             )
         if node["kind"] == "call":
             _verify_call_symbol(node, ctx, node_path)
-            stmts.append(emit_call_node(node, ctx, node_path))
+            stmts.extend(emit_call_node_stmts(node, ctx, node_path))
         elif node["kind"] == "composition":
             op_name = node.get("operator")
             if not op_name:
@@ -311,6 +319,14 @@ def render_descriptor(
     is_async = bool(skill_block.get("async", False)) if is_v03_plus else False
 
     ctx = RenderContext(descriptor=descriptor, surface=surface, is_async=is_async)
+
+    # Pre-scan descriptor for all downstream `{"ref": id}` references plus the
+    # return-capture id. Consumed by ``emit_call_node`` to decide whether to
+    # split ``m.instruct(..., format=Schema)`` into a thunk + parse pair (so
+    # the binding visible to downstream nodes is the parsed model). When the
+    # result is unreferenced we keep the inline form for byte-stable backward
+    # compatibility with the v0.1/v0.2 emission baseline.
+    ctx.referenced_ids = _collect_downstream_referenced_ids(descriptor)
 
     # Pre-scan inputs/outputs for annotation imports they need (v0.3 type
     # permissiveness — RFC §3.5 + G8.4). Done up-front so the import block
@@ -518,6 +534,56 @@ def _last_call_id(nodes: list[dict[str, Any]]) -> str | None:
         if n.get("kind") == "call":
             last = n.get("id", last)
     return last
+
+
+def _collect_downstream_referenced_ids(descriptor: dict[str, Any]) -> set[str]:
+    """Return the set of node ids referenced from elsewhere in the descriptor.
+
+    Walks every nested dict / list, scooping up:
+      - every ``{"ref": "<id>"}`` occurrence (in args, bound_to, operator
+        slots like ``on``, ``cases``, ``while``, etc.)
+      - the descriptor's return-value capture id (the first ``outputs[0]``
+        capture target, or the last call-node id if no capture is declared)
+
+    This set is consumed by :func:`emit_call_node` to decide whether an
+    ``m.instruct(..., format=Schema)`` call's binding needs to be split into
+    a ``<id>_thunk = ...`` / ``<id> = Schema.model_validate_json(<id>_thunk
+    .value)`` pair. When the binding is unreferenced we keep the inline
+    parse wrap so existing v0.1/v0.2 goldens stay byte-stable.
+
+    The walk is purposefully descriptor-shape agnostic: anything that looks
+    like ``{"ref": <str>}`` counts, regardless of where it sits. This avoids
+    coupling to specific operator schemas (plan §5.4 — no per-symbol logic).
+    """
+    refs: set[str] = set()
+
+    def _visit(node: Any) -> None:
+        if isinstance(node, dict):
+            ref = node.get("ref")
+            if isinstance(ref, str) and ref:
+                refs.add(ref)
+            for v in node.values():
+                _visit(v)
+        elif isinstance(node, list):
+            for item in node:
+                _visit(item)
+
+    _visit(descriptor.get("pipeline", []))
+    _visit(descriptor.get("state", []))
+
+    # Return-value capture: if outputs declare a capture target, mark it.
+    # Otherwise fall back to the last call-node id (matches the rule in
+    # ``_build_return_stmt``).
+    outputs = descriptor.get("outputs", []) or []
+    if outputs:
+        out_name = outputs[0].get("name")
+        cap_id = _find_capture_id(descriptor.get("pipeline", []), out_name) if out_name else None
+        if cap_id is None:
+            cap_id = _last_call_id(descriptor.get("pipeline", []))
+        if cap_id:
+            refs.add(cap_id)
+
+    return refs
 
 
 def _walk(nodes: list[dict[str, Any]]):

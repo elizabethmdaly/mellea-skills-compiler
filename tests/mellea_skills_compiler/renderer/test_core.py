@@ -16,9 +16,13 @@ from mellea_skills_compiler.renderer import (
     render_descriptor,
 )
 
+from tests.mellea_skills_compiler.conftest import (
+    DESCRIPTOR_FIXTURE_DIR,
+    SURFACE_PATH as SURFACE,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
-SENTRY_DESC = REPO_ROOT / "melleafy-handoff" / "kickoff" / "spike-outputs" / "descriptors" / "sentry-find-bugs.descriptor.json"
-SURFACE = REPO_ROOT / "melleafy-handoff" / "kickoff" / "spike-outputs" / "surface_0.5.0.json"
+SENTRY_DESC = DESCRIPTOR_FIXTURE_DIR / "sentry-find-bugs.descriptor.json"
 
 
 # --- Fixtures -------------------------------------------------------------
@@ -140,11 +144,22 @@ def test_rendered_imports_schemas_from_relative_module(sentry_result: RenderResu
 
 
 def test_rendered_emits_format_schema_parse_wrap(sentry_result: RenderResult) -> None:
-    """Every call with `format=Schema` is wrapped in `Schema.model_validate_json(...).value`."""
+    """Every call with `format=Schema` is wrapped in `Schema.model_validate_json(...).value`.
+
+    Downstream-referenced bindings (``extract_files`` is read by the map's
+    ``over`` ref; ``audit`` is the run_pipeline return value) use the
+    two-statement thunk/parse split — i.e. ``<id>_thunk = session.instruct(
+    ..., format=Schema)`` followed by ``<id> = Schema.model_validate_json(
+    <id>_thunk.value)``. The wrap is what the assertion checks; the call
+    is the prior line.
+    """
     src = sentry_result.pipeline_py
-    assert "ModifiedFiles.model_validate_json(session.instruct(" in src
-    assert ".value)" in src
-    assert "FindingsReport.model_validate_json(session.instruct(" in src
+    # extract_files is referenced downstream → two-statement form.
+    assert "extract_files_thunk = session.instruct(" in src
+    assert "extract_files = ModifiedFiles.model_validate_json(extract_files_thunk.value)" in src
+    # audit is the return value → also two-statement form.
+    assert "audit_thunk = session.instruct(" in src
+    assert "audit = FindingsReport.model_validate_json(audit_thunk.value)" in src
 
 
 def test_rendered_state_assignments_module_level(sentry_result: RenderResult) -> None:

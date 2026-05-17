@@ -52,16 +52,9 @@ from mellea_skills_compiler.renderer import render_descriptor
 from mellea_skills_compiler.renderer.source_map import SourceMap, SourceMapEntry
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-SURFACE_PATH = (
-    REPO_ROOT
-    / "melleafy-handoff"
-    / "kickoff"
-    / "spike-outputs"
-    / "surface_0.5.0.json"
-)
-DESCRIPTOR_DIR = (
-    REPO_ROOT / "melleafy-handoff" / "kickoff" / "spike-outputs" / "descriptors"
+from tests.mellea_skills_compiler.conftest import (
+    DESCRIPTOR_FIXTURE_DIR as DESCRIPTOR_DIR,
+    SURFACE_PATH,
 )
 
 

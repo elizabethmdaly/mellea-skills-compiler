@@ -176,3 +176,13 @@ cython_debug/
 .vscode
 .DS_Store
 .python-version
+
+# Local Mellea docs cache (derived artefacts; see src/mellea_skills_compiler/cache/)
+.mellea-cache/
+
+# Developer-only handoff scratch area. The code-needed pieces (surface JSON,
+# descriptor schema, one-shot descriptor) have been relocated into the package
+# under src/mellea_skills_compiler/.../data/ and into tests/fixtures/.
+# Everything left under this tree is plan/process documentation that is
+# not required to install, run, or test the project.
+melleafy-handoff/

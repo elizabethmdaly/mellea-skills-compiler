@@ -33,10 +33,7 @@ from mellea_skills_compiler.renderer import render_descriptor
 from mellea_skills_compiler.renderer.schemas import render_schemas
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-SURFACE_PATH = (
-    REPO_ROOT / "melleafy-handoff" / "kickoff" / "spike-outputs" / "surface_0.5.0.json"
-)
+from tests.mellea_skills_compiler.conftest import SURFACE_PATH
 
 
 @pytest.fixture(scope="module")
@@ -182,8 +179,11 @@ def test_synthetic_v03_emits_dependency_artefacts(surface):
     src = result.pipeline_py
     # delegate_to_runtime → Callable kwarg
     assert "search_fn: Callable[[str], list[str]]" in src
-    # load_from_disk → _owasp_refs constant + _load_owasp_refs helper
-    assert "_owasp_refs = Path(__file__).parent" in src
+    # load_from_disk → _owasp_refs_PATH constant + _load_owasp_refs helper.
+    # The constant is suffixed _PATH and the path-join chain is per-segment so
+    # the leftmost operand is literally Path(__file__).parent (Rule OUT-6 /
+    # the bundled-asset-path-resolution lint).
+    assert "_owasp_refs_PATH = Path(__file__).parent" in src
     assert "def _load_owasp_refs" in src
     # stub → scratchpad function
     assert "def scratchpad(content: str) -> None:" in src

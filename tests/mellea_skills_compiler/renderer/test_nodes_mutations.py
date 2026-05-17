@@ -64,38 +64,14 @@ from mellea_skills_compiler.renderer.nodes import emit_call_node, emit_state
 from mellea_skills_compiler.renderer.core import RenderContext
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-SURFACE_PATH = (
-    REPO_ROOT
-    / "melleafy-handoff"
-    / "kickoff"
-    / "spike-outputs"
-    / "surface_0.5.0.json"
+from tests.mellea_skills_compiler.conftest import (
+    DESCRIPTOR_FIXTURE_DIR,
+    SURFACE_PATH,
 )
-SENTRY_PATH = (
-    REPO_ROOT
-    / "melleafy-handoff"
-    / "kickoff"
-    / "spike-outputs"
-    / "descriptors"
-    / "sentry-find-bugs.descriptor.json"
-)
-SECURITY_REVIEW_PATH = (
-    REPO_ROOT
-    / "melleafy-handoff"
-    / "kickoff"
-    / "spike-outputs"
-    / "descriptors"
-    / "security-review.descriptor.json"
-)
-SECURITY_ENGINEER_PATH = (
-    REPO_ROOT
-    / "melleafy-handoff"
-    / "kickoff"
-    / "spike-outputs"
-    / "descriptors"
-    / "security-engineer.descriptor.json"
-)
+
+SENTRY_PATH = DESCRIPTOR_FIXTURE_DIR / "sentry-find-bugs.descriptor.json"
+SECURITY_REVIEW_PATH = DESCRIPTOR_FIXTURE_DIR / "security-review.descriptor.json"
+SECURITY_ENGINEER_PATH = DESCRIPTOR_FIXTURE_DIR / "security-engineer.descriptor.json"
 
 
 @pytest.fixture(scope="module")

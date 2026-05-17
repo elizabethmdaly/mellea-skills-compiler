@@ -1,0 +1,202 @@
+{
+  "descriptor_version": "0.1",
+  "mellea_version": "0.5.0",
+  "skill": {
+    "name": "security-review",
+    "classification": "DSL"
+  },
+  "_notes": [
+    "Frontmatter `allowed-tools: Read, Grep, Glob, Bash, Task` and `license: LICENSE` are NOT representable in descriptor v0. See descriptor-schema-v0.md §'Known v0 gaps'. Flagged in phase0-2-report.md.",
+    "The 'research vs reporting' distinction in the spec is embedded in prompt text — the descriptor can only express this via prompt content, not as a separate scope artefact."
+  ],
+  "inputs": [
+    {
+      "name": "code",
+      "schema": { "kind": "str" },
+      "description": "Code or diff to review for security vulnerabilities."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "report",
+      "schema": { "kind": "model_ref", "ref": "#/schemas/SecurityReviewReport" }
+    }
+  ],
+  "schemas": {
+    "Severity": {
+      "kind": "enum",
+      "members": ["Critical", "High", "Medium", "Low"]
+    },
+    "ConfidenceLevel": {
+      "kind": "enum",
+      "members": ["HIGH", "MEDIUM", "LOW"]
+    },
+    "VulnerabilityCategory": {
+      "kind": "enum",
+      "members": [
+        "Injection",
+        "XSS",
+        "Authentication",
+        "Authorization_IDOR",
+        "Cryptography",
+        "Deserialization",
+        "File_security",
+        "SSRF",
+        "CSRF",
+        "Data_protection",
+        "API_security",
+        "Business_logic",
+        "Modern_threats",
+        "Misconfiguration",
+        "Error_handling",
+        "Supply_chain",
+        "Logging"
+      ]
+    },
+    "PotentialFinding": {
+      "kind": "model",
+      "fields": {
+        "vuln_id": { "type": "str" },
+        "category": { "type": "enum_ref", "ref": "#/schemas/VulnerabilityCategory" },
+        "location": { "type": "str" },
+        "snippet": { "type": "str" },
+        "rationale": { "type": "str" }
+      }
+    },
+    "PotentialFindings": {
+      "kind": "model",
+      "fields": {
+        "language_or_framework": { "type": "str" },
+        "candidates": { "type": "list[PotentialFinding]" }
+      }
+    },
+    "ExploitabilityVerdict": {
+      "kind": "model",
+      "fields": {
+        "vuln_id": { "type": "str" },
+        "confidence": { "type": "enum_ref", "ref": "#/schemas/ConfidenceLevel" },
+        "attacker_controlled_input": { "type": "bool" },
+        "framework_mitigates": { "type": "bool" },
+        "data_flow_trace": { "type": "str" },
+        "issue_description": { "type": "str", "optional": true },
+        "severity": { "type": "enum_ref", "ref": "#/schemas/Severity", "optional": true },
+        "fix": { "type": "str", "optional": true }
+      }
+    },
+    "ConfirmedFinding": {
+      "kind": "model",
+      "fields": {
+        "vuln_id": { "type": "str" },
+        "category": { "type": "enum_ref", "ref": "#/schemas/VulnerabilityCategory" },
+        "severity": { "type": "enum_ref", "ref": "#/schemas/Severity" },
+        "location": { "type": "str" },
+        "issue": { "type": "str" },
+        "impact": { "type": "str" },
+        "evidence": { "type": "str" },
+        "fix": { "type": "str" }
+      }
+    },
+    "NeedsVerification": {
+      "kind": "model",
+      "fields": {
+        "vuln_id": { "type": "str" },
+        "location": { "type": "str" },
+        "question": { "type": "str" }
+      }
+    },
+    "SecurityReviewReport": {
+      "kind": "model",
+      "fields": {
+        "summary": { "type": "str" },
+        "risk_level": { "type": "enum_ref", "ref": "#/schemas/Severity" },
+        "findings": { "type": "list[ConfirmedFinding]" },
+        "needs_verification": { "type": "list[NeedsVerification]" }
+      }
+    }
+  },
+  "state": [
+    {
+      "id": "backend",
+      "symbol": "mellea.backends.openai.OpenAIBackend",
+      "args": {
+        "model_id": { "env": "MODEL_ID" }
+      }
+    },
+    {
+      "id": "session",
+      "symbol": "mellea.stdlib.session.MelleaSession",
+      "args": {
+        "backend": { "ref": "backend" }
+      }
+    }
+  ],
+  "pipeline": [
+    {
+      "id": "detect_and_enumerate",
+      "kind": "call",
+      "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+      "bound_to": { "ref": "session" },
+      "args": {
+        "description": {
+          "template": "You are a security code reviewer. Detect the language/framework and enumerate every potential vulnerability you see in the code below. DO NOT yet decide confidence — list candidates only. Cover injection, XSS, authn/authz, crypto, deserialization, file handling, SSRF, CSRF, data protection, API security, business logic, modern threats, misconfiguration, error handling, supply chain, logging. Skip test files, dead code, commented code.\n\nCode:\n{code}"
+        },
+        "format": { "schema_ref": "#/schemas/PotentialFindings" }
+      }
+    },
+    {
+      "id": "map_verify_exploitability",
+      "kind": "composition",
+      "operator": "map",
+      "over": { "ref": "detect_and_enumerate", "select": "candidates" },
+      "item_id": "candidate",
+      "collect": "list",
+      "body": [
+        {
+          "id": "verdict_step",
+          "kind": "call",
+          "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+          "bound_to": { "ref": "session" },
+          "args": {
+            "description": {
+              "template": "Verify exploitability for vulnerability `{candidate.vuln_id}` ({candidate.category}) at `{candidate.location}`.\n\nResearch the data flow: where does the input come from? Is it attacker-controlled (request.GET, request.POST, request.json, request.headers, request.cookies, URL path segments, file uploads, WebSocket messages) — or server-controlled (settings.*, os.environ, config files, hardcoded constants, signed session data)?\n\nDoes the framework mitigate this? (Django auto-escape, React JSX escape, ORM parameterization, etc.) Is there upstream validation or sanitization?\n\nReturn confidence HIGH only when you have a vulnerable pattern AND attacker-controlled input AND no framework mitigation. Return MEDIUM when the input source is unclear. Return LOW for theoretical / defense-in-depth issues.\n\nCandidate snippet:\n{candidate.snippet}\n\nReviewer rationale: {candidate.rationale}"
+            },
+            "format": { "schema_ref": "#/schemas/ExploitabilityVerdict" },
+            "requirements": [
+              {
+                "symbol": "mellea.stdlib.requirements.Requirement",
+                "args": {
+                  "description": {
+                    "value": "If confidence is HIGH, severity, issue_description and fix MUST be populated. If confidence is MEDIUM or LOW, these MAY be null."
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "report",
+      "kind": "call",
+      "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+      "bound_to": { "ref": "session" },
+      "args": {
+        "description": {
+          "template": "Build the final SecurityReviewReport. Include only HIGH-confidence verdicts in `findings`. Put MEDIUM-confidence verdicts in `needs_verification`. Drop LOW-confidence verdicts entirely. Compute risk_level from the highest severity in findings. If no high-confidence vulnerabilities exist, summary = 'No high-confidence vulnerabilities identified.'"
+        },
+        "format": { "schema_ref": "#/schemas/SecurityReviewReport" },
+        "requirements": [
+          {
+            "symbol": "mellea.stdlib.requirements.Requirement",
+            "args": {
+              "description": {
+                "value": "Findings list must contain only items with HIGH confidence. Do not invent issues that weren't in the verification step."
+              }
+            }
+          }
+        ]
+      },
+      "captures": { "result": "#/outputs/report" }
+    }
+  ]
+}

@@ -364,6 +364,12 @@ def emit_call_node(node: dict[str, Any], ctx: "RenderContext", descriptor_path: 
         call expression in ``await`` per plan §11.9.
       - ``source_elements: ["E14", ...]`` → propagated to the source map for
         Step 6's ``mapping_report.md`` builder; renderer otherwise ignores.
+
+    Returns a single ``ast.stmt``. Callers that may need a multi-statement
+    emission (e.g. the ``format=Schema`` two-step thunk/parse split for
+    downstream-referenced results) should use :func:`emit_call_node_stmts`,
+    which delegates here for the single-stmt cases and otherwise returns the
+    two statements directly.
     """
     call = build_call(
         symbol=node["symbol"],
@@ -436,6 +442,88 @@ def emit_call_node(node: dict[str, Any], ctx: "RenderContext", descriptor_path: 
     stmt = ast.Assign(targets=[ast.Name(id=node["id"])], value=rhs)
     _record_source_elements(ctx, node, stmt, descriptor_path)
     return SourceMap.tag_stmt(stmt, node["id"], descriptor_path)
+
+
+def emit_call_node_stmts(
+    node: dict[str, Any],
+    ctx: "RenderContext",
+    descriptor_path: str = "",
+) -> list[ast.stmt]:
+    """Emit a call descriptor node, returning one or two statements.
+
+    When the call has ``format={schema_ref: ...}``, is **not streaming**,
+    and the node's ``id`` is referenced downstream
+    (``ctx.referenced_ids``), emit the safer two-statement form::
+
+        <id>_thunk = session.instruct(..., format=<Schema>)
+        <id> = <Schema>.model_validate_json(<id>_thunk.value)
+
+    This makes the binding visible to downstream nodes (and to the return
+    statement) the **parsed Pydantic model**, not the raw thunk — closing
+    the gap that the ``instruct-result-parse-before-access`` lint catches
+    post-render. The lint exempts the
+    ``<Schema>.model_validate_json(<id>_thunk.value)`` call when its first
+    argument is the attribute access ``<id>_thunk.value`` for a Name bound
+    earlier in the same scope from an ``m.instruct`` call carrying a
+    ``format=`` kwarg.
+
+    Falls back to a single statement (delegating to :func:`emit_call_node`)
+    in every other case — no ``format=Schema``, format is a primitive /
+    plain Python type instead of a ``schema_ref``, the result is not
+    referenced anywhere downstream, or the call is streaming (which already
+    binds the parsed model directly without a thunk in scope).
+    """
+    args = node.get("args", {}) or {}
+    schema_name = _format_arg_schema_name(args)
+    streaming = bool(node.get("streaming", False))
+    node_id = node.get("id")
+    referenced = bool(node_id and node_id in getattr(ctx, "referenced_ids", set()))
+
+    if not (schema_name and referenced) or streaming:
+        return [emit_call_node(node, ctx, descriptor_path)]
+
+    # Two-statement form. We rebuild the underlying call here rather than
+    # try to peel apart emit_call_node's wrap, because the wrap is built
+    # inline (Schema.model_validate_json(<call>.value)) and reusing it
+    # would entail unwrapping AST nodes. This stays consistent with
+    # emit_call_node by routing through the same build_call + register
+    # path (so imports, schema uses, source-map tagging stay aligned).
+    call = build_call(
+        symbol=node["symbol"],
+        bound_to=node.get("bound_to"),
+        args=args,
+        ctx=ctx,
+    )
+    ctx.register_id(node_id, "pipeline")  # type: ignore[arg-type]
+    ctx.register_schema_use(schema_name)
+
+    is_async = getattr(ctx, "is_async", False)
+    rhs: ast.expr = call
+    if is_async:
+        rhs = ast.Await(value=rhs)
+
+    thunk_name = f"{node_id}_thunk"
+    thunk_assign: ast.stmt = ast.Assign(
+        targets=[ast.Name(id=thunk_name)],
+        value=rhs,
+    )
+    parse_call = ast.Call(
+        func=ast.Attribute(value=ast.Name(id=schema_name), attr="model_validate_json"),
+        args=[ast.Attribute(value=ast.Name(id=thunk_name), attr="value")],
+        keywords=[],
+    )
+    parsed_assign: ast.stmt = ast.Assign(
+        targets=[ast.Name(id=node_id)],  # type: ignore[arg-type]
+        value=parse_call,
+    )
+
+    # Tag both stmts in the source map for traceability; the descriptor
+    # node maps to a 2-line span, and the tag-anchored first stmt is the
+    # repair-loop entry point.
+    _record_source_elements(ctx, node, thunk_assign, descriptor_path)
+    SourceMap.tag_stmt(thunk_assign, node_id, descriptor_path)  # type: ignore[arg-type]
+    SourceMap.tag_stmt(parsed_assign, node_id, descriptor_path)  # type: ignore[arg-type]
+    return [thunk_assign, parsed_assign]
 
 
 def _record_source_elements(

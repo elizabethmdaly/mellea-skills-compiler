@@ -22,10 +22,7 @@ from mellea_skills_compiler.renderer.dependencies import (
 )
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-SURFACE_PATH = (
-    REPO_ROOT / "melleafy-handoff" / "kickoff" / "spike-outputs" / "surface_0.5.0.json"
-)
+from tests.mellea_skills_compiler.conftest import SURFACE_PATH
 
 
 @pytest.fixture(scope="module")
@@ -173,6 +170,21 @@ def test_mock_returns_magicmock(surface):
 # --- load_from_disk -------------------------------------------------------
 
 
+def _write_pkg_with_pipeline(tmp_path: Path, src: str) -> Path:
+    """Write a minimal package at tmp_path containing the given pipeline.py.
+
+    Returns the package directory. The pipeline.py is prefixed with the
+    ``from pathlib import Path`` import the renderer would emit so the file
+    is syntactically valid for the lint's ast.parse.
+    """
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    full = "from pathlib import Path\n" + src + "\n"
+    (pkg / "pipeline.py").write_text(full)
+    return pkg
+
+
 def test_load_from_disk_emits_path_constant_and_helper(surface):
     desc = {
         "dependencies": [
@@ -187,10 +199,214 @@ def test_load_from_disk_emits_path_constant_and_helper(surface):
     ctx = _ctx(surface, desc)
     art = render_dependencies(desc, ctx)
     src = _unparse(art.top_level_stmts)
-    assert "_owasp = Path(__file__).parent / 'references/owasp.md'" in src
+    # _PATH suffix distinguishes the constant from any same-id symbol the
+    # LLM might emit later; per-segment "/" path-join is the exact AST shape
+    # the bundled-asset-path-resolution lint accepts.
+    assert "_owasp_PATH = Path(__file__).parent / 'references' / 'owasp.md'" in src
     assert "def _load_owasp() -> str" in src
-    assert "_owasp.read_text(encoding='utf-8')" in src
+    assert "_owasp_PATH.read_text(encoding='utf-8')" in src
     assert "pathlib" in ctx.imports
+
+
+def test_load_from_disk_emits_path_file_parent(surface):
+    """The emitted path resolution MUST be rooted at Path(__file__).parent
+    (Rule OUT-6) — never via Path(repo_root), an injected function arg,
+    os.getcwd(), or a module-level _PKG_DIR constant."""
+    desc = {
+        "dependencies": [
+            {
+                "id": "owasp",
+                "kind": "file",
+                "disposition": "load_from_disk",
+                "path": "references/owasp.md",
+            }
+        ]
+    }
+    art = render_dependencies(desc, _ctx(surface, desc))
+    src = _unparse(art.top_level_stmts)
+    assert "Path(__file__).parent" in src
+    # Forbidden shapes — defense in depth against accidental regressions.
+    assert "Path(repo_root)" not in src
+    assert "os.getcwd" not in src
+    assert "_PKG_DIR" not in src
+
+
+def test_load_from_disk_emits_const_and_loader(surface):
+    """Both the module-level path constant AND the loader helper must be
+    present in the artefact (RFC §3.1: load_from_disk renders as
+    'Path constant + _load_<id>() helper')."""
+    desc = {
+        "dependencies": [
+            {
+                "id": "owasp",
+                "kind": "file",
+                "disposition": "load_from_disk",
+                "path": "references/owasp.md",
+            }
+        ]
+    }
+    art = render_dependencies(desc, _ctx(surface, desc))
+    assert len(art.top_level_stmts) == 2
+    const_stmt, helper_stmt = art.top_level_stmts
+    assert isinstance(const_stmt, ast.Assign)
+    assert isinstance(const_stmt.targets[0], ast.Name)
+    assert const_stmt.targets[0].id == "_owasp_PATH"
+    assert isinstance(helper_stmt, ast.FunctionDef)
+    assert helper_stmt.name == "_load_owasp"
+
+
+def test_load_from_disk_lint_passes(surface, tmp_path):
+    """The rendered artefact must satisfy lint_bundled_asset_path_resolution
+    (Rule OUT-6 / Rule 2.5-2). The lint, not just substring checks, is the
+    contract — assert verdict directly."""
+    from mellea_skills_compiler.compile.lints import lint_bundled_asset_path_resolution
+
+    desc = {
+        "dependencies": [
+            {
+                "id": "owasp",
+                "kind": "file",
+                "disposition": "load_from_disk",
+                "path": "references/owasp.md",
+            }
+        ]
+    }
+    art = render_dependencies(desc, _ctx(surface, desc))
+    src = _unparse(art.top_level_stmts)
+    pkg = _write_pkg_with_pipeline(tmp_path, src)
+    result = lint_bundled_asset_path_resolution(pkg)
+    assert result.verdict == "pass", [f.message for f in result.failures]
+
+
+def test_load_from_disk_lint_passes_with_multiple_deps(surface, tmp_path):
+    """Multiple load_from_disk deps spread across references/ and scripts/
+    must all render lint-clean."""
+    from mellea_skills_compiler.compile.lints import lint_bundled_asset_path_resolution
+
+    desc = {
+        "dependencies": [
+            {
+                "id": "owasp",
+                "kind": "file",
+                "disposition": "load_from_disk",
+                "path": "references/owasp.md",
+            },
+            {
+                "id": "playbook",
+                "kind": "file",
+                "disposition": "load_from_disk",
+                "path": "references/playbooks/xss.md",
+            },
+            {
+                "id": "linter",
+                "kind": "file",
+                "disposition": "load_from_disk",
+                "path": "scripts/lint.sh",
+            },
+            {
+                "id": "logo",
+                "kind": "file",
+                "disposition": "load_from_disk",
+                "path": "assets/logo.png",
+            },
+        ]
+    }
+    art = render_dependencies(desc, _ctx(surface, desc))
+    src = _unparse(art.top_level_stmts)
+    pkg = _write_pkg_with_pipeline(tmp_path, src)
+    result = lint_bundled_asset_path_resolution(pkg)
+    assert result.verdict == "pass", [f.message for f in result.failures]
+
+
+def test_load_from_disk_nested_paths_split_per_segment(surface):
+    """Nested paths (e.g. references/sub/file.md) must split into per-segment
+    path-joins; collapsing into a single 'sub/file.md' constant works for the
+    lint today but loses the canonical OUT-6 shape and is harder to read."""
+    desc = {
+        "dependencies": [
+            {
+                "id": "nested",
+                "kind": "file",
+                "disposition": "load_from_disk",
+                "path": "references/sub/file.md",
+            }
+        ]
+    }
+    art = render_dependencies(desc, _ctx(surface, desc))
+    src = _unparse(art.top_level_stmts)
+    assert (
+        "_nested_PATH = Path(__file__).parent / 'references' / 'sub' / 'file.md'"
+        in src
+    )
+
+
+def test_load_from_disk_synthetic_against_failing_skill(surface, tmp_path):
+    """Synthesise a descriptor matching the shape that produced the
+    gdpr-breach-sentinel failure (three references/ load_from_disk deps) and
+    confirm the renderer's output is lint-clean — a regression test for the
+    specific failure that motivated this fix."""
+    from mellea_skills_compiler.compile.lints import lint_bundled_asset_path_resolution
+
+    desc = {
+        "dependencies": [
+            {
+                "id": "enisa_methodology",
+                "kind": "file",
+                "disposition": "load_from_disk",
+                "path": "references/enisa-methodology.md",
+            },
+            {
+                "id": "edpb_cases",
+                "kind": "file",
+                "disposition": "load_from_disk",
+                "path": "references/edpb-cases.md",
+            },
+            {
+                "id": "templates",
+                "kind": "file",
+                "disposition": "load_from_disk",
+                "path": "references/templates.md",
+            },
+        ]
+    }
+    art = render_dependencies(desc, _ctx(surface, desc))
+    src = _unparse(art.top_level_stmts)
+    pkg = _write_pkg_with_pipeline(tmp_path, src)
+    result = lint_bundled_asset_path_resolution(pkg)
+    assert result.verdict == "pass", [f.message for f in result.failures]
+
+
+def test_load_from_disk_tolerates_messy_path(surface):
+    """Defensively normalise leading/trailing/duplicate slashes and Windows
+    backslashes — the schema validator doesn't reject these, and a single
+    malformed descriptor path shouldn't crash the renderer or emit a broken
+    AST. Output must still be lint-clean."""
+    desc = {
+        "dependencies": [
+            {
+                "id": "msg",
+                "kind": "file",
+                "disposition": "load_from_disk",
+                "path": "/references//owasp.md",
+            }
+        ]
+    }
+    art = render_dependencies(desc, _ctx(surface, desc))
+    src = _unparse(art.top_level_stmts)
+    assert "_msg_PATH = Path(__file__).parent / 'references' / 'owasp.md'" in src
+
+
+def test_load_from_disk_empty_path_after_normalisation_raises(surface):
+    """A path that normalises to nothing (e.g. "/", "//") is a hard error;
+    silently emitting Path(__file__).parent alone would lose the file
+    reference and the resulting pipeline would crash at runtime."""
+    desc = {
+        "dependencies": [
+            {"id": "x", "kind": "file", "disposition": "load_from_disk", "path": "/"}
+        ]
+    }
+    with pytest.raises(RendererError, match="must not be empty"):
+        render_dependencies(desc, _ctx(surface, desc))
 
 
 def test_load_from_disk_requires_path(surface):

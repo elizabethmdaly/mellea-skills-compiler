@@ -44,6 +44,8 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from importlib import metadata as _md
+from importlib.resources import files as _resource_files
+from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -59,17 +61,16 @@ _LOGGER = logging.getLogger(__name__)
 
 
 # --- Defaults: bundled prompt resources -------------------------------------
+#
+# These ship with the wheel under ``src/mellea_skills_compiler/.../data/``
+# and are resolved via :mod:`importlib.resources` so they're locatable
+# regardless of where the package is installed.
 
-# Repo root: src/mellea_skills_compiler/compile/descriptor_emission.py -> parents[3]
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-_DEFAULT_SCHEMA_DOC = _REPO_ROOT / "melleafy-handoff" / "kickoff" / "descriptor-schema-v0.md"
-_DEFAULT_ONE_SHOT_DESCRIPTOR = (
-    _REPO_ROOT
-    / "melleafy-handoff"
-    / "kickoff"
-    / "spike-outputs"
-    / "descriptors"
-    / "sentry-find-bugs.descriptor.json"
+_DEFAULT_SCHEMA_DOC: Traversable = (
+    _resource_files("mellea_skills_compiler.descriptor") / "data" / "descriptor-schema-v0.md"
+)
+_DEFAULT_ONE_SHOT_DESCRIPTOR: Traversable = (
+    _resource_files("mellea_skills_compiler.compile") / "data" / "sentry-find-bugs.descriptor.json"
 )
 
 
@@ -131,10 +132,10 @@ class EmissionConfig:
     descriptor_schema_version: str = "0.2"
     intermediate_artefacts: dict[str, Any] | None = None
 
-    def resolved_one_shot_path(self) -> Path:
+    def resolved_one_shot_path(self) -> Path | Traversable:
         return self.one_shot_descriptor_path or _DEFAULT_ONE_SHOT_DESCRIPTOR
 
-    def resolved_schema_doc_path(self) -> Path:
+    def resolved_schema_doc_path(self) -> Path | Traversable:
         return self.schema_doc_path or _DEFAULT_SCHEMA_DOC
 
 

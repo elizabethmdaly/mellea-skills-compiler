@@ -354,6 +354,19 @@ def _emit_load_from_disk(dep: dict, art: DependenciesArtefact, ctx: "RenderConte
 
     The Path is constructed relative to ``__file__`` so the rendered package
     can find the file at runtime regardless of where it's installed.
+
+    The emission shape is exactly what the ``bundled-asset-path-resolution``
+    Step 7 lint accepts (Rule OUT-6, Rule 2.5-2): a single chained ``BinOp``
+    whose leftmost operand is the literal ``Path(__file__).parent`` and whose
+    right operands are per-segment string constants (top-level bundled dir
+    first, then nested path segments, then the file). The lint rejects any
+    indirection via a module-level constant alias (e.g. ``_PKG_DIR``) because
+    such a Name can in principle be rebound, so we always inline the
+    ``Path(__file__).parent`` expression directly in the path-join chain.
+
+    Constant name is ``_<id>_PATH`` (the trailing ``_PATH`` distinguishes the
+    path constant from any same-id symbol the LLM might emit downstream); the
+    helper ``_load_<id>()`` references that constant to read the file.
     """
     path = dep.get("path")
     if not path:
@@ -362,24 +375,43 @@ def _emit_load_from_disk(dep: dict, art: DependenciesArtefact, ctx: "RenderConte
         )
     ctx.add_import("pathlib", "Path")
     dep_id = dep["id"]
-    const_name = f"_{dep_id}"
-    # _<id> = Path(__file__).parent / "<path>"
+    const_name = f"_{dep_id}_PATH"
+
+    # Split the path into per-segment string constants so the emitted chain
+    # is exactly ``Path(__file__).parent / "<dir>" / [<nested>/] "<file>"``.
+    # Splitting on "/" is correct here: descriptor paths are POSIX-style
+    # (RFC §3.1 — paths are always relative-from-skill-root, "/"-separated).
+    # We tolerate (and normalise) any leading/trailing/duplicate slashes
+    # defensively because the schema validator does not reject them.
+    segments = [seg for seg in path.replace("\\", "/").split("/") if seg]
+    if not segments:
+        raise RendererError(
+            f"dependency {dep.get('id')!r}: load_from_disk 'path' must not be "
+            f"empty after normalisation (got {path!r})"
+        )
+
+    # Build the chained BinOp: Path(__file__).parent / "seg1" / "seg2" / ...
+    path_expr: ast.expr = ast.Attribute(
+        value=ast.Call(
+            func=ast.Name(id="Path"),
+            args=[ast.Name(id="__file__")],
+            keywords=[],
+        ),
+        attr="parent",
+    )
+    for seg in segments:
+        path_expr = ast.BinOp(
+            left=path_expr,
+            op=ast.Div(),
+            right=ast.Constant(value=seg),
+        )
+
+    # _<id>_PATH = Path(__file__).parent / "<dir>" / ... / "<file>"
     const_stmt = ast.Assign(
         targets=[ast.Name(id=const_name)],
-        value=ast.BinOp(
-            left=ast.Attribute(
-                value=ast.Call(
-                    func=ast.Name(id="Path"),
-                    args=[ast.Name(id="__file__")],
-                    keywords=[],
-                ),
-                attr="parent",
-            ),
-            op=ast.Div(),
-            right=ast.Constant(value=path),
-        ),
+        value=path_expr,
     )
-    # def _load_<id>() -> str: return _<id>.read_text(encoding="utf-8")
+    # def _load_<id>() -> str: return _<id>_PATH.read_text(encoding="utf-8")
     helper_fn = ast.FunctionDef(
         name=f"_load_{dep_id}",
         args=ast.arguments(

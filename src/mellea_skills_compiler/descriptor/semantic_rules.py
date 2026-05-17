@@ -200,7 +200,11 @@ def run_all(
                 descriptor=descriptor, inventory=inventory
             )
         )
-        # Layered-defence rules ship at warning severity per RFC §4.
+        # Layered-defence rules. R-SEM-CALL-ARGS-MATCH-SIG fires at ERROR
+        # severity (promoted from WARNING after the gdpr-privacy-notice
+        # 2026-05-17 evidence — see _check_call_args_match_sig docstring).
+        # R-SEM-REF-SELECT-RESOLVES stays at WARNING per RFC §4 telemetry
+        # window.
         errors.extend(
             _check_call_args_match_sig(
                 descriptor=descriptor, surface=surface
@@ -1818,29 +1822,84 @@ def _check_field_type_known(*, descriptor: dict[str, Any]) -> list[ValidationErr
     return errors
 
 
-# --- R-SEM-CALL-ARGS-MATCH-SIG (warning) -----------------------------------
+# --- R-SEM-CALL-ARGS-MATCH-SIG (error) -------------------------------------
+#
+# Catches arity mismatches (extra/unknown args, missing required args) at
+# descriptor-validate time. Mirrors the post-render ``stdlib-arity`` lint
+# (compile/lints.py::lint_stdlib_arity) so the same shape never reaches render.
+#
+# Severity: ERROR. Promoted from WARNING per the v0.3 RFC §4 telemetry-window
+# discipline once empirical evidence (gdpr-privacy-notice in the overnight
+# batch, 2026-05-17) showed the post-render lint catching shapes the
+# descriptor-side rule was missing — making render-then-lint a 50+ minute
+# round-trip when the descriptor-side rule could repair-loop in seconds.
+#
+# TODO: telemetry-window decision pending — see RFC §4 for the formal
+# promotion process. Pragmatic promotion landed first; the post-hoc decision
+# record can backfill in `melleafy-handoff/decisions/<date>-rule-promotion-
+# call-args-match-sig.md`.
 
 
-def _signature_parameters_from_surface(symbol: str, surface: dict[str, Any]) -> set[str] | None:
-    """Return the set of parameter names for ``symbol``, or None if not found.
+# Static signature table for stdlib functions whose introspected signature
+# is opaque (``*args, **kwargs``) — mirrors the post-render lint's
+# ``_STDLIB_STATIC_SIGS`` and wins over the grounded signature when present.
+def _static_sig(
+    *,
+    min_pos: int,
+    max_pos: int,
+    required: tuple[str, ...],
+    optional: tuple[str, ...],
+) -> dict[str, Any]:
+    return {
+        "min_pos": min_pos,
+        "max_pos": max_pos,
+        "required": required,
+        "optional": optional,
+        "all_names": frozenset(required) | frozenset(optional),
+        "has_var_keyword": False,
+        "has_var_positional": False,
+    }
 
-    Returns a special sentinel ``frozenset({"**kwargs"})`` when the resolved
-    signature contains ``**kwargs`` — caller treats that as "any arg goes".
-    Uses ``__wrapped__`` aware introspection by trusting the surface JSON's
-    recorded ``signature`` (Phase 0.1 decorator-aware extraction).
+
+_STDLIB_STATIC_SIGS: dict[str, dict[str, Any]] = {
+    "simple_validate": _static_sig(
+        min_pos=1,
+        max_pos=1,
+        required=("validation_fn",),
+        optional=("reason",),
+    ),
+    "req": _static_sig(
+        min_pos=1,
+        max_pos=1,
+        required=("description",),
+        optional=("validation_fn",),
+    ),
+    "check": _static_sig(
+        min_pos=2,
+        max_pos=2,
+        required=("requirement", "output"),
+        optional=(),
+    ),
+}
+
+
+def _parse_signature_structured(sig: str) -> dict[str, Any] | None:
+    """Parse a Python signature string into a structured params record.
+
+    Returns ``None`` when the signature can't be parsed. Returns a dict with:
+      - ``required``: tuple of param names that have no default and aren't var-args
+      - ``optional``: tuple of param names that have a default (or are keyword-only with default)
+      - ``all_names``: frozenset of all valid keyword arg names
+      - ``has_var_keyword``: True iff signature contains ``**kwargs``
+      - ``has_var_positional``: True iff signature contains ``*args``
+
+    Strips ``self``/``cls`` (callers don't pass them).
     """
-    member = _resolve_symbol_member(symbol, surface)
-    if member is None:
-        return None
-    sig = member.get("signature") if isinstance(member, dict) else None
     if not isinstance(sig, str):
         return None
-    # signature is like ``(self, foo: int, *, bar: str = 'x', **kwargs)``.
-    # Strip outer parens (and any return annotation).
     open_paren = sig.find("(")
     if open_paren < 0:
         return None
-    # Find matching close paren.
     depth = 0
     close_paren = -1
     for i in range(open_paren, len(sig)):
@@ -1854,39 +1913,101 @@ def _signature_parameters_from_surface(symbol: str, surface: dict[str, Any]) -> 
     if close_paren < 0:
         return None
     inner = sig[open_paren + 1 : close_paren]
-    # Split top-level commas.
+    # Bracket-aware split on top-level commas so ``Literal['a', 'b']`` /
+    # ``Callable[[int], str]`` / ``Union[A, B]`` survive intact.
     depth = 0
     parts: list[str] = []
     last = 0
     for i, ch in enumerate(inner):
-        if ch in "[(":
+        if ch in "[({":
             depth += 1
-        elif ch in "])":
+        elif ch in "])}":
             depth -= 1
         elif ch == "," and depth == 0:
             parts.append(inner[last:i].strip())
             last = i + 1
     parts.append(inner[last:].strip())
-    names: set[str] = set()
+
+    required: list[str] = []
+    optional: list[str] = []
+    has_var_keyword = False
+    has_var_positional = False
+    after_kw_marker = False
     for raw in parts:
         if not raw:
             continue
-        if raw == "*" or raw == "/":
+        if raw == "/":
+            continue
+        if raw == "*":
+            after_kw_marker = True
             continue
         if raw.startswith("**"):
-            return frozenset({"**kwargs"})
-        if raw.startswith("*"):
-            # *args — skip; we're not matching positional-only args.
+            has_var_keyword = True
             continue
-        # Strip leading * from positional/keyword.
-        # parameter spec: ``name: type = default`` — pull the name.
-        # Watch for ``self`` / ``cls`` — strip them; callers shouldn't pass.
+        if raw.startswith("*"):
+            has_var_positional = True
+            # Everything after ``*args`` is keyword-only.
+            after_kw_marker = True
+            continue
         name_part = raw.split(":", 1)[0].split("=", 1)[0].strip()
         if name_part in ("self", "cls"):
             continue
-        if name_part:
-            names.add(name_part)
-    return names
+        if not name_part:
+            continue
+        has_default = "=" in raw
+        if has_default:
+            optional.append(name_part)
+        elif after_kw_marker:
+            # Keyword-only without default → still required.
+            required.append(name_part)
+        else:
+            required.append(name_part)
+    return {
+        "required": tuple(required),
+        "optional": tuple(optional),
+        "all_names": frozenset(required) | frozenset(optional),
+        "has_var_keyword": has_var_keyword,
+        "has_var_positional": has_var_positional,
+    }
+
+
+def _signature_parameters_from_surface(symbol: str, surface: dict[str, Any]) -> set[str] | None:
+    """Return the set of parameter names for ``symbol``, or None if not found.
+
+    Returns a special sentinel ``frozenset({"**kwargs"})`` when the resolved
+    signature contains ``**kwargs`` — caller treats that as "any arg goes".
+
+    Retained for compatibility with callers expecting the original
+    "names-only" shape. New code should use :func:`_resolve_signature_record`.
+    """
+    record = _resolve_signature_record(symbol, surface)
+    if record is None:
+        return None
+    if record["has_var_keyword"]:
+        return frozenset({"**kwargs"})
+    return set(record["all_names"])
+
+
+def _resolve_signature_record(
+    symbol: str, surface: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Resolve ``symbol`` to a structured signature record.
+
+    Applies the ``_STDLIB_STATIC_SIGS`` override when the symbol's tail name
+    is one of the known stdlib helpers (``req`` / ``check`` /
+    ``simple_validate``) — these are introspected as ``(*args, **kwargs)``
+    upstream but have a sharper static signature the post-render lint also
+    trusts.
+    """
+    # Static override wins — mirrors the post-render lint.
+    tail = symbol.rsplit(".", 1)[-1]
+    if tail in _STDLIB_STATIC_SIGS:
+        return _STDLIB_STATIC_SIGS[tail]
+    member = _resolve_symbol_member(symbol, surface)
+    if member is None:
+        return None
+    sig = member.get("signature") if isinstance(member, dict) else None
+    return _parse_signature_structured(sig) if isinstance(sig, str) else None
 
 
 def _resolve_symbol_member(symbol: str, surface: dict[str, Any]) -> dict[str, Any] | None:
@@ -1932,6 +2053,22 @@ def _resolve_symbol_member(symbol: str, surface: dict[str, Any]) -> dict[str, An
 def _check_call_args_match_sig(
     *, descriptor: dict[str, Any], surface: dict[str, Any] | None
 ) -> list[ValidationError]:
+    """Catch arity mismatches and unknown keyword args at descriptor-validate.
+
+    Fires at severity ``"error"`` so the rendered code can never reach the
+    post-render ``stdlib-arity`` lint. Three classes of violation:
+
+      1. ``unknown-keyword``: ``args`` has a key that the signature
+         doesn't declare (and the signature doesn't sweep with ``**kwargs``).
+      2. ``missing-required``: a required parameter (positional or
+         keyword-only without a default) is not present in ``args`` and the
+         signature doesn't accept ``*args`` (which would let positional
+         arity slip past us).
+      3. ``too-few-positional``: the ``args`` dict has fewer entries than
+         the static-table ``min_pos`` for a stdlib symbol like ``check`` —
+         only relevant when the static table overrides an opaque
+         ``(*args, **kwargs)`` upstream signature.
+    """
     errors: list[ValidationError] = []
     if surface is None:
         return errors
@@ -1942,29 +2079,87 @@ def _check_call_args_match_sig(
         symbol = node.get("symbol")
         if not isinstance(symbol, str):
             continue
-        params = _signature_parameters_from_surface(symbol, surface)
-        if params is None:
+        record = _resolve_signature_record(symbol, surface)
+        if record is None:
             # Symbol not in surface — R-SEM-SYMBOL covers that; don't double-flag.
             continue
-        if "**kwargs" in params:
-            continue
         args = node.get("args")
-        if not isinstance(args, dict):
-            continue
-        for key in args.keys():
-            if key not in params:
+        args_keys = set(args.keys()) if isinstance(args, dict) else set()
+        n_args = len(args_keys)
+
+        # Static-table arity (for stdlib helpers with opaque grounded sigs).
+        # ``min_pos``/``max_pos`` only set in static-table records.
+        min_pos = record.get("min_pos")
+        max_pos = record.get("max_pos")
+        if (
+            isinstance(min_pos, int)
+            and isinstance(max_pos, int)
+            and not record.get("has_var_positional")
+            and not record.get("has_var_keyword")
+        ):
+            if n_args < min_pos:
                 errors.append(
                     ValidationError(
-                        path=f"{path}/args/{key}",
+                        path=f"{path}/args",
                         rule=R_CALL_ARGS_MATCH_SIG,
                         message=(
-                            f"call to {symbol!r} declares arg {key!r} not "
-                            f"in its signature; valid parameters are "
-                            f"{sorted(params)}"
+                            f"call to {symbol!r} supplies {n_args} arg(s); "
+                            f"signature requires between {min_pos} and "
+                            f"{max_pos}. Required parameters: "
+                            f"{list(record['required'])}."
                         ),
-                        severity="warning",
+                        severity="error",
                     )
                 )
+            elif n_args > max_pos and not record["has_var_keyword"]:
+                errors.append(
+                    ValidationError(
+                        path=f"{path}/args",
+                        rule=R_CALL_ARGS_MATCH_SIG,
+                        message=(
+                            f"call to {symbol!r} supplies {n_args} arg(s); "
+                            f"signature accepts at most {max_pos}. Valid "
+                            f"parameters: {sorted(record['all_names'])}."
+                        ),
+                        severity="error",
+                    )
+                )
+
+        # Unknown-keyword check (signatures without **kwargs).
+        if not record["has_var_keyword"] and isinstance(args, dict):
+            for key in args_keys:
+                if key not in record["all_names"]:
+                    errors.append(
+                        ValidationError(
+                            path=f"{path}/args/{key}",
+                            rule=R_CALL_ARGS_MATCH_SIG,
+                            message=(
+                                f"call to {symbol!r} declares arg {key!r} not "
+                                f"in its signature; valid parameters are "
+                                f"{sorted(record['all_names'])}"
+                            ),
+                            severity="error",
+                        )
+                    )
+
+        # Missing-required check. Skip when the signature accepts ``*args``
+        # — positional arity could still be supplied positionally by the
+        # renderer in a way the descriptor's keyword dict doesn't surface.
+        if not record["has_var_positional"]:
+            for required_name in record["required"]:
+                if required_name not in args_keys:
+                    errors.append(
+                        ValidationError(
+                            path=f"{path}/args",
+                            rule=R_CALL_ARGS_MATCH_SIG,
+                            message=(
+                                f"call to {symbol!r} is missing required "
+                                f"argument {required_name!r}. Required "
+                                f"parameters: {list(record['required'])}."
+                            ),
+                            severity="error",
+                        )
+                    )
     return errors
 
 

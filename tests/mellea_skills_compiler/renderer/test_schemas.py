@@ -20,15 +20,9 @@ import pytest
 from mellea_skills_compiler.renderer import RendererError
 from mellea_skills_compiler.renderer.schemas import render_schemas
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-SENTRY_DESCRIPTOR = (
-    REPO_ROOT
-    / "melleafy-handoff"
-    / "kickoff"
-    / "spike-outputs"
-    / "descriptors"
-    / "sentry-find-bugs.descriptor.json"
-)
+from tests.mellea_skills_compiler.conftest import DESCRIPTOR_FIXTURE_DIR
+
+SENTRY_DESCRIPTOR = DESCRIPTOR_FIXTURE_DIR / "sentry-find-bugs.descriptor.json"
 
 
 # --- helpers ----------------------------------------------------------------
