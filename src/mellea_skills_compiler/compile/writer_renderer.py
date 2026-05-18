@@ -879,6 +879,192 @@ def _log_result(result: RenderResult, *, enforce: bool) -> None:
         LOGGER.error("[writer:%s] %s", result.name, result.detail)
 
 
+def _load_default_surface() -> Optional[dict[str, Any]]:
+    """Resolve the bundled surface JSON via importlib.resources.
+
+    Mirrors the resolution used by ``renderer/cli.py``: read
+    ``surface_0.5.0.json`` shipped under
+    ``src/mellea_skills_compiler/mellea_surface/data/``. Returns the parsed
+    dict, or None if the file cannot be located or parsed (the caller treats
+    None as "cannot render — descriptor mode is degraded" rather than
+    crashing the compile).
+    """
+    try:
+        from importlib.resources import files as _resource_files
+
+        surface_path = Path(
+            str(
+                _resource_files("mellea_skills_compiler.mellea_surface")
+                / "data"
+                / "surface_0.5.0.json"
+            )
+        )
+    except (ModuleNotFoundError, FileNotFoundError, OSError) as exc:
+        LOGGER.warning(
+            "[writer:descriptor] could not locate bundled surface JSON: %s",
+            exc,
+        )
+        return None
+    if not surface_path.exists():
+        LOGGER.warning(
+            "[writer:descriptor] bundled surface JSON %s not found",
+            surface_path,
+        )
+        return None
+    try:
+        return json.loads(surface_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        LOGGER.warning(
+            "[writer:descriptor] bundled surface JSON %s unreadable: %s",
+            surface_path,
+            exc,
+        )
+        return None
+
+
+def render_descriptor_to_python(
+    package_dir: Path,
+    *,
+    surface: Optional[dict[str, Any]] = None,
+    skill_root: Optional[Path] = None,
+) -> Optional[dict[str, Any]]:
+    """Render ``pipeline.py`` + ``schemas.py`` from ``descriptor_emission.json``.
+
+    This is the wrapper-side counterpart of the descriptor-renderer plumbing
+    used by :func:`descriptor_emission.compile_via_descriptor`. The slash
+    command (``--use-descriptor``) instructs Claude to emit
+    ``intermediate/descriptor_emission.json`` and tells the model "the
+    wrapper will render pipeline.py / schemas.py from this". Historically
+    the wrapper did NOT actually do that — :func:`render_writers` only
+    handles ``config.py`` and ``fixtures/``. Three skills in the May 17
+    overnight batch landed with descriptor_emission.json on disk but no
+    rendered pipeline.py / schemas.py; the lint reported ``skipped`` on the
+    absent file, ``overall_verdict=pass`` was emitted, and the smoke check
+    crashed with a misleading "module is missing" error. This function
+    closes that gap.
+
+    Args:
+        package_dir: The compiled-skill package directory.
+        surface: Pre-loaded Mellea surface JSON (the same shape the renderer
+            and validator consume). When ``None``, the bundled
+            ``mellea_surface/data/surface_0.5.0.json`` is loaded via
+            ``importlib.resources``.
+        skill_root: Path to the source skill directory, threaded into the
+            renderer so v0.3 ``bundled_resources`` can resolve their source
+            paths. Optional — descriptors without bundled resources do not
+            require it.
+
+    Returns:
+        A summary dict with the shape
+        ``{"verdict": "rendered" | "skipped" | "failed",
+        "files_written": [str, ...], "reason": str | None}``.
+
+        Verdicts:
+          - ``"skipped"`` — ``intermediate/descriptor_emission.json`` is
+            absent. The caller (descriptor-mode compile flow) treats this
+            as a soft warning: in legacy mode Claude writes pipeline.py
+            directly, and the lint will fail if neither path produced it.
+          - ``"failed"`` — descriptor_emission.json is present but the
+            renderer raised. ``reason`` carries the error message.
+          - ``"rendered"`` — pipeline.py and schemas.py were materialised.
+
+    Idempotency: re-running this function against the same descriptor
+    produces byte-identical output (the renderer is deterministic), so it
+    is safe to invoke from the lint-repair retry loop. When the on-disk
+    pipeline.py / schemas.py already exist, they are overwritten — the
+    wrapper is the source of truth in descriptor mode (per the slash
+    command's contract). When the on-disk content matches the rendered
+    content, no behavioural change beyond the overwrite occurs. When the
+    on-disk content differs (Claude wrote a free-form version alongside
+    the descriptor emission), a warning is logged before overwriting.
+    """
+    descriptor_path = package_dir / "intermediate" / "descriptor_emission.json"
+    if not descriptor_path.exists():
+        return {
+            "verdict": "skipped",
+            "files_written": [],
+            "reason": "descriptor_emission_absent",
+        }
+
+    try:
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "verdict": "failed",
+            "files_written": [],
+            "reason": f"descriptor_emission.json unreadable: {exc}",
+        }
+
+    if surface is None:
+        surface = _load_default_surface()
+    if surface is None:
+        return {
+            "verdict": "failed",
+            "files_written": [],
+            "reason": "no surface JSON available (could not load bundled default)",
+        }
+
+    # Local imports keep this module importable without dragging the
+    # renderer / schemas modules into every compile invocation.
+    try:
+        from mellea_skills_compiler.renderer import render_descriptor
+        from mellea_skills_compiler.renderer.schemas import render_schemas
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "verdict": "failed",
+            "files_written": [],
+            "reason": f"renderer modules unavailable: {exc}",
+        }
+
+    try:
+        render_result = render_descriptor(descriptor, surface, skill_root=skill_root)
+        pipeline_py = render_result.pipeline_py
+        schemas_py = render_schemas(descriptor.get("schemas", {}) or {})
+    except Exception as exc:  # noqa: BLE001 - renderer surfaces a typed
+        # RendererError but we also catch downstream Python errors so we never
+        # crash the surrounding compile; the lint will hard-fail on the
+        # resulting missing file.
+        return {
+            "verdict": "failed",
+            "files_written": [],
+            "reason": f"render_descriptor raised: {type(exc).__name__}: {exc}",
+        }
+
+    pipeline_path = package_dir / "pipeline.py"
+    schemas_path = package_dir / "schemas.py"
+
+    # Idempotency choice: always overwrite. The slash command's contract
+    # under --use-descriptor is "Claude emits descriptor JSON, wrapper
+    # renders pipeline.py + schemas.py from it" — so the wrapper is the
+    # source of truth. If Claude also wrote a free-form pipeline.py the
+    # wrapper-rendered version wins. We log the overwrite so the divergence
+    # is auditable, but we do not require a match.
+    package_dir.mkdir(parents=True, exist_ok=True)
+    for target, rendered, label in (
+        (pipeline_path, pipeline_py, "pipeline.py"),
+        (schemas_path, schemas_py, "schemas.py"),
+    ):
+        if target.exists():
+            try:
+                existing = target.read_text(encoding="utf-8")
+            except OSError:
+                existing = None
+            if existing is not None and existing != rendered:
+                LOGGER.warning(
+                    "[writer:descriptor] overwriting %s with descriptor-rendered "
+                    "version (on-disk content differs by %d bytes)",
+                    label,
+                    abs(len(existing) - len(rendered)),
+                )
+        target.write_text(rendered, encoding="utf-8")
+
+    return {
+        "verdict": "rendered",
+        "files_written": ["pipeline.py", "schemas.py"],
+        "reason": None,
+    }
+
+
 def default_writer_specs(repo_root) -> List[WriterSpec]:
     """Wrapper-rendered artifacts. Order matters only for log readability.
 

@@ -16,6 +16,6 @@ Custom slash commands available to all team members working in this repo.
 | `/mellea-fy-fixtures`   | `mellea-fy-fixtures.md`   | Step 4        | Fixture generation — produces the `fixtures/` subpackage (5–8 test cases)                                         |
 | `/mellea-fy-generate`   | `mellea-fy-generate.md`   | Steps 3 + 5   | Skeleton emission and body generation — produces the populated Python package                                     |
 | `/mellea-fy-artifacts`  | `mellea-fy-artifacts.md`  | Step 6        | Supporting artifact generation — produces `mapping_report.md`, `melleafy.json`, `SETUP.md`, `README.md`           |
-| `/mellea-fy-validate`   | `mellea-fy-validate.md`   | Step 7        | Static validation — 14 formal lint checks; produces `intermediate/step_7_report.json`                             |
+| `/mellea-fy-validate`   | `mellea-fy-validate.md`   | Step 7        | Static validation — 23 formal lint checks; produces `intermediate/step_7_report.json`                             |
 | `/mellea-fy-behaviours` | `mellea-fy-behaviours.md` | Reference     | Known Mellea behaviours and workarounds (KB3–KB9, KB11) — read before generating any code                         |
 | `/mellea-fy-repair`     | `mellea-fy-repair.md`     | Repair        | Inspect a partial or failed run, audit every step's artifacts, and resume the pipeline from the first broken step |

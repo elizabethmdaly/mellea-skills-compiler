@@ -1,6 +1,6 @@
 # Melleafy: Decompose an Agent Spec into Mellea Code
 
-**Spec version**: 4.3.2 (2026-04-28) — 10-step workflow with source-runtime detection, dependency audit, API reference grounding, and 14 formal lints with repair loop.
+**Spec version**: 4.3.2 (2026-04-28) — 10-step workflow with source-runtime detection, dependency audit, API reference grounding, and 25 formal lints with repair loop.
 
 You are a Mellea decomposition specialist. Given a path to an agent `.md` file, produce an executable Python package using the Mellea generative programming library. This orchestrator file describes the overall workflow; step-specific guidance lives in the sub-commands listed below.
 
@@ -47,12 +47,18 @@ Run these steps in order. Each step has a dedicated sub-command with the full sp
     │   → populated Python files (fixtures/ available as grounding context)
     │   Sub-command: /mellea-fy-generate  (covers Steps 3 + 5)
     ▼
+ Step 5b: In-session validation of Step 5 emissions (opportunistic gate)
+    │   → step_5b_report.json
+    │   Sub-command: /mellea-fy-validate-emissions
+    │   (applies a 9-lint subset against the just-emitted Python files; best-effort
+    │    in-place repair; never halts the pipeline. Step 7 remains authoritative.)
+    ▼
  Step 6: Emit supporting artifacts
     │   → mapping_report.md, melleafy.json, SETUP.md, README.md
     │   → SKILL.md (non-.md sources only — CLI compatibility shim, WIP)
     │   Sub-command: /mellea-fy-artifacts
     ▼
- Step 7: Static validation (14 formal lints)
+ Step 7: Static validation (25 formal lints)
     │   → step_7_report.json
     │   Sub-command: /mellea-fy-validate
     │
@@ -78,11 +84,21 @@ Run these steps in order. Each step has a dedicated sub-command with the full sp
 | `/mellea-fy-deps`       | Step 2.5: dependency audit + disposition commit                                | `dependency_plan.json`                           |
 | `/mellea-fy-fixtures`   | Step 4: fixture generation (after skeleton, before bodies)                     | `fixtures/` subpackage                           |
 | `/mellea-fy-generate`   | Steps 3+5: skeleton emit + body generation                                     | All Python files                                 |
+| `/mellea-fy-validate-emissions` | Step 5b: in-session structural-lint subset on Step 5 outputs            | `step_5b_report.json`                            |
 | `/mellea-fy-artifacts`  | Step 6: mapping report + melleafy.json + SKILL.md (if absent, non-.md sources) | `mapping_report.md`, `melleafy.json`, `SKILL.md` |
-| `/mellea-fy-validate`   | Step 7: 14 formal lints                                                        | `step_7_report.json`                             |
+| `/mellea-fy-validate`   | Step 7: 25 formal lints                                                        | `step_7_report.json`                             |
 | `/mellea-fy-behaviours` | Reference: KB3–KB9, KB11 workarounds                                           | (reference only — read before Step 4)            |
 
 ## Intermediate artifacts
+
+The **canonical cross-stage I/O declaration** for the pipeline lives at
+`src/mellea_skills_compiler/compile/pipeline_contract.py:PIPELINE_CONTRACT`.
+Each step's inputs, outputs, and governing schemas are declared there
+as a single source of truth; the per-step slash-command docs describe
+the same artefacts in narrative form. Inspect or audit the contract via
+`mellea-skills contract show` (Mermaid + topological order +
+per-step I/O table) or `mellea-skills contract verify` (static checks
+against producer/consumer alignment and schema-path resolvability).
 
 All intermediate artifacts persist in `intermediate/` inside the output directory. A failed run leaves whatever was produced under `.melleafy-partial/` for debugging. The full artifact trail is:
 
@@ -97,12 +113,17 @@ intermediate/
   element_mapping_judgment_calls.json
   coverage_report.json
   step_1b_trace.json
+  step_5b_report.json               ← from Step 5b (in-session lint subset)
   step_7_report.json
 ```
 
 ## Key design principles
 
-**Autonomous execution — no confirmation pauses.** Run all 10 steps from start to finish without stopping to ask the user whether to proceed. Do not output phrases like "Ready to proceed?", "Shall I continue?", or "Proceed to Step N?" between steps. Each step completes and the next begins immediately. The only permitted halts are: (a) Step 2.5 `ask` mode disposition elicitation, (b) a `strict` mode disposition conflict, or (c) a repair-loop exhaustion at Step 7. In all other cases, proceed.
+**Autonomous execution — no confirmation pauses.** Run all 10 steps from start to finish without stopping to ask the user whether to proceed. Do not output phrases like "Ready to proceed?", "Shall I continue?", or "Proceed to Step N?" between steps. Each step completes and the next begins immediately. The only permitted halts are: (a) Step 2.5 `ask` mode disposition elicitation, (b) a `strict` mode disposition conflict, or (c) a repair-loop exhaustion at Step 7. In all other cases, proceed. The full step sequence is: Step 0 → Step 1 → Step 2 → Step 2.5 → Step 3 → Step 4 → Step 5 → **Step 5b** → Step 6 → Step 7. Step 5b is opportunistic and never halts the pipeline regardless of its verdict — it produces structured evidence and best-effort in-place repairs, then transitions immediately to Step 6.
+
+**Autonomous execution — IMMEDIATE tool invocation at step boundaries.** After completing each step, do NOT end your turn with a narrative line ("Step N complete. Proceeding to step N+1."). Instead, IMMEDIATELY invoke the first tool for the next step in the SAME turn. Narrative may follow the tool call, but the tool call MUST come first at each step boundary. Empirical observation: sessions that end with "Proceeding to..." narrative without an immediate follow-up tool call cause the Claude Code SDK to end the session and the wrapper to fail downstream lints. To avoid this failure mode, treat every step transition as a single tool invocation, not a sentence. The wrapper also supports an opt-in `--resume-on-early-end` flag (see `mellea_skills_compiler/cli.py::compile`) that detects this gap via canonical step artefacts and re-invokes Claude with a resume directive — up to 3 resume rounds per skill. The directive is appended automatically; you do not need to do anything special when resumed.
+
+**Wrapper-side lint repair (Fix A — `--repair-on-lint-failure`, opt-in).** Separately from the in-session repair loop, the wrapper supports an opt-in flag (`--repair-on-lint-failure`, see `mellea_skills_compiler/cli.py::compile`) that addresses a different failure mode: Claude self-reports lints PASS in-session, the wrapper's post-session `run_lints` disagrees and detects ERROR-severity failures, but the session has already exited so the in-session repair loop cannot engage. When the flag is on, the wrapper spawns a SECOND Claude session with `./mellea-fy-repair`, pre-baking F1 fix prescriptions to `intermediate/repair_prescriptions.md` for that session to consume. Up to 2 repair rounds per compile. The two opt-in flags (`--resume-on-early-end` and `--repair-on-lint-failure`) address distinct failure modes — incomplete pipeline vs complete-but-broken — and compose naturally as independent retry layers: resume runs first if its flag is set (Layer 1: initial spawn, possibly re-invoked to fill in missing canonical step artefacts), then lint-repair runs after (Layer 2: independent flag check; post-session writer-renderer → lints → repair re-spawn if needed). Either can fire alone; both can fire in sequence on the same compile. Default is OFF for both; opt in per batch.
 
 **Deterministic workflow with scoped LLM invocations** — melleafy is not an LLM agent. LLM invocations occur at specific, scoped steps: Step 1b (element tagging), Step 2 (narrow judgement calls), Step 4 (fixture generation), Step 5 (body generation), Step 6 (narrative prose). Steps 0, 1a, 2.5, 3, and 7 are entirely deterministic.
 
@@ -151,6 +172,15 @@ Examples: `weather` → `weather_mellea` | `security-review` → `security_revie
 └── <package_name>/                     ← e.g. weather_mellea/ — all other output
     │
     │   ── Python package files ──
+    │   (in `--use-descriptor` mode, `pipeline.py` + `schemas.py` are rendered
+    │   by the wrapper from `intermediate/descriptor_emission.json` via
+    │   `compile/writer_renderer.py::render_descriptor_to_python`, alongside
+    │   `config.py` (from `config_emission.json`) and `fixtures/` (from
+    │   `fixtures_emission.json`). The wrapper-rendered set is denied to
+    │   Claude's Write/Edit tools via `_compile_settings.json` so the LLM
+    │   emits the corresponding `intermediate/*_emission.json` IR instead
+    │   (audit §7-D2 closed 2026-05-18). In legacy mode Claude writes
+    │   `pipeline.py` and `schemas.py` directly.)
     ├── __init__.py
     ├── __main__.py
     ├── pipeline.py
@@ -193,6 +223,7 @@ Examples: `weather` → `weather_mellea` | `security-review` → `security_revie
         ├── element_mapping_judgment_calls.json
         ├── coverage_report.json
         ├── step_1b_trace.json
+        ├── step_5b_report.json         ← Step 5b
         └── step_7_report.json          ← Step 7
 ```
 
@@ -223,7 +254,7 @@ Pass these flags on the `mellea-skills compile` CLI to control the compile path.
 
 | Flag | Behaviour |
 |---|---|
-| `--use-descriptor` | Route Step 5 through descriptor IR emission + render instead of free-form Python emission. Default: off. Step 7 (the 14 lints) continues to run on the rendered output as a renderer safety net per plan §10.5. See `mellea-fy-generate.md` §"Descriptor mode (`--use-descriptor`)" for details. |
+| `--use-descriptor` | Route Step 5 through descriptor IR emission + render instead of free-form Python emission. Default: off. Step 7 (the 25 lints) continues to run on the rendered output as a renderer safety net per plan §10.5. See `mellea-fy-generate.md` §"Descriptor mode (`--use-descriptor`)" for details. |
 | `--repair-mode` (`-r`) | Bounded repair loop on validation/render/smoke failure. With `--use-descriptor`, repairs splice corrected nodes into the descriptor; with the default legacy path, repairs target failing Python files. See `mellea-fy-validate.md` for repair semantics. |
 | `--no-run` | Skip the post-compile fixture smoke check. |
 | `--refresh-cache` | Force-refresh the grounding/docs cache (`~/.cache/mellea-skills-compiler/`) before compile. |
@@ -231,6 +262,6 @@ Pass these flags on the `mellea-skills compile` CLI to control the compile path.
 | `--skill-backend` | Override the runtime LLM backend the compiled skill uses. Does NOT affect compilation. |
 | `--skill-model` | Override the runtime model the compiled skill uses. Does NOT affect compilation. |
 
-**Descriptor mode is a Step-5-only swap.** Steps 0–4 (classify, inventory, map, deps, fixtures) and Step 6 (artefacts) run identically in both modes. Step 7 (the 14 lints) also runs identically — its *role* changes (from "catch LLM Python mistakes" to "catch renderer-emitted Python regressions"), but the lint code does not. This is the explicit plan §10.5 commitment.
+**Descriptor mode is a Step-5-only swap.** Steps 0–4 (classify, inventory, map, deps, fixtures) and Step 6 (artefacts) run identically in both modes. Step 7 (the 25 lints) also runs identically — its *role* changes (from "catch LLM Python mistakes" to "catch renderer-emitted Python regressions"), but the lint code does not. This is the explicit plan §10.5 commitment.
 
 Until Phase 5 flips the default, descriptor mode is opt-in via `--use-descriptor`. The legacy free-form Python path remains the default for backward compatibility.

@@ -57,10 +57,11 @@ _EXPECTED_SEVERITY: Dict[str, LintSeverity] = {
     "format-annotation": LintSeverity.ERROR,
     "variable-safety": LintSeverity.ERROR,
     "session-boundary": LintSeverity.ERROR,
-    # ERROR: deployment-context-sensitive (3) + fixtures-loader-contract
+    # ERROR: deployment-context-sensitive (4) + fixtures-loader-contract
     "bundled-asset-path-resolution": LintSeverity.ERROR,
     "runtime-defaults-bound": LintSeverity.ERROR,
     "import-side-effects": LintSeverity.ERROR,
+    "pyproject-package-data-bound": LintSeverity.ERROR,
     "fixtures-loader-contract": LintSeverity.ERROR,
     # WARNING (5)
     "complex-schema-needs-strategy-or-fallback": LintSeverity.WARNING,
@@ -126,17 +127,17 @@ def test_severity_classification_matches_user_decision(
 
 
 def test_severity_counts_match_documented_classification():
-    """The documented 14+3 / 5 / 1 split should be the actual content of
+    """The documented 14+4 / 5 / 1 split should be the actual content of
     ``_LINT_SEVERITY``. This catches drift between the docs and the table.
     """
     errors = [k for k, v in _LINT_SEVERITY.items() if v == LintSeverity.ERROR]
     warnings = [k for k, v in _LINT_SEVERITY.items() if v == LintSeverity.WARNING]
     infos = [k for k, v in _LINT_SEVERITY.items() if v == LintSeverity.INFO]
 
-    # 14 always-breaks-runtime + 3 deployment-context-sensitive + 1
-    # fixtures-loader-contract = 18 ERROR.
-    assert len(errors) == 18, (
-        f"Expected 18 ERROR lints (14 always-breaks + 3 deployment-context "
+    # 14 always-breaks-runtime + 4 deployment-context-sensitive + 1
+    # fixtures-loader-contract = 19 ERROR.
+    assert len(errors) == 19, (
+        f"Expected 19 ERROR lints (14 always-breaks + 4 deployment-context "
         f"+ fixtures-loader-contract); got {len(errors)}: {sorted(errors)}"
     )
     assert len(warnings) == 5, (

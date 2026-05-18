@@ -34,6 +34,46 @@ from mellea_skills_compiler.toolkit.logging import configure_logger
 LOGGER = configure_logger()
 
 
+class SmokeCheckFailure(Exception):
+    """Raised by the validate gate when smoke-check fails (or its
+    infrastructure cannot start). Carries enough structured context for
+    the wrapper's smoke-repair retry to build a targeted repair prompt
+    without re-reading the smoke report JSON.
+
+    Two ``kind``s:
+      - ``"infrastructure"`` — smoke could not start (typically pipeline.py
+        missing/unimportable or a top-level error before the first fixture
+        runs). ``infrastructure_error`` holds the stringified cause.
+      - ``"fixtures"`` — at least one fixture ran and reported failure.
+        ``fixture_failures`` holds the list of failing fixtures in the
+        shape ``[(fixture_id, failure_message_or_None), ...]``.
+    """
+
+    def __init__(
+        self,
+        kind: str,
+        *,
+        infrastructure_error: Optional[str] = None,
+        fixture_failures: Optional[list[tuple[str, Optional[str]]]] = None,
+        report_path: Optional[str] = None,
+    ) -> None:
+        self.kind = kind
+        self.infrastructure_error = infrastructure_error
+        self.fixture_failures = fixture_failures or []
+        self.report_path = report_path
+        if kind == "infrastructure":
+            super().__init__(
+                f"Smoke-check infrastructure error (could not even start): "
+                f"{infrastructure_error}"
+            )
+        else:
+            count = len(self.fixture_failures)
+            super().__init__(
+                f"Smoke-check failed: {count} fixture(s) reported failure"
+                + (f". Report at {report_path}" if report_path else "")
+            )
+
+
 @dataclass
 class SmokeFixtureResult:
     fixture_id: str

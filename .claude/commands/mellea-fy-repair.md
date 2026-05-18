@@ -4,6 +4,15 @@
 
 You are a Melleafy repair specialist. Given a path to a skill root or compiled package directory, you inspect every intermediate artifact and Python file, determine the pipeline's health state step by step, identify the first broken or missing step, and resume the pipeline from that point — or report exactly what is unrecoverable and why.
 
+**Invocation contexts (Fix A — 2026-05-17):**
+
+This slash command is invoked in two distinct contexts. Both follow the same Phase 1–4 flow below; only the trigger differs.
+
+1. **In-session repair (legacy)** — Claude itself detected a failure mid-compile (e.g. a lint failed mid-Step-7) and re-invoked `/mellea-fy-repair` from inside the same session.
+2. **Wrapper-side repair (Fix A, opt-in via `--repair-on-lint-failure`)** — the WRAPPER detected ERROR-severity Step 7 lint failures AFTER the previous Claude session ended. A fresh session is spawned with `./mellea-fy-repair`. In this context the wrapper has pre-baked structured fix prescriptions to `intermediate/repair_prescriptions.md`. **Read that file first** — it contains targeted file/line fixes derived from F1 templates and is the authoritative starting point for the repair. If the file is absent (no F1 templates matched the failing lints), consult `intermediate/step_7_report.json` directly and apply the fix described by each failure's `message` field.
+
+When invoked in the wrapper-side repair context, DO NOT redo Steps 0–6. Their artefacts are already in `intermediate/`. Apply the prescribed fixes to the named files and exit.
+
 **Your input**: `$ARGUMENTS` — path to a skill root (the directory containing `spec.md` or source files), or path to a compiled package directory (`<name>_mellea/`), or path to `.melleafy-partial/`.
 
 **Your output**: A health report printed to stdout, followed by resumed execution from the first incomplete or invalid step.
@@ -205,9 +214,15 @@ Read `step_7_report.json` to determine which lints failed. **Filter to `severity
 | Tier 3 `melleafy-json-consistency`                                                                                                                                                                                                   | Resume at Step 6 — regenerate `melleafy.json` and related artifacts; pass exact consistency sub-check failures as context to `/mellea-fy-artifacts`                                       |
 | `timed_out` lints                                                                                                                                                                                                                    | Re-run `/mellea-fy-validate` once; if the same lint times out again, treat as a halt                                                                                                      |
 
-### Per-lint fix prescriptions (F1, forward reference)
+### Per-lint fix prescriptions
 
-When `step_7_report.json` is read for repair routing, the repair loop also calls `compile.repair_templates.get_repair_template(lint_id, failure, package_dir=...)` per failure. The returned markdown (if any) is appended to the Claude repair prompt under a "Per-lint fix prescriptions" section. Lints without a registered template fall back to the generic repair prompt above.
+Before the generic repair instruction below, the repair prompt now includes a "Per-lint fix prescriptions" section listing structured fix templates for each `error`-severity (or smoke-escalated) lint failure. The section is assembled by the orchestrator-side helper in `src/mellea_skills_compiler/compile/repair_prompt.py:build_repair_prompt_lint_section(report, package_dir)`, which:
+
+1. Filters `step_7_report.json:lints[]` to entries with `verdict == "fail"` AND (`severity == "error"` OR `effective_severity == "error"`).
+2. For each surviving failure, calls `compile.repair_templates.get_repair_template(lint_id, failure, package_dir=..., surface_json=...)` and collects the rendered markdown.
+3. Concatenates the renderings under a single `## Per-lint fix prescriptions` header. Apply these prescriptions in order — each names the exact file, line number, and corrective pattern.
+
+When the helper returns `None` (either no `error`-severity failures, or no failures match a registered template), fall back to the generic repair instruction below.
 
 Wave 1 templates (live in `src/mellea_skills_compiler/compile/repair_templates.py`):
 
@@ -216,7 +231,21 @@ Wave 1 templates (live in `src/mellea_skills_compiler/compile/repair_templates.p
 - `stdlib-arity` (interpolates the canonical signature from `intermediate/mellea_api_ref.json`)
 - `instruct-result-parse-before-access`
 
-Note: the template module is in place but the orchestrator wiring that actually appends the prescriptions to the repair prompt is a separate task (F1 integration). Until that lands, this slash command's behaviour is unchanged — the templates exist only as a callable Python API.
+To invoke from the slash command:
+
+```bash
+python -c "
+import json, sys
+from pathlib import Path
+from mellea_skills_compiler.compile.repair_prompt import build_repair_prompt_lint_section
+pkg = Path('<package_dir>')
+report = json.loads((pkg / 'intermediate' / 'step_7_report.json').read_text())
+section = build_repair_prompt_lint_section(report, pkg)
+sys.stdout.write(section or '')
+"
+```
+
+Lints without a registered prescription continue to be handled by the generic Claude reasoning in the routing table above.
 
 ### Partial artifact handling
 

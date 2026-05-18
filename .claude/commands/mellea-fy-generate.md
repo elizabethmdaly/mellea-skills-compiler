@@ -50,6 +50,8 @@ The `run_pipeline` function signature and `main.py` shape vary by modality from 
 
 **Rule 3-2 — `run_pipeline` is the canonical entry point name**: The top-level entry function in `pipeline.py` MUST be named exactly `run_pipeline` — not `run_phase_1`, not `run_assessment`, not any other `run_*` variant. The smoke-check loader at `toolkit/file_utils.py:load_skill_pipeline` uses `melleafy.json:entry_signature` as the authoritative source of truth for which function to invoke, with `run_pipeline` as the fallback when the manifest is absent. Empirically observed regression: a package defining `run_phase_2_gap_analysis`, `run_phase_3_roadmap`, and `run_pipeline` as public top-level functions caused the pre-fix loader to pick `run_phase_2_gap_analysis` (alphabetically first under `dir()`) and crash at fixture smoke-check with a TypeError. Public helper functions named `run_<phase>` are PERMITTED alongside `run_pipeline` — the loader's manifest-driven discovery handles the disambiguation — but `run_pipeline` MUST be present. Step 5 records the canonical signature in `melleafy.json:entry_signature`. The `pipeline-entry-canonical` lint enforces this at Step 7.
 
+**Rule 3-3 — `run_pipeline` is decorated with `@validate_call` for dict-coercion at the entry-point boundary**: The renderer emits `@validate_call(config={"arbitrary_types_allowed": True})` (from `pydantic`) immediately before the `def run_pipeline(...)` signature, and adds `from pydantic import validate_call` to the rendered imports. This makes the entry point's type annotations *enforced and coercive at call time* — callers may pass plain dicts where Pydantic models are typed (the natural shape for JSON-emitted fixtures and external orchestrators), and the dict is coerced to the declared model before the function body runs. `arbitrary_types_allowed=True` lets the decorator accept parameters typed as things Pydantic doesn't know natively (e.g., a session handle, a `Callable[...]` for delegated tools). This closes a class of empirically observed bugs of the form `'dict' object has no attribute 'model_copy'`, where a dict-typed argument reaches downstream code that assumes a Pydantic instance. **Internal helper functions** (those emitted by composition operators like `parallel` / `agent_loop` / `human_approval`, or `_<name>`-prefixed module-level helpers) are NOT decorated — their callers are inside the pipeline where types are already correct, and per-call validation adds non-trivial overhead. The decorator is emitted for **all** descriptor versions (v0.1, v0.2, v0.3+); the contract is the same. Applies equally to `async def run_pipeline(...)` when `skill.async == true`. The renderer guarantees emission idempotency — re-render produces byte-identical output (no duplicate decorator, no duplicate import).
+
 ### Step 3a-pre: Bundled assets are already mirrored (Rule OUT-6)
 
 Companion directories from the skill root (`scripts/`, `references/`, `assets/`) are mirrored into `<package_name>/` **deterministically by the compile pipeline**, _before_ mellea-fy runs. The model does not perform the copy — it is plumbing handled by `mellea_skills_compiler.compile.mellea_skills._mirror_companion_dirs`. By the time Step 3 begins, any companion directory that existed at the skill root is already present at `<package_name>/<dir>/` and can be referenced directly.
@@ -477,9 +479,33 @@ def _get_user_approval(draft: str) -> str:
 
 When `mellea-skills compile` was invoked with the `--use-descriptor` flag (propagated from `mellea-fy.md`'s argument parser to this sub-command), Step 5 takes a different code path. Steps 0–4 (classify, inventory, map, deps, fixtures) and Step 6 (artefacts) run identically to the default path. Step 7 (lints) also runs identically — but its role shifts from "catch LLM Python mistakes" to "catch renderer-emitted Python regressions" per plan §10.5.
 
+### Wrapper-rendered files in descriptor mode
+
+In descriptor mode the wrapper's post-session writer flow renders TWO ADDITIONAL files from `intermediate/descriptor_emission.json` (alongside the existing `config.py` and `fixtures/` it always renders):
+
+| File         | Rendered from                              | Wrapper hook                                                                     | LLM Write/Edit                                                                                              |
+|--------------|--------------------------------------------|----------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|
+| `config.py`  | `intermediate/config_emission.json`        | `compile/writer_renderer.py::render_writers` (always)                            | DENIED (both modes)                                                                                         |
+| `fixtures/`  | `intermediate/fixtures_emission.json`      | `compile/writer_renderer.py::render_writers` (always)                            | DENIED (both modes)                                                                                         |
+| `pipeline.py`| `intermediate/descriptor_emission.json`    | `compile/writer_renderer.py::render_descriptor_to_python` (descriptor mode only) | DENIED in descriptor mode (`_DESCRIPTOR_MODE_ADDITIONAL_PATHS`, audit §7-D2 closed 2026-05-18); allowed in legacy mode |
+| `schemas.py` | `intermediate/descriptor_emission.json`    | `compile/writer_renderer.py::render_descriptor_to_python` (descriptor mode only) | DENIED in descriptor mode (`_DESCRIPTOR_MODE_ADDITIONAL_PATHS`, audit §7-D2 closed 2026-05-18); allowed in legacy mode |
+
+In legacy mode (no `--use-descriptor`) Claude writes `pipeline.py` and `schemas.py` directly as part of free-form Python emission, and `render_descriptor_to_python` is not invoked. In descriptor mode Claude emits `descriptor_emission.json` only — the wrapper renders the Python from the descriptor IR via `mellea_skills_compiler.renderer.render_descriptor` + `render_schemas`. The wrapper is the source of truth: the `_compile_settings.json` deny list extends to `pipeline.py` and `schemas.py` in descriptor mode, so the LLM's Write/Edit tool calls on those paths are blocked at the tool layer. The post-session `pipeline-entry-canonical` lint hard-fails when `pipeline.py` is absent — so a descriptor that the renderer rejects surfaces as a lint failure, not a silent miss.
+
 **Canonical Step-5 algorithm in descriptor mode** (Phase 3.5.A): the descriptor-emission prompt consumes ALL EIGHT intermediate artefacts produced by Steps 0 through 2.5, alongside the schema doc, filtered surface, and one-shot example. The descriptor must reflect those analytical decisions faithfully rather than re-derive them.
 
-The algorithm:
+### Role boundary: what Claude does vs. what the wrapper does
+
+This boundary is the single most-misread part of descriptor mode — read it before reading the algorithm steps below.
+
+- **Claude's role (in-session)**: emit `intermediate/descriptor_emission.json` to disk via the `Write` tool. That file must conform to the schema at `src/mellea_skills_compiler/descriptor/schemas/descriptor.schema.v0.3.json` (covering `inputs`, `outputs`, `schemas`, `state`, `pipeline` list of typed nodes, and v0.3 additions like `dependencies` and `bundled_resources`). Claude's job ENDS at writing that JSON file. Claude does NOT invoke any Python function — the only tools available in this slash command are `Read`, `Write`, `Edit`.
+- **Claude does NOT write `pipeline.py` or `schemas.py`** in descriptor mode. Those paths are in the wrapper's `_WRAPPER_RENDERED_PATHS` deny-list when `--use-descriptor` is active, so a `Write` against them would be refused; even if it were allowed, the wrapper would overwrite the file post-session.
+- **The wrapper's role (post-session, automatic — for situational awareness only, you do not invoke it)**: after the Claude session exits, `mellea_skills_compiler.compile.mellea_skills.compile()` calls `compile/writer_renderer.py::render_descriptor_to_python(package_dir, ...)`. That wrapper hook reads `intermediate/descriptor_emission.json` from disk and dispatches to the deterministic descriptor renderer at `renderer/core.py::render_descriptor` (+ `render_schemas`) to produce `pipeline.py` + `schemas.py`, which it writes to `<package_dir>/`. The wrapper then continues with the rest of the post-session flow (`config.py` + `fixtures/` writers, Step 6 finalisation, Step 7 lints, optional repair retry).
+- **Failure surface**: if `descriptor_emission.json` is missing or malformed, `render_descriptor_to_python` cannot produce `pipeline.py`, and the Step 7 `pipeline-entry-canonical` lint hard-fails (Bug 1 fix, 2026-05-17). When `--repair-on-lint-failure` is set, the wrapper schedules a repair session that gets a fresh chance to emit a correct descriptor.
+
+The in-Python entry points named below (`compile_via_descriptor`, `EmissionConfig`) describe the **wrapper-internal** semantics of the descriptor flow for context only. They are NOT something Claude can or should invoke from inside this slash command — Claude's only deliverable in descriptor mode is the descriptor JSON on disk.
+
+### Algorithm (Claude-side, in-session)
 
 1. Read every intermediate artefact present under `<package_name>/intermediate/`. The canonical 8-artefact set is:
    - `classification.json` — 5-axis archetype (Step 0)
@@ -490,33 +516,42 @@ The algorithm:
    - `mellea_api_ref.json` — introspected Mellea surface, replaces/augments the bundled `surface_0.5.0.json` (Step 2.5e)
    - `mellea_doc_index.json` — per-symbol doc-page references (Step 2.5f)
    - `expected_signature.json` (P3.5.D — Step 2 always emits this artefact; the system prompt inlines it as a HARD CONSTRAINT block. The `R-SEM-SIGNATURE-MATCH` validator rule fires on any divergence between the descriptor's `inputs`/`outputs`/`schemas` and the locked signature. Absent only on legacy / pre-P3.5.D intermediate artefact sets — in that case the rule is non-firing) — locked I/O signature constraint
-2. Load the introspected Mellea surface from `mellea_api_ref.json` if present, else from `<repo>/melleafy-handoff/kickoff/spike-outputs/surface_0.5.0.json`.
-3. Build an `EmissionConfig` whose `intermediate_artefacts` dict carries the parsed JSON for each artefact present (keys match the artefact basenames without `.json`: `classification`, `inventory`, `element_mapping`, `element_mapping_amendments`, `dependency_plan`, `mellea_api_ref`, `mellea_doc_index`, `expected_signature`).
-4. Invoke `mellea_skills_compiler.compile.descriptor_emission.compile_via_descriptor(spec_text, surface, config=EmissionConfig(intermediate_artefacts=..., ...), write_to=<skill-root>/<package_name>/)`. This:
-   a. Builds the prompt — system block = schema doc + filtered surface (9 modules) + 1-shot example + the 8-artefact section (one `cache_control: ephemeral` breakpoint over the whole block); user block = the skill spec.
-   b. Streams from Claude (`aws/claude-sonnet-4-6`, `max_tokens=64000`) per the Phase 1 locked-in config.
-   c. Extracts the `<descriptor>...</descriptor>` JSON from the response.
-   d. Validates the descriptor against `descriptor.schema.v0.x.json` via `mellea_skills_compiler.descriptor.validator.validate()`. When `expected_signature.json` is present, P3.5.D's `R-SEM-SIGNATURE-MATCH` rule enforces the locked I/O signature.
-   e. Renders the descriptor through the Phase 2 renderer (`mellea_skills_compiler.renderer.render_descriptor` + `render_schemas` + `render_init` + `render_fixtures` + `render_melleafy_json` + `render_setup_md` + `render_readme_md`) → `pipeline.py`, `schemas.py`, `__init__.py`, `fixtures.py`, `melleafy.json`, `SETUP.md`, `README.md`, `source_map.json`.
-   f. Runs the smoke check (`py_compile` + import under dummy backend).
-5. On any sub-step failure, if `--repair-mode` was also set, the repair loop (`mellea_skills_compiler.compile.repair.compile_with_repair`) handles bounded retries (max 2 per stage) and may auto-escalate this skill to legacy by writing `<skill-root>/.melleafy-routing.json` per `melleafy-handoff/process/regression-and-extension-policy.md` §(b).
-6. Step 6 (`mellea-fy-artifacts`) and Step 7 (`mellea-fy-validate`) run as usual.
+2. Cross-reference the introspected Mellea surface in `mellea_api_ref.json` (falling back to `<repo>/melleafy-handoff/kickoff/spike-outputs/surface_0.5.0.json` if absent) for symbol names, signatures, and module paths when assembling pipeline nodes.
+3. Synthesise the descriptor IR. Each of the 8 artefacts feeds specific descriptor fields:
+   - `classification.json` → `metadata.modality`, `metadata.archetype`
+   - `inventory.json` + `element_mapping.json` + `element_mapping_amendments.json` → `pipeline` nodes (typed by mapped Mellea symbol), `schemas` entries
+   - `dependency_plan.json` → `dependencies`, `bundled_resources` (v0.3); also disposition-tags on pipeline nodes
+   - `mellea_api_ref.json` → import paths and signatures used by node `call` fields
+   - `expected_signature.json` → `inputs`, `outputs`, and top-level `schemas` (HARD CONSTRAINT — divergence fails `R-SEM-SIGNATURE-MATCH` post-session)
+4. Write the assembled JSON to `intermediate/descriptor_emission.json` using the `Write` tool. The file MUST be valid JSON matching `descriptor.schema.v0.3.json`. This is your terminal action for Step 5 in descriptor mode — do not attempt to write `pipeline.py` or `schemas.py`.
+
+### What the wrapper does post-session (for situational awareness)
+
+After the Claude session exits, the wrapper automatically (you do not invoke any of this):
+
+a. Reads `intermediate/descriptor_emission.json` from disk via `compile/writer_renderer.py::render_descriptor_to_python(package_dir, ...)`.
+b. Validates the descriptor against `descriptor.schema.v0.3.json` via `descriptor/validator.py::validate()` (jsonschema + `R-SEM-*` semantic rules). When `expected_signature.json` is present, `R-SEM-SIGNATURE-MATCH` enforces the locked I/O signature.
+c. Dispatches to the deterministic Phase 2 renderer at `renderer/core.py::render_descriptor` (plus `render_schemas`) to produce `pipeline.py` + `schemas.py`, written to `<package_dir>/`. (Note: when descriptor emission is invoked via the standalone `compile/descriptor_emission.py::compile_via_descriptor` entry — a separate Python-harness path, not used by this slash command — additional artefacts like `__init__.py`, `fixtures.py`, `melleafy.json`, `SETUP.md`, `README.md`, `source_map.json` are also rendered. The mainline `compile()` + `render_descriptor_to_python` path renders only `pipeline.py` + `schemas.py`; the other artefacts come from their own writers / Step 6.)
+d. Continues with `config.py` + `fixtures/` writers (always-on), Step 6 artefact finalisation, Step 7 lints, and the optional `--repair-on-lint-failure` retry loop.
+e. If the descriptor was missing or malformed, `pipeline.py` is not produced and the Step 7 `pipeline-entry-canonical` lint hard-fails — surfacing the problem as a lint failure rather than a silent miss.
+
+Step 6 (`mellea-fy-artifacts`) and Step 7 (`mellea-fy-validate`) run as usual against the wrapper-rendered files.
 
 **Why the 8-artefact prompt matters**: each artefact removes a decision the LLM would otherwise re-derive (and sometimes get wrong). `dependency_plan.json` carries the 8 disposition kinds; the LLM does NOT pick dispositions — it transcribes them. `element_mapping.json` + `element_mapping_amendments.json` carry the tag → symbol decisions. `classification.json` constrains the modality + interaction style. Skipping any of these means asking the LLM to learn what the analytical pipeline has already decided.
 
-**Flag mapping from `mellea-skills compile` to descriptor-mode**:
+**Flag mapping from `mellea-skills compile` to descriptor-mode** (these flags are interpreted by the wrapper, not by Claude — listed here for context):
 
 | CLI flag | Descriptor-mode behaviour |
 |---|---|
-| `--use-descriptor` | Required to enter this path. |
-| `--model` / `-m` | Overrides `EmissionConfig.model` (default `aws/claude-sonnet-4-6`). |
+| `--use-descriptor` | Required to enter this path. Causes the wrapper to invoke `render_descriptor_to_python` post-session and adds `pipeline.py` / `schemas.py` to the slash-command deny-list. |
+| `--model` / `-m` | Overrides the model used by the wrapper to spawn the Claude session (informational from a slash-command POV — affects which model is generating the descriptor JSON). |
 | `--timeout` | Not directly applicable — streaming + 64K tokens has its own per-stream behaviour. |
-| `--repair-mode` / `-r` | Switches the entry point from `compile_via_descriptor` to `compile_with_repair`. |
-| `--no-run` | Skips the smoke check (step 3f). |
+| `--repair-mode` / `-r` | Routes the wrapper through `compile/repair.py::compile_with_repair` (bounded retry, possible legacy escalation) instead of the single-shot descriptor path. Informational reference: the underlying wrapper-internal entry point name is `compile_via_descriptor`; Claude does not invoke either function. |
+| `--no-run` | Skips the post-session smoke check. |
 | `--refresh-cache` | Forces a P1.C cache refresh before emission. |
 | `--skill-backend` / `--skill-model` | Apply to the rendered package's runtime defaults (no compile-time effect). |
 
-When `--use-descriptor` is NOT set, this step follows the existing free-form Python emission flow below.
+When `--use-descriptor` is NOT set, this step follows the existing free-form Python emission flow below (Claude writes `pipeline.py` and `schemas.py` directly).
 
 ---
 

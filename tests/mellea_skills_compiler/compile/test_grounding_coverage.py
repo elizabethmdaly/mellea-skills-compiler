@@ -48,6 +48,12 @@ _PROSE_REFERENCE_ALLOWLIST = frozenset({
     # (`_extract_forbidden_param_names`). Documented in deps.md as the source
     # for forbidden param names; the LLM does not import it directly.
     "mellea.stdlib.components.genslot._disallowed_param_names",
+    # Used in `mellea-fy-validate-emissions.md` as an EXAMPLE of a
+    # hallucinated `from mellea.backends.tools import ...` that the
+    # Step 5b `import-soundness` rule catches (the canonical path is
+    # `mellea.stdlib.tools`). Purely illustrative — the module does
+    # not exist.
+    "mellea.backends.tools",
 })
 
 

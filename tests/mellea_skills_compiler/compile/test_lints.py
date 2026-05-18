@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Dict
 
 from mellea_skills_compiler.compile.lints import (
+    LintSeverity,
+    _LINT_SEVERITY,
     lint_bundled_asset_path_resolution,
     lint_complex_schema_needs_strategy_or_fallback,
     lint_fixture_signature_bound,
@@ -29,8 +31,10 @@ from mellea_skills_compiler.compile.lints import (
     lint_melleafy_json_consistency,
     lint_no_watsonx,
     lint_optional_extraction_guidance,
+    lint_parseable,
     lint_pipeline_entry_canonical,
     lint_prefix_persona,
+    lint_pyproject_package_data_bound,
     lint_run_pipeline_params_typed,
     lint_runtime_defaults_bound,
     lint_session_boundary,
@@ -817,13 +821,49 @@ class TestPipelineEntryCanonical:
                 f"with failures {[f.message for f in result.failures]}"
             )
 
-    def test_skipped_when_pipeline_absent(self):
-        """No pipeline.py → skipped (other lints own that report)."""
+    def test_fails_when_pipeline_file_missing(self):
+        """No pipeline.py → fail. Missing entry file is a hard error, not a skip.
+
+        Regression target: the false-positive ``skipped`` verdict masked
+        three skills (gpai-code-of-practice, matter-intake-scoping,
+        nil-contract-analysis) whose Step 7 lints "passed" while
+        pipeline.py was absent from the package on disk. The downstream
+        smoke check then crashed with a misleading "pipeline module is
+        missing" error. Now ``pipeline-entry-canonical`` reports a hard
+        fail so the absent file is the actual blocker.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             pkg = _make_package(Path(tmp), {"main.py": "print('hi')\n"})
             result = lint_pipeline_entry_canonical(pkg)
-            assert result.verdict == "skipped"
-            assert result.skipped_reason is not None
+            assert result.verdict == "fail", (
+                f"Missing pipeline.py must fail; got {result.verdict}"
+            )
+            assert len(result.failures) == 1, (
+                f"Expected exactly one failure for missing pipeline.py; got "
+                f"{[f.message for f in result.failures]}"
+            )
+            failure = result.failures[0]
+            assert failure.file == "pipeline.py"
+            assert "missing" in failure.message.lower()
+
+    def test_pipeline_entry_canonical_skipped_only_when_irrelevant(self):
+        """Skipped is reserved for genuine non-applicability — present-but-empty
+        and present-with-content both go through the normal verdict path.
+
+        Specifically: when pipeline.py exists, the lint should NOT return
+        ``skipped`` for the file-absent reason. ``skipped`` for this lint
+        is now reserved exclusively for cases that genuinely do not apply
+        (none currently exist).
+        """
+        pipeline = "def run_pipeline(x: str) -> str:\n    return x\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_package(Path(tmp), {"pipeline.py": pipeline})
+            result = lint_pipeline_entry_canonical(pkg)
+            assert result.verdict in {"pass", "fail"}, (
+                f"Present pipeline.py should produce a definitive verdict; "
+                f"got {result.verdict}"
+            )
+            assert result.verdict == "pass"
 
     def test_fails_on_pipeline_syntax_error(self):
         """A SyntaxError in pipeline.py should fail with line info."""
@@ -2009,12 +2049,29 @@ class TestRunPipelineParamsTyped:
             pkg = _make_package(Path(tmp), {"pipeline.py": pipeline})
             assert lint_run_pipeline_params_typed(pkg).verdict == "pass"
 
-    def test_skipped_when_pipeline_absent(self):
+    def test_fails_when_pipeline_file_missing(self):
+        """No pipeline.py → fail. Same rationale as
+        ``TestPipelineEntryCanonical.test_fails_when_pipeline_file_missing``:
+        a missing pipeline.py is a real blocker, not a benign skip.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             pkg = _make_package(Path(tmp), {"main.py": "x=1\n"})
-            assert lint_run_pipeline_params_typed(pkg).verdict == "skipped"
+            result = lint_run_pipeline_params_typed(pkg)
+            assert result.verdict == "fail", (
+                f"Missing pipeline.py should now fail (not skip); got "
+                f"{result.verdict}"
+            )
+            assert len(result.failures) == 1
+            assert result.failures[0].file == "pipeline.py"
+            assert "missing" in result.failures[0].message.lower()
 
     def test_skipped_when_run_pipeline_absent(self):
+        """pipeline.py exists but no run_pipeline function → still skipped.
+
+        ``pipeline-entry-canonical`` owns the "missing run_pipeline function"
+        diagnostic; this lint defers to it for that case rather than
+        emitting a duplicate failure.
+        """
         pipeline = "def run_phase_2(x) -> dict:\n    return {}\n"
         with tempfile.TemporaryDirectory() as tmp:
             pkg = _make_package(Path(tmp), {"pipeline.py": pipeline})
@@ -2945,6 +3002,13 @@ class TestRunLints:
             "from pathlib import Path\n"
             "p = Path(__file__).parent / 'scripts' / 'bash' / 'x.sh'\n"
         )
+        # pipeline.py is mandatory (Rule 3-2) — pipeline-entry-canonical
+        # and run-pipeline-params-typed now fail on its absence rather than
+        # silently skipping, so a "compliant" package must include one.
+        pipeline = (
+            "def run_pipeline(query: str) -> dict:\n"
+            "    return {}\n"
+        )
         with tempfile.TemporaryDirectory() as tmp:
             pkg = _make_package(
                 Path(tmp),
@@ -2952,6 +3016,7 @@ class TestRunLints:
                     "fixtures/__init__.py": "ALL_FIXTURES = []\n",
                     "config.py": config,
                     "tools.py": tools,
+                    "pipeline.py": pipeline,
                 },
             )
             _write_directive(pkg, "ollama", "granite4.1:8b")
@@ -3044,3 +3109,400 @@ class TestRunLints:
                 "run_lints should create intermediate/ when absent"
             )
             assert (pkg / "intermediate" / "step_7_report.json").exists()
+
+
+# ─── TestParseable (Tier 1) ───
+
+
+class TestParseable:
+    """Test cases for lint_parseable (Tier 1 hard-fail).
+
+    The package directory name doubles as the import path used by the
+    subprocess check, so each tempdir gets a sub-directory with a stable
+    package name (`testpkg`).
+    """
+
+    @staticmethod
+    def _make_pkg_dir(tmp_root: Path) -> Path:
+        """Return a child directory named ``testpkg`` under ``tmp_root``.
+
+        The parent dir is what the subprocess uses as ``cwd`` and on
+        ``PYTHONPATH`` so ``import testpkg.pipeline`` resolves correctly.
+        """
+        pkg = tmp_root / "testpkg"
+        pkg.mkdir()
+        return pkg
+
+    def test_passes_on_clean_package(self):
+        """A pkg with valid __init__/pipeline/schemas should pass both checks."""
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_dir(Path(tmp))
+            (pkg / "__init__.py").write_text("")
+            (pkg / "pipeline.py").write_text(
+                "def run_pipeline(text: str) -> str:\n    return text\n"
+            )
+            (pkg / "schemas.py").write_text(
+                "from pydantic import BaseModel\n\n"
+                "class Output(BaseModel):\n    text: str\n"
+            )
+            result = lint_parseable(pkg)
+            assert result.verdict == "pass", (
+                f"Clean package should pass parseable; got {result.verdict}: "
+                f"{[f.message for f in result.failures]}"
+            )
+            assert result.files_checked >= 3
+
+    def test_fails_on_syntax_error_in_pipeline_py(self):
+        """A syntactically broken pipeline.py should fail with SyntaxError."""
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_dir(Path(tmp))
+            (pkg / "__init__.py").write_text("")
+            # Missing closing paren — guaranteed SyntaxError.
+            (pkg / "pipeline.py").write_text(
+                "def run_pipeline(text: str -> str:\n    return text\n"
+            )
+            result = lint_parseable(pkg)
+            assert result.verdict == "fail"
+            assert any("pipeline.py" in f.file for f in result.failures), (
+                f"Failure should name pipeline.py; got files: "
+                f"{[f.file for f in result.failures]}"
+            )
+            assert any(
+                "SyntaxError" in f.message or "syntax" in f.message.lower()
+                for f in result.failures
+            ), (
+                f"Failure should mention SyntaxError; got: "
+                f"{[f.message for f in result.failures]}"
+            )
+
+    def test_fails_on_import_error_in_pipeline_py(self):
+        """pipeline.py importing a non-existent module should fail the import check."""
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_dir(Path(tmp))
+            (pkg / "__init__.py").write_text("")
+            (pkg / "pipeline.py").write_text(
+                # Parses cleanly but the import target does not exist.
+                "from this_module_definitely_does_not_exist_xyz import thing\n\n"
+                "def run_pipeline(text: str) -> str:\n    return text\n"
+            )
+            result = lint_parseable(pkg)
+            assert result.verdict == "fail", (
+                f"Import of non-existent module should fail; got {result.verdict}"
+            )
+            msgs = " ".join(f.message for f in result.failures)
+            assert (
+                "ModuleNotFoundError" in msgs
+                or "this_module_definitely_does_not_exist_xyz" in msgs
+                or "import" in msgs.lower()
+            ), f"Failure should surface the import error; got: {msgs}"
+
+    def test_fails_on_missing_pipeline_py(self):
+        """No pipeline.py at all → fail with an explicit reason."""
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_dir(Path(tmp))
+            (pkg / "__init__.py").write_text("")
+            # No pipeline.py.
+            result = lint_parseable(pkg)
+            assert result.verdict == "fail"
+            assert len(result.failures) == 1
+            assert "pipeline.py absent" in result.failures[0].message
+
+    def test_severity_is_error(self):
+        """parseable must be classified as ERROR in the central severity table."""
+        assert _LINT_SEVERITY["parseable"] == LintSeverity.ERROR
+
+    def test_subprocess_timeout_handled(self, monkeypatch):
+        """A pipeline.py that hangs at import time → fail with timeout reason.
+
+        We monkeypatch ``subprocess.run`` inside the lints module to raise
+        ``TimeoutExpired`` immediately rather than actually waiting 30s.
+        That keeps the test fast while exercising the timeout branch.
+        """
+        import subprocess as subprocess_module
+
+        from mellea_skills_compiler.compile import lints as lints_mod
+
+        original_run = lints_mod.__dict__.get("subprocess", None)
+
+        def _fake_run(*_args, **_kwargs):
+            raise subprocess_module.TimeoutExpired(cmd="python", timeout=30)
+
+        # The lint imports subprocess locally inside the function; we have
+        # to patch it on the subprocess module itself so the local import
+        # gets the patched ``run``.
+        monkeypatch.setattr(subprocess_module, "run", _fake_run)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_dir(Path(tmp))
+            (pkg / "__init__.py").write_text("")
+            (pkg / "pipeline.py").write_text(
+                "def run_pipeline(text: str) -> str:\n    return text\n"
+            )
+            result = lint_parseable(pkg)
+            assert result.verdict == "fail", (
+                f"Timeout should produce fail verdict; got {result.verdict}"
+            )
+            msgs = " ".join(f.message for f in result.failures)
+            assert "Timeout" in msgs or "timeout" in msgs.lower(), (
+                f"Failure should mention timeout; got: {msgs}"
+            )
+
+        # No restoration needed — monkeypatch handles it. Reference original
+        # binding to make linters happy.
+        _ = original_run
+
+    def test_checks_fixtures_subdir_for_syntax(self):
+        """Per-file parse check also covers fixtures/*.py.
+
+        A SyntaxError in fixtures/fixture_one.py should be flagged even
+        though the importability check targets `<pkg>.pipeline` (not fixtures).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_dir(Path(tmp))
+            (pkg / "__init__.py").write_text("")
+            (pkg / "pipeline.py").write_text(
+                "def run_pipeline(text: str) -> str:\n    return text\n"
+            )
+            fixtures = pkg / "fixtures"
+            fixtures.mkdir()
+            (fixtures / "__init__.py").write_text("ALL_FIXTURES = []\n")
+            (fixtures / "fixture_one.py").write_text(
+                "def make_one(:\n    pass\n"  # SyntaxError
+            )
+            result = lint_parseable(pkg)
+            assert result.verdict == "fail"
+            assert any(
+                "fixtures/fixture_one.py" in f.file for f in result.failures
+            ), (
+                f"Failure should name the broken fixture; got files: "
+                f"{[f.file for f in result.failures]}"
+            )
+
+
+# ─── TestPyprojectPackageDataBound (Rule OUT-6) ───
+
+
+class TestPyprojectPackageDataBound:
+    """Test cases for lint_pyproject_package_data_bound.
+
+    Rule OUT-6 mirrors companion dirs (scripts/, references/, assets/) into
+    the package AND requires they appear in [tool.setuptools.package-data]
+    in pyproject.toml. This lint enforces the second half.
+    """
+
+    @staticmethod
+    def _make_pkg_with(tmp_root: Path, *, companion_dirs: list[str],
+                       pyproject_text: str,
+                       pyproject_at: str = "pkg") -> Path:
+        """Create ``tmp_root/testpkg/`` with the given companion dirs and a
+        pyproject.toml at either ``pkg`` (inside the package dir) or
+        ``root`` (the skill root, one level up).
+        """
+        pkg = tmp_root / "testpkg"
+        pkg.mkdir()
+        for d in companion_dirs:
+            (pkg / d).mkdir()
+            (pkg / d / "sample.txt").write_text("sample\n")
+        if pyproject_at == "pkg":
+            (pkg / "pyproject.toml").write_text(pyproject_text)
+        else:
+            (tmp_root / "pyproject.toml").write_text(pyproject_text)
+        return pkg
+
+    def test_passes_with_correct_globs(self):
+        """pyproject lists scripts/**/*; scripts/ exists → pass."""
+        pyproject = (
+            "[tool.setuptools.package-data]\n"
+            'testpkg = ["scripts/**/*"]\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_with(
+                Path(tmp), companion_dirs=["scripts"],
+                pyproject_text=pyproject,
+            )
+            result = lint_pyproject_package_data_bound(pkg)
+            assert result.verdict == "pass", (
+                f"Expected pass with scripts/**/*; got {result.verdict}: "
+                f"{[f.message for f in result.failures]}"
+            )
+
+    def test_fails_when_glob_missing(self):
+        """pyproject missing scripts/**/* but scripts/ exists → fail."""
+        # Wrong dir declared (references), but scripts/ on disk.
+        pyproject = (
+            "[tool.setuptools.package-data]\n"
+            'testpkg = ["references/**/*"]\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_with(
+                Path(tmp), companion_dirs=["scripts"],
+                pyproject_text=pyproject,
+            )
+            result = lint_pyproject_package_data_bound(pkg)
+            assert result.verdict == "fail"
+            assert any("scripts" in f.message for f in result.failures), (
+                f"Failure should mention scripts; got: "
+                f"{[f.message for f in result.failures]}"
+            )
+
+    def test_skipped_when_no_pyproject(self):
+        """No pyproject.toml anywhere → verdict=skipped with reason."""
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = Path(tmp) / "testpkg"
+            pkg.mkdir()
+            # No pyproject anywhere; no companion dirs either — doesn't matter.
+            result = lint_pyproject_package_data_bound(pkg)
+            assert result.verdict == "skipped", (
+                f"No pyproject.toml should skip; got {result.verdict}"
+            )
+            assert result.skipped_reason is not None
+            assert "pyproject.toml" in result.skipped_reason
+
+    def test_handles_multiple_companion_dirs(self):
+        """All 3 companion dirs present, all 3 declared → pass."""
+        pyproject = (
+            "[tool.setuptools.package-data]\n"
+            'testpkg = ["scripts/**/*", "references/**/*", "assets/**/*"]\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_with(
+                Path(tmp),
+                companion_dirs=["scripts", "references", "assets"],
+                pyproject_text=pyproject,
+            )
+            result = lint_pyproject_package_data_bound(pkg)
+            assert result.verdict == "pass", (
+                f"Expected pass with all 3 dirs declared; got {result.verdict}: "
+                f"{[f.message for f in result.failures]}"
+            )
+
+    def test_partial_coverage_fails(self):
+        """2 of 3 companion dirs declared, 3rd present but undeclared → fail."""
+        pyproject = (
+            "[tool.setuptools.package-data]\n"
+            'testpkg = ["scripts/**/*", "references/**/*"]\n'
+            # assets/**/* missing.
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_with(
+                Path(tmp),
+                companion_dirs=["scripts", "references", "assets"],
+                pyproject_text=pyproject,
+            )
+            result = lint_pyproject_package_data_bound(pkg)
+            assert result.verdict == "fail"
+            # Should specifically call out assets/, not the covered dirs.
+            msgs = " ".join(f.message for f in result.failures)
+            assert "assets" in msgs, (
+                f"Failure should mention assets/; got: {msgs}"
+            )
+            assert len(result.failures) == 1, (
+                f"Only the undeclared dir should fail; got {len(result.failures)} "
+                f"failures: {[f.message for f in result.failures]}"
+            )
+
+    def test_severity_is_error(self):
+        """pyproject-package-data-bound must be classified as ERROR."""
+        assert (
+            _LINT_SEVERITY["pyproject-package-data-bound"] == LintSeverity.ERROR
+        )
+
+    def test_accepts_wildcard_package_key(self):
+        """[tool.setuptools.package-data]."*" applies to all packages → pass."""
+        pyproject = (
+            "[tool.setuptools.package-data]\n"
+            '"*" = ["scripts/**/*", "references/**/*", "assets/**/*"]\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_with(
+                Path(tmp),
+                companion_dirs=["scripts", "references", "assets"],
+                pyproject_text=pyproject,
+            )
+            result = lint_pyproject_package_data_bound(pkg)
+            assert result.verdict == "pass", (
+                f"Wildcard '*' key should be honoured; got {result.verdict}: "
+                f"{[f.message for f in result.failures]}"
+            )
+
+    def test_falls_back_to_skill_root_pyproject(self):
+        """No pyproject in package dir, but one at the skill root → use it."""
+        pyproject = (
+            "[tool.setuptools.package-data]\n"
+            'testpkg = ["scripts/**/*"]\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_with(
+                Path(tmp), companion_dirs=["scripts"],
+                pyproject_text=pyproject, pyproject_at="root",
+            )
+            result = lint_pyproject_package_data_bound(pkg)
+            assert result.verdict == "pass", (
+                f"Skill-root pyproject should be honoured; got {result.verdict}: "
+                f"{[f.message for f in result.failures]}"
+            )
+
+    def test_only_present_dirs_are_required(self):
+        """If only scripts/ exists on disk, package-data need only declare scripts/."""
+        pyproject = (
+            "[tool.setuptools.package-data]\n"
+            'testpkg = ["scripts/**/*"]\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_with(
+                Path(tmp), companion_dirs=["scripts"],
+                pyproject_text=pyproject,
+            )
+            # references/ and assets/ are absent on disk — lint must not
+            # demand entries for dirs that don't exist.
+            result = lint_pyproject_package_data_bound(pkg)
+            assert result.verdict == "pass"
+
+    def test_unparseable_pyproject_fails_clearly(self):
+        """A malformed pyproject.toml should produce a clear failure (not crash)."""
+        bad_text = "this is not valid toml [[[\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_with(
+                Path(tmp), companion_dirs=["scripts"],
+                pyproject_text=bad_text,
+            )
+            result = lint_pyproject_package_data_bound(pkg)
+            assert result.verdict == "fail"
+            msgs = " ".join(f.message for f in result.failures)
+            assert "TOML" in msgs or "parse" in msgs.lower(), (
+                f"Failure should mention TOML/parse; got: {msgs}"
+            )
+
+    def test_accepts_explicit_filename_list(self):
+        """Explicit per-file lists under <companion>/ count as coverage."""
+        pyproject = (
+            "[tool.setuptools.package-data]\n"
+            'testpkg = ["scripts/run.sh", "scripts/setup.py"]\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_with(
+                Path(tmp), companion_dirs=["scripts"],
+                pyproject_text=pyproject,
+            )
+            result = lint_pyproject_package_data_bound(pkg)
+            assert result.verdict == "pass", (
+                f"Explicit filename list should count as coverage; got "
+                f"{result.verdict}: {[f.message for f in result.failures]}"
+            )
+
+    def test_pyproject_without_package_data_section_fails(self):
+        """pyproject.toml exists but lacks [tool.setuptools.package-data] entirely."""
+        pyproject = (
+            "[project]\n"
+            'name = "testpkg"\n'
+            'version = "0.1.0"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = self._make_pkg_with(
+                Path(tmp), companion_dirs=["scripts"],
+                pyproject_text=pyproject,
+            )
+            result = lint_pyproject_package_data_bound(pkg)
+            assert result.verdict == "fail", (
+                f"Missing package-data table should fail; got {result.verdict}"
+            )

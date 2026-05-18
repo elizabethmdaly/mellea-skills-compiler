@@ -95,9 +95,9 @@ _ADVISORY_VERDICTS = frozenset({"warning"})
 #              strict mode promotes only WARNING (project policy), not INFO.
 _LINT_SEVERITY: Dict[str, LintSeverity] = {
     # ── ERROR: always-breaks-runtime (14) ───────────────────────────────
-    # ``parseable`` is enforced by the slash command (Tier 1) before this
-    # module runs; entry kept here so any future Python port inherits the
-    # right severity.
+    # ``parseable`` is the Tier 1 hard-fail (every .py file parses + the
+    # package entry module imports cleanly in a subprocess). Implemented in
+    # ``lint_parseable`` below; this entry is what the gate consults.
     "parseable": LintSeverity.ERROR,
     "import-soundness": LintSeverity.ERROR,
     "stdlib-arity": LintSeverity.ERROR,
@@ -112,10 +112,16 @@ _LINT_SEVERITY: Dict[str, LintSeverity] = {
     "format-annotation": LintSeverity.ERROR,
     "variable-safety": LintSeverity.ERROR,
     "session-boundary": LintSeverity.ERROR,
-    # ── ERROR: deployment-context-sensitive (3) ─────────────────────────
+    # ── ERROR: deployment-context-sensitive (4) ─────────────────────────
     "bundled-asset-path-resolution": LintSeverity.ERROR,
     "runtime-defaults-bound": LintSeverity.ERROR,
     "import-side-effects": LintSeverity.ERROR,
+    # ``pyproject-package-data-bound`` is the second half of Rule OUT-6:
+    # the bundled companion dirs MUST appear in
+    # ``[tool.setuptools.package-data]`` so a ``pip install`` ships them.
+    # Without this entry the wheel is missing assets — broken at first
+    # reference load.
+    "pyproject-package-data-bound": LintSeverity.ERROR,
     # ``fixtures-loader-contract`` stays ERROR — missing fixtures/__init__.py
     # is a real file-presence requirement; the smoke-check loader breaks
     # without it.
@@ -978,15 +984,36 @@ def lint_pipeline_entry_canonical(package_dir: Path) -> LintResult:
     authoritative source of truth, but this lint backstops the contract so
     misalignment is caught at compile time rather than fixture smoke-check.
 
-    Skip cases:
-      - `pipeline.py` absent → skipped (other lints own missing-file reports).
+    Missing-file case:
+      - ``pipeline.py`` absent → ``fail``. ``pipeline.py`` is a MANDATORY
+        artefact of every compile (Rule 3-2). Historically this lint reported
+        ``skipped`` for an absent file, which the Step-7 aggregator counted as
+        ``pass`` and let the wrapper proceed to smoke check — which then
+        crashed with a misleading "module is missing" message. Reporting a
+        hard ``fail`` here closes that false-positive chain and (when
+        ``--repair-on-lint-failure`` is set) triggers the repair loop on the
+        actually-broken state instead of after the smoke crash.
     """
     result = LintResult(lint_id="pipeline-entry-canonical", verdict="pass")
 
     pipeline_path = package_dir / "pipeline.py"
     if not pipeline_path.exists():
-        result.verdict = "skipped"
-        result.skipped_reason = "pipeline.py not found in package"
+        result.verdict = "fail"
+        result.failures.append(
+            LintFailure(
+                file="pipeline.py",
+                line=None,
+                column=None,
+                message=(
+                    "pipeline.py is missing from the compiled package. "
+                    "It should be produced either by Claude (legacy free-form "
+                    "emission) or by the wrapper's descriptor renderer (when "
+                    "compiling with --use-descriptor). Cannot validate the "
+                    "entry point of an absent file."
+                ),
+                rule_ref="mellea-fy-generate.md#run_pipeline (Rule 3-2)",
+            )
+        )
         return result
     result.files_checked = 1
 
@@ -1948,8 +1975,28 @@ def lint_run_pipeline_params_typed(package_dir: Path) -> LintResult:
 
     pipeline_path = package_dir / "pipeline.py"
     if not pipeline_path.exists():
-        result.verdict = "skipped"
-        result.skipped_reason = "pipeline.py not found in package"
+        # pipeline.py is mandatory (Rule 3-2). Reporting ``skipped`` here used
+        # to mask a missing-file pipeline behind a benign aggregate verdict;
+        # report ``fail`` so the absence is visible. ``pipeline-entry-canonical``
+        # also fails on the same shape and owns the primary diagnostic — the
+        # repeat here is intentional so this WARNING-severity lint surfaces a
+        # consistent signal even if a future change removes the ERROR sibling.
+        result.verdict = "fail"
+        result.failures.append(
+            LintFailure(
+                file="pipeline.py",
+                line=None,
+                column=None,
+                message=(
+                    "pipeline.py is missing from the compiled package, so "
+                    "`run_pipeline` parameter typing cannot be validated. "
+                    "Produce pipeline.py via Claude (legacy free-form "
+                    "emission) or the wrapper's descriptor renderer "
+                    "(--use-descriptor)."
+                ),
+                rule_ref="Rule 3-1 (cross-reference sub-check F)",
+            )
+        )
         return result
     result.files_checked = 1
 
@@ -3757,6 +3804,368 @@ def lint_import_side_effects(package_dir: Path) -> LintResult:
     return result
 
 
+# ─── Lint: parseable (Tier 1) ───
+
+
+def lint_parseable(package_dir: Path) -> LintResult:
+    """Every `.py` file under the package must parse, and `<pkg>.pipeline` must import.
+
+    Two checks, executed in order:
+
+      1. Per-file parseability: `ast.parse(p.read_text())` for every `.py` file
+         directly under `<package_dir>/` and `<package_dir>/fixtures/`.
+      2. Package importability: `python -c "import <package_name>.pipeline"`
+         executed as a subprocess from `<package_dir>.parent`. A
+         `ModuleNotFoundError` or `ImportError` (e.g. wrong external import
+         path like `mellea.stdlib.strategies` instead of `mellea.stdlib.sampling`)
+         surfaces as a failure here, catching what `ast.parse()` cannot.
+
+    Why a subprocess: importing the package directly in the lint process would
+    pollute namespace, risk hanging on import side effects, or get masked by
+    cached sys.modules entries. A clean child process surfaces exactly the
+    error a downstream consumer (`pip install` + `python -c "import ..."`)
+    would see.
+
+    Missing-file case: when `pipeline.py` is absent we return ONE failure with
+    severity ERROR ("pipeline.py absent — parseable lint cannot run"). This
+    duplicates the `pipeline-entry-canonical` missing-file branch on purpose:
+    Tier 1 should hard-fail loudly so the slash-command tier gate halts before
+    Tier 2/3 lints run on a package that has no entry module at all.
+
+    Scope: only the files directly under `<package_dir>/` and
+    `<package_dir>/fixtures/`. The package is what we ship; the importability
+    check is on `<package_name>.pipeline`, the canonical entry module.
+    """
+    import subprocess
+    import sys
+
+    result = LintResult(lint_id="parseable", verdict="pass")
+
+    pipeline_path = package_dir / "pipeline.py"
+    if not pipeline_path.exists():
+        result.verdict = "fail"
+        result.failures.append(
+            LintFailure(
+                file="pipeline.py",
+                line=None,
+                column=None,
+                message=(
+                    "pipeline.py absent — parseable lint cannot run. "
+                    "The Tier 1 importability check requires the canonical "
+                    "entry module `<package_name>/pipeline.py`. This is a "
+                    "mandatory output of every compile (Rule 3-2)."
+                ),
+                rule_ref="mellea-fy-validate.md#tier-1-parseability",
+            )
+        )
+        return result
+
+    # ── Check 1: per-file ast.parse() ──
+    py_files: List[Path] = []
+    pkg_root_files = sorted(p for p in package_dir.glob("*.py"))
+    fixtures_dir = package_dir / "fixtures"
+    fixtures_files: List[Path] = []
+    if fixtures_dir.is_dir():
+        fixtures_files = sorted(p for p in fixtures_dir.glob("*.py"))
+    py_files.extend(pkg_root_files)
+    py_files.extend(fixtures_files)
+    result.files_checked = len(py_files)
+
+    for py_file in py_files:
+        rel = py_file.relative_to(package_dir).as_posix()
+        try:
+            ast.parse(py_file.read_text(), filename=str(py_file))
+        except SyntaxError as exc:
+            result.failures.append(
+                LintFailure(
+                    file=rel,
+                    line=exc.lineno,
+                    column=exc.offset,
+                    message=(
+                        f"SyntaxError parsing {rel}: {exc.msg}. "
+                        f"The file is not a valid Python module; "
+                        f"downstream lints and runtime import will fail."
+                    ),
+                    rule_ref="mellea-fy-validate.md#tier-1-parseability",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — any read/decode error here is fatal
+            result.failures.append(
+                LintFailure(
+                    file=rel,
+                    line=None,
+                    column=None,
+                    message=(
+                        f"{type(exc).__name__} reading or parsing {rel}: {exc}."
+                    ),
+                    rule_ref="mellea-fy-validate.md#tier-1-parseability",
+                )
+            )
+
+    # If any file failed to parse, skip the import check — the import would
+    # crash on the same syntax error with a less specific traceback.
+    if result.failures:
+        result.verdict = "fail"
+        return result
+
+    # ── Check 2: subprocess import of `<package_name>.pipeline` ──
+    package_name = package_dir.name
+    parent = package_dir.parent
+    cmd = [sys.executable, "-c", f"import {package_name}.pipeline"]
+    env_path = str(parent)
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(parent),
+            env={"PYTHONPATH": env_path, "PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        result.failures.append(
+            LintFailure(
+                file="pipeline.py",
+                line=None,
+                column=None,
+                message=(
+                    f"Timeout (>30s) importing {package_name}.pipeline. "
+                    f"Module-level code is likely blocking (infinite loop, "
+                    f"blocking network call, or a deadlock). Import-time "
+                    f"side effects are forbidden — see import-side-effects."
+                ),
+                rule_ref="mellea-fy-validate.md#tier-1-parseability",
+            )
+        )
+        result.verdict = "fail"
+        return result
+    except Exception as exc:  # noqa: BLE001
+        result.failures.append(
+            LintFailure(
+                file="pipeline.py",
+                line=None,
+                column=None,
+                message=(
+                    f"Failed to spawn subprocess for import check: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                rule_ref="mellea-fy-validate.md#tier-1-parseability",
+            )
+        )
+        result.verdict = "fail"
+        return result
+
+    if proc.returncode != 0:
+        # Stderr from the failing subprocess carries the real traceback —
+        # include enough of it that the operator (or repair loop) can act.
+        stderr = (proc.stderr or "").strip()
+        # Surface the last 2KB of stderr to keep the failure message bounded.
+        if len(stderr) > 2000:
+            stderr = "... " + stderr[-2000:]
+        result.failures.append(
+            LintFailure(
+                file="pipeline.py",
+                line=None,
+                column=None,
+                message=(
+                    f"`python -c 'import {package_name}.pipeline'` failed "
+                    f"(exit {proc.returncode}). This catches wrong external "
+                    f"import paths (e.g. `mellea.stdlib.strategies` vs the "
+                    f"real `mellea.stdlib.sampling`) that ast.parse() cannot "
+                    f"detect. Subprocess stderr:\n{stderr}"
+                ),
+                rule_ref="mellea-fy-validate.md#tier-1-parseability",
+            )
+        )
+        result.verdict = "fail"
+        return result
+
+    return result
+
+
+# ─── Lint: pyproject-package-data-bound (Rule OUT-6) ───
+
+
+def _read_pyproject_toml(path: Path) -> Optional[dict]:
+    """Parse pyproject.toml; return None on missing or unparseable file.
+
+    Uses stdlib ``tomllib`` (Python 3.11+). Errors are deliberately swallowed
+    here — the caller turns absence into a skip and parse failures into a
+    fail with a clear message.
+    """
+    import tomllib
+
+    if not path.exists():
+        return None
+    try:
+        with path.open("rb") as fh:
+            return tomllib.load(fh)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _package_data_globs_for(package_name: str, pyproject: dict) -> List[str]:
+    """Return the list of glob patterns declared for ``package_name`` under
+    ``[tool.setuptools.package-data]`` (or the wildcard ``"*"`` key).
+
+    Returns an empty list when the table is absent or the package has no
+    entry. Both the exact ``package_name`` key and the wildcard ``"*"`` key
+    are honoured (setuptools treats ``"*"`` as "all packages").
+    """
+    tool = pyproject.get("tool", {}) if isinstance(pyproject, dict) else {}
+    setuptools_tbl = tool.get("setuptools", {}) if isinstance(tool, dict) else {}
+    package_data = (
+        setuptools_tbl.get("package-data", {})
+        if isinstance(setuptools_tbl, dict)
+        else {}
+    )
+    if not isinstance(package_data, dict):
+        return []
+    globs: List[str] = []
+    for key in (package_name, "*"):
+        value = package_data.get(key)
+        if isinstance(value, list):
+            globs.extend(g for g in value if isinstance(g, str))
+        elif isinstance(value, str):
+            globs.append(value)
+    return globs
+
+
+def _glob_covers_companion_dir(glob: str, companion: str) -> bool:
+    """Heuristic: does ``glob`` cause setuptools to include any file under
+    ``<companion>/``?
+
+    Acceptable patterns (per Rule OUT-6 prose):
+      - ``<companion>/**/*`` — recursive
+      - ``<companion>/*`` — direct children
+      - ``<companion>/<any-suffix>`` — explicit filename or sub-glob
+      - exact file paths anchored at ``<companion>/`` are sufficient too
+    """
+    g = glob.replace("\\", "/").lstrip("./")
+    prefix = f"{companion}/"
+    return g.startswith(prefix) or g == companion
+
+
+def lint_pyproject_package_data_bound(package_dir: Path) -> LintResult:
+    """Bundled companion dirs MUST appear in `[tool.setuptools.package-data]`.
+
+    Rule OUT-6 contract has two parts:
+
+      (1) Companion directories at the skill root (``scripts/``, ``references/``,
+          ``assets/``) are mirrored into ``<package_name>/`` at Step 3. (Enforced
+          by ``mirror_companion_dirs`` in ``claude_directives.py``.)
+      (2) ``pyproject.toml`` declares those directories under
+          ``[tool.setuptools.package-data]`` so a ``pip install`` includes them
+          in the built wheel.
+
+    Without (2), the wheel ships without bundled assets and the installed
+    package crashes the first time it tries to load a reference or invoke a
+    script — even though the source tree looked complete.
+
+    Detection:
+      - Look up ``pyproject.toml`` at ``<package_dir>/pyproject.toml`` first;
+        if absent, fall back to ``<package_dir>.parent/pyproject.toml`` (the
+        skill root, which is where the slash command currently writes the file
+        in legacy mode). If neither exists, the lint is skipped.
+      - Parse with stdlib ``tomllib`` (Python 3.11+).
+      - For every companion dir physically present at ``<package_dir>/<dir>/``,
+        confirm the resolved ``[tool.setuptools.package-data]`` block (under
+        either the exact package name or the wildcard ``"*"`` key) declares a
+        glob that would cover the directory's contents.
+      - Acceptable globs: ``<dir>/**/*``, ``<dir>/*``, or any pattern beginning
+        with ``<dir>/``. Anything else fails.
+
+    Severity: ERROR — a missing package-data entry produces a broken wheel,
+    which is a deployment-context runtime failure.
+    """
+    result = LintResult(lint_id="pyproject-package-data-bound", verdict="pass")
+
+    # Resolution precedence: package-local pyproject first, then skill-root.
+    candidate_paths = (
+        package_dir / "pyproject.toml",
+        package_dir.parent / "pyproject.toml",
+    )
+    pyproject_path: Optional[Path] = None
+    for p in candidate_paths:
+        if p.exists():
+            pyproject_path = p
+            break
+
+    if pyproject_path is None:
+        result.verdict = "skipped"
+        result.skipped_reason = (
+            "no pyproject.toml at package dir or skill root — "
+            "package-data lint not applicable"
+        )
+        return result
+    result.files_checked = 1
+
+    pyproject = _read_pyproject_toml(pyproject_path)
+    if pyproject is None:
+        rel = (
+            pyproject_path.relative_to(package_dir)
+            if pyproject_path.is_relative_to(package_dir)
+            else Path("..") / pyproject_path.name
+        )
+        result.verdict = "fail"
+        result.failures.append(
+            LintFailure(
+                file=str(rel).replace("\\", "/"),
+                line=None,
+                column=None,
+                message=(
+                    f"pyproject.toml at {pyproject_path} could not be parsed "
+                    f"as TOML. Rule OUT-6 requires a valid "
+                    f"[tool.setuptools.package-data] section."
+                ),
+                rule_ref="Rule OUT-6 (mellea-fy.md)",
+            )
+        )
+        return result
+
+    package_name = package_dir.name
+    declared_globs = _package_data_globs_for(package_name, pyproject)
+
+    # Display path: relative to package_dir when possible, else `../pyproject.toml`.
+    if pyproject_path.is_relative_to(package_dir):
+        rel_path = str(pyproject_path.relative_to(package_dir)).replace("\\", "/")
+    else:
+        rel_path = "../pyproject.toml"
+
+    for companion in _BUNDLED_DIRS:
+        companion_dir = package_dir / companion
+        if not companion_dir.is_dir():
+            continue
+        covered = any(
+            _glob_covers_companion_dir(g, companion) for g in declared_globs
+        )
+        if not covered:
+            result.failures.append(
+                LintFailure(
+                    file=rel_path,
+                    line=None,
+                    column=None,
+                    message=(
+                        f"Companion directory '{companion}/' is mirrored into "
+                        f"{package_name}/ (Rule OUT-6) but pyproject.toml's "
+                        f"[tool.setuptools.package-data] does not declare a "
+                        f"glob covering it. Without an entry like "
+                        f"'{package_name} = [\"{companion}/**/*\", ...]' a "
+                        f"`pip install` will produce a wheel without the "
+                        f"bundled assets and the installed package will "
+                        f"crash on first reference load. "
+                        f"Declared globs for this package: "
+                        f"{declared_globs or '(none)'}"
+                    ),
+                    rule_ref="Rule OUT-6 (mellea-fy.md)",
+                )
+            )
+
+    if result.failures:
+        result.verdict = "fail"
+    return result
+
+
 # ─── Runner ───
 
 
@@ -3787,8 +4196,15 @@ _LLM_OWNED_LINTS_ALLOWLIST: frozenset = frozenset({
 
 
 ALL_LINTS: Tuple[Callable[[Path], LintResult], ...] = (
+    # Tier 1 — parseability check runs first. ``run_lints`` itself does not
+    # halt the rest of the tier on Tier-1 failure (the slash command
+    # implements that policy); the wrapper just runs everything and lets
+    # severity decide the gate. Even so, Tier 1 stays at index 0 so the
+    # report orders results correctly.
+    lint_parseable,
     lint_fixtures_loader_contract,
     lint_bundled_asset_path_resolution,
+    lint_pyproject_package_data_bound,
     lint_runtime_defaults_bound,
     lint_instruct_has_description,
     lint_pipeline_entry_canonical,

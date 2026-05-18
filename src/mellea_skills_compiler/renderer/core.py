@@ -12,6 +12,15 @@ P2.B). P2.B's composition operators self-register on import of
 import lazily, and falls back to a built-in SequentialRenderer if P2.B's
 package is not present (so `test_core.py` can exercise the end-to-end path
 on a sequential-only descriptor without P2.B's operators package).
+
+Entry-point contract: the exported ``run_pipeline`` function is decorated
+with Pydantic's ``@validate_call(config={"arbitrary_types_allowed": True})``
+so that callers can pass plain dicts where Pydantic models are typed and
+have them coerced automatically at call time. The decorator is emitted
+regardless of descriptor version. Internal helpers (loop branches, parallel
+fan-out functions, ``_<name>``-prefixed module-level helpers) are NOT
+decorated — they are called from inside the pipeline where types are
+already correct, and per-call validation adds non-trivial overhead.
 """
 
 from __future__ import annotations
@@ -354,13 +363,35 @@ def render_descriptor(
 
     # Build the run_pipeline function.
     args_node = _build_args_node(descriptor, deps_artefact)
+    # Emit `@validate_call(config={"arbitrary_types_allowed": True})` on the
+    # entry-point function so callers can pass plain dicts where Pydantic
+    # models are typed, and have them coerced automatically at call time.
+    # The `arbitrary_types_allowed=True` config matters because exported
+    # entry points often have parameters typed as things Pydantic doesn't
+    # know how to validate natively (e.g., a session handle, a
+    # ``Callable[...]`` for delegated tools, etc.). Without it, the
+    # decorator raises at function definition time for any such param.
+    ctx.add_import("pydantic", "validate_call")
+    validate_call_decorator = ast.Call(
+        func=ast.Name(id="validate_call", ctx=ast.Load()),
+        args=[],
+        keywords=[
+            ast.keyword(
+                arg="config",
+                value=ast.Dict(
+                    keys=[ast.Constant(value="arbitrary_types_allowed")],
+                    values=[ast.Constant(value=True)],
+                ),
+            )
+        ],
+    )
     if is_async:
         # async def run_pipeline(...) per plan §11.9.
         fn: ast.stmt = ast.AsyncFunctionDef(
             name="run_pipeline",
             args=args_node,
             body=pipeline_stmts + [return_stmt],
-            decorator_list=[],
+            decorator_list=[validate_call_decorator],
             returns=_output_annotation(descriptor.get("outputs", [])),
             type_params=[],
         )
@@ -369,7 +400,7 @@ def render_descriptor(
             name="run_pipeline",
             args=args_node,
             body=pipeline_stmts + [return_stmt],
-            decorator_list=[],
+            decorator_list=[validate_call_decorator],
             returns=_output_annotation(descriptor.get("outputs", [])),
             type_params=[],
         )

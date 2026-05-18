@@ -14,10 +14,14 @@ from pathlib import Path
 import pytest
 
 from mellea_skills_compiler.compile.claude_directives import (
+    _DESCRIPTOR_MODE_ADDITIONAL_PATHS,
+    _LEGACY_WRAPPER_RENDERED_PATHS,
+    _resolve_wrapper_rendered_paths,
     build_system_prompt,
     derive_package_name,
     mirror_companion_dirs,
     resolve_runtime_defaults,
+    write_compile_settings,
     write_runtime_directive,
 )
 from mellea_skills_compiler.compile.mellea_skills import _tolerant_name_extract
@@ -379,3 +383,173 @@ class TestBuildSystemPrompt:
         prompt = build_system_prompt("o'l'l'ama", "granite4.1:8b", "src")
         assert repr("o'l'l'ama") in prompt
         assert repr("granite4.1:8b") in prompt
+
+    def test_build_system_prompt_includes_step_5_discipline_directive(self):
+        """The Step 5 emission-discipline directive must be present so
+        the LLM is reminded to verify every Mellea-stdlib call site
+        against `intermediate/mellea_api_ref.json` BEFORE Step 5b runs
+        as a catch-net. Empirical motivation: the 2026-05-17 batch saw
+        5 separate skills emit `check(req)` (1-arg) instead of
+        `check(requirement, output)` (2-arg) even though the canonical
+        signature was on disk for the LLM to consult."""
+        prompt = build_system_prompt("ollama", "granite4.1:8b", "src")
+        assert "Step 5 emission discipline" in prompt, (
+            "Step 5 emission-discipline directive missing from system prompt"
+        )
+        assert "mellea_api_ref.json" in prompt, (
+            "System prompt must reference the canonical API surface "
+            "(mellea_api_ref.json) for the discipline directive to be "
+            "actionable."
+        )
+        assert "check(" in prompt, (
+            "The empirical-failure-mode example (`check(...)` arity) "
+            "must remain in the prompt so the LLM sees the concrete "
+            "anti-pattern."
+        )
+
+    def test_build_system_prompt_keeps_existing_directives(self):
+        """The Step 5 discipline addition MUST NOT remove the existing
+        autonomous-execution / anti-narration directives. Regression
+        guard for the layered-directive composition."""
+        prompt = build_system_prompt("ollama", "granite4.1:8b", "src")
+        # Autonomous-execution directive (original).
+        assert "Run the complete 10-step pipeline" in prompt
+        # Anti-narration directive (immediate tool invocation).
+        assert "IMMEDIATE tool invocation at step boundaries" in prompt
+        # The wrapper-rendered-path notice (post-deny-rule guidance).
+        assert "Write or edit them yourself" in prompt or (
+            "DO NOT write or edit them" in prompt
+        )
+
+
+class TestResolveWrapperRenderedPaths:
+    """Mode-aware wrapper-rendered path resolution (audit §7-D2, 2026-05-18).
+
+    The wrapper renders deterministic files from emission JSON post-session.
+    In legacy mode it renders `config.py` and `fixtures/**`; in descriptor
+    mode it additionally renders `pipeline.py` and `schemas.py` from
+    `intermediate/descriptor_emission.json`. The helper resolves the right
+    set for each mode so `write_compile_settings` and any other consumer
+    surface a single source of truth.
+    """
+
+    def test_resolve_wrapper_rendered_paths_legacy(self):
+        paths = _resolve_wrapper_rendered_paths(False)
+        assert paths == ("config.py", "fixtures/**")
+        # Legacy must NOT carry the descriptor-only additions.
+        assert "pipeline.py" not in paths
+        assert "schemas.py" not in paths
+
+    def test_resolve_wrapper_rendered_paths_descriptor(self):
+        paths = _resolve_wrapper_rendered_paths(True)
+        # Legacy entries preserved + descriptor-only additions appended.
+        assert "config.py" in paths
+        assert "fixtures/**" in paths
+        assert "pipeline.py" in paths
+        assert "schemas.py" in paths
+        assert len(paths) == 4
+
+    def test_resolve_wrapper_rendered_paths_no_overlap(self):
+        """Legacy and descriptor-only sets must be disjoint — no path is
+        double-listed when descriptor mode unions them. If this ever
+        regresses (e.g. someone moves `config.py` into the descriptor set
+        without removing it from the legacy set), deny rules would
+        duplicate and the union would silently bloat.
+        """
+        legacy = set(_LEGACY_WRAPPER_RENDERED_PATHS)
+        descriptor_extra = set(_DESCRIPTOR_MODE_ADDITIONAL_PATHS)
+        assert legacy.isdisjoint(descriptor_extra), (
+            f"Overlap between legacy and descriptor-mode paths: "
+            f"{legacy & descriptor_extra}"
+        )
+
+
+class TestWriteCompileSettings:
+    """`--settings` deny rules for wrapper-rendered paths.
+
+    The wrapper denies Write/Edit on paths it renders deterministically
+    post-session, so Claude doesn't waste tokens emitting files that get
+    overwritten. The deny list is mode-aware (audit §7-D2, 2026-05-18).
+    """
+
+    def _read_deny(self, path: Path) -> list[str]:
+        return json.loads(path.read_text())["permissions"]["deny"]
+
+    def test_write_compile_settings_legacy_mode_denies_only_legacy_paths(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        intermediate = tmp_path / "pkg_mellea" / "intermediate"
+        package = tmp_path / "pkg_mellea"
+
+        path = write_compile_settings(intermediate, package, use_descriptor=False)
+
+        deny = self._read_deny(path)
+        joined = "\n".join(deny)
+        # Legacy entries present.
+        assert "Write(pkg_mellea/config.py)" in deny
+        assert "Edit(pkg_mellea/config.py)" in deny
+        assert "Write(pkg_mellea/fixtures/**)" in deny
+        assert "Edit(pkg_mellea/fixtures/**)" in deny
+        # Descriptor-only entries MUST be absent in legacy mode — denying
+        # `pipeline.py` in legacy mode would block the LLM from writing
+        # the file it owns end-to-end.
+        assert "pipeline.py" not in joined
+        assert "schemas.py" not in joined
+
+    def test_write_compile_settings_descriptor_mode_denies_pipeline_py_and_schemas_py(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        intermediate = tmp_path / "pkg_mellea" / "intermediate"
+        package = tmp_path / "pkg_mellea"
+
+        path = write_compile_settings(intermediate, package, use_descriptor=True)
+
+        deny = self._read_deny(path)
+        # All four wrapper-rendered paths denied in descriptor mode.
+        for rel in ("config.py", "fixtures/**", "pipeline.py", "schemas.py"):
+            assert f"Write(pkg_mellea/{rel})" in deny, (
+                f"Missing Write deny for {rel} in descriptor mode"
+            )
+            assert f"Edit(pkg_mellea/{rel})" in deny, (
+                f"Missing Edit deny for {rel} in descriptor mode"
+            )
+        # 4 paths × 2 tool variants (Write + Edit) = 8 deny rules.
+        assert len(deny) == 8
+
+    def test_write_compile_settings_default_kwarg_is_legacy(
+        self, tmp_path, monkeypatch
+    ):
+        """Backward compat: calling without `use_descriptor` keeps the
+        pre-2026-05-18 contract (legacy mode = 2 paths × 2 tools = 4
+        deny rules). This protects any caller that hasn't been updated
+        to thread the flag through.
+        """
+        monkeypatch.chdir(tmp_path)
+        intermediate = tmp_path / "pkg_mellea" / "intermediate"
+        package = tmp_path / "pkg_mellea"
+
+        path = write_compile_settings(intermediate, package)
+
+        deny = self._read_deny(path)
+        joined = "\n".join(deny)
+        # Legacy entries present, descriptor entries absent.
+        assert "Write(pkg_mellea/config.py)" in deny
+        assert "Write(pkg_mellea/fixtures/**)" in deny
+        assert "pipeline.py" not in joined
+        assert "schemas.py" not in joined
+        # 2 paths × 2 tool variants = 4 deny rules.
+        assert len(deny) == 4
+
+    def test_write_compile_settings_creates_intermediate_dir(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        intermediate = tmp_path / "pkg_mellea" / "intermediate"
+        package = tmp_path / "pkg_mellea"
+        assert not intermediate.exists()
+
+        path = write_compile_settings(intermediate, package, use_descriptor=True)
+
+        assert intermediate.exists()
+        assert path == intermediate / "_compile_settings.json"
+        assert path.exists()

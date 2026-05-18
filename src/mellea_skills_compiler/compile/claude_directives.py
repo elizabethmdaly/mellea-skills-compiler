@@ -105,24 +105,70 @@ def resolve_runtime_defaults(
 
 
 # Paths under <package_name>/ that the wrapper renders authoritatively from
-# emission JSON. The slash command must NOT write or edit these — `--settings`
-# deny rules block the Write/Edit tool calls, and the wrapper overwrites with
-# the writer's output post-mellea-fy. Add new entries here as each writer is
-# migrated to enforce mode. Glob patterns are supported (verified end-to-end
-# in the synthetic deny-rule test: `Write(forbidden/**)` blocked nested writes).
-_WRAPPER_RENDERED_PATHS: tuple[str, ...] = (
+# emission JSON in LEGACY mode (no `--use-descriptor`). The slash command must
+# NOT write or edit these — `--settings` deny rules block the Write/Edit tool
+# calls, and the wrapper overwrites with the writer's output post-mellea-fy.
+# Add new entries here as each writer is migrated to enforce mode. Glob
+# patterns are supported (verified end-to-end in the synthetic deny-rule
+# test: `Write(forbidden/**)` blocked nested writes).
+_LEGACY_WRAPPER_RENDERED_PATHS: tuple[str, ...] = (
     "config.py",
     "fixtures/**",
 )
 
+# Additional paths the wrapper renders in DESCRIPTOR mode (Fix A,
+# 2026-05-18). Claude emits `intermediate/descriptor_emission.json` and the
+# wrapper's `compile/writer_renderer.py::render_descriptor_to_python`
+# materialises these files from the descriptor IR. In descriptor mode the
+# wrapper is the authoritative source for both `pipeline.py` and `schemas.py`
+# — direct Write/Edit by Claude would be overwritten post-session, wasting
+# tokens on a clobbered emission. Deny rules make that contract explicit at
+# the tool level so the LLM emits the descriptor IR instead.
+_DESCRIPTOR_MODE_ADDITIONAL_PATHS: tuple[str, ...] = (
+    "pipeline.py",
+    "schemas.py",
+)
 
-def write_compile_settings(intermediate_dir: Path, package_dir: Path) -> Path:
+# Backward-compat alias — legacy-mode default. Existing imports (e.g.
+# `build_system_prompt` and any external consumers) keep working with the
+# legacy path list; the descriptor-mode union is exposed only via
+# `_resolve_wrapper_rendered_paths`.
+_WRAPPER_RENDERED_PATHS = _LEGACY_WRAPPER_RENDERED_PATHS
+
+
+def _resolve_wrapper_rendered_paths(use_descriptor: bool) -> tuple[str, ...]:
+    """Return the wrapper-rendered path list for the given compile mode.
+
+    Legacy mode (``use_descriptor=False``) returns the always-rendered set
+    (`config.py`, `fixtures/**`). Descriptor mode (``use_descriptor=True``)
+    additionally includes `pipeline.py` and `schemas.py`, which the wrapper
+    renders post-session from `intermediate/descriptor_emission.json` via
+    `writer_renderer.render_descriptor_to_python`.
+    """
+    if use_descriptor:
+        return _LEGACY_WRAPPER_RENDERED_PATHS + _DESCRIPTOR_MODE_ADDITIONAL_PATHS
+    return _LEGACY_WRAPPER_RENDERED_PATHS
+
+
+def write_compile_settings(
+    intermediate_dir: Path,
+    package_dir: Path,
+    *,
+    use_descriptor: bool = False,
+) -> Path:
     """Write a per-invocation Claude Code --settings file with the deny rules.
 
     Path-scoped Write/Edit denies prevent the LLM from clobbering files the
     wrapper will render after the slash command exits. acceptEdits permission
     mode does NOT override deny — Anthropic's evaluation order is deny → mode
     → allow (verified end-to-end in the synthetic deny-rule test).
+
+    The deny list is mode-aware: in legacy mode it covers `config.py` and
+    `fixtures/**`; in descriptor mode (``use_descriptor=True``) it also
+    covers `pipeline.py` and `schemas.py` because the wrapper renders them
+    deterministically from `intermediate/descriptor_emission.json`. The
+    default (``use_descriptor=False``) preserves the pre-2026-05-18 contract
+    for callers that haven't been updated.
 
     Important: the deny rule paths must match what the LLM actually tries to
     write. Claude Code interprets relative paths against the subprocess cwd
@@ -140,7 +186,7 @@ def write_compile_settings(intermediate_dir: Path, package_dir: Path) -> Path:
         # package_dir is outside cwd — Claude Code accepts absolute paths too.
         rel_pkg = package_dir.resolve()
     deny_rules: list[str] = []
-    for rel in _WRAPPER_RENDERED_PATHS:
+    for rel in _resolve_wrapper_rendered_paths(use_descriptor):
         target = f"{rel_pkg.as_posix()}/{rel}"
         deny_rules.append(f"Write({target})")
         deny_rules.append(f"Edit({target})")
@@ -192,6 +238,35 @@ def build_system_prompt(backend: str, model_id: str, source: str) -> str:
         "Do NOT pause between steps, do NOT ask for user confirmation to proceed, and do NOT stop "
         "after any individual step completes. Invoke each sub-command in sequence and continue "
         "immediately to the next step.\n\n"
+        "**Autonomous execution — IMMEDIATE tool invocation at step boundaries.** "
+        "After completing each step, do NOT end your turn with a narrative line "
+        "(\"Step N complete. Proceeding to step N+1.\"). Instead, IMMEDIATELY invoke "
+        "the first tool for the next step in the SAME turn. Narrative may follow "
+        "the tool call, but the tool call MUST come first at each step boundary. "
+        "The session is considered done only after Step 7 (`step_7_report.json`) "
+        "is written.\n\n"
+        "Empirical observation: sessions that end with \"Proceeding to...\" narrative "
+        "without an immediate follow-up tool call cause the pipeline to halt at the "
+        "step boundary. To avoid this, treat every step transition as a single "
+        "tool invocation, not a sentence.\n\n"
+        "**Step 5 emission discipline — canonical signature verification.** For "
+        "every Mellea-stdlib call you emit (m.instruct, req, check, "
+        "simple_validate, etc.), you MUST:\n\n"
+        "1. Locate the canonical signature in "
+        "intermediate/mellea_api_ref.json:.modules.<module>.<symbol>.signature\n"
+        "2. Match positional argument count, keyword argument names, and "
+        "import paths EXACTLY against the canonical.\n"
+        "3. If you cannot find the symbol in mellea_api_ref.json, do NOT "
+        "invent it — use a documented alternative or surface the limitation.\n"
+        "4. After emitting each auxiliary file (requirements.py, slots.py, "
+        "tools.py), enumerate every Mellea call site in that file and "
+        "verify against the canonical surface before moving on.\n\n"
+        "Empirical observation: the most common cause of post-compile failures "
+        "is hallucinated `check(arg)` (1-arg) when the canonical signature is "
+        "`check(requirement, ctx)` (2-arg). Either look it up exactly or use "
+        "`req()` (the 1-arg factory) instead.\n\n"
+        "The Step 5b validation gate exists to catch these — but the cheaper "
+        "path is to get it right the first time in Step 5.\n\n"
         "The following paths are rendered by the compile pipeline from the JSON you emit "
         "in <package_name>/intermediate/ — DO NOT write or edit them yourself; the Write "
         "and Edit tools are denied for these paths and the wrapper will render them "

@@ -10,6 +10,12 @@ from mellea_skills_compiler.toolkit.logging import configure_logger
 
 
 app = typer.Typer(no_args_is_help=True)
+contract_app = typer.Typer(
+    no_args_is_help=True,
+    help="Inspect and verify the pipeline contract registry "
+    "(see `src/mellea_skills_compiler/compile/pipeline_contract.py`).",
+)
+app.add_typer(contract_app, name="contract")
 LOGGER = configure_logger()
 
 
@@ -58,9 +64,15 @@ def compile(
         typer.Option(
             "--timeout",
             "-t",
-            help="Claude session timeout in seconds. Default to 4500 (75min).",
+            help=(
+                "Claude session timeout in seconds. Default 14400 (4 hours). "
+                "Raised from the previous 4500s (75min) because complex skills "
+                "with multi-lint repair sequences were being cut mid-fix. "
+                "Increase further on demand; the only downside of a high cap "
+                "is that a genuinely-hung session takes longer to detect."
+            ),
         ),
-    ] = 4500,
+    ] = 14400,
     repair_mode: Annotated[
         bool,
         typer.Option(
@@ -130,6 +142,30 @@ def compile(
             "One of: auto|always|never.",
         ),
     ] = "auto",
+    resume_on_early_end: Annotated[
+        bool,
+        typer.Option(
+            "--resume-on-early-end",
+            help="Detect when Claude ended its turn before Step 6 completed "
+            "(e.g., 'Step 0 complete. Proceeding to Step 1a.' with no "
+            "follow-up tool call) and automatically re-invoke Claude to "
+            "resume from the next step. Up to 3 resume rounds per skill. "
+            "Default: False (legacy behaviour — single shot).",
+        ),
+    ] = False,
+    repair_on_lint_failure: Annotated[
+        bool,
+        typer.Option(
+            "--repair-on-lint-failure",
+            help=(
+                "When the wrapper detects error-severity Step 7 lint failures "
+                "after the Claude session ends, automatically spawn a second "
+                "Claude session in repair mode with structured F1 fix "
+                "prescriptions. Up to 2 repair rounds per compile. "
+                "Default: False (legacy behaviour — compile fails hard on lint)."
+            ),
+        ),
+    ] = False,
 ):
     """
     Compile Mellea skill specification into a Mellea pipeline using mellea-fy Claude command.
@@ -158,6 +194,8 @@ def compile(
                 skill_model=skill_model,
                 strict=strict,
                 smoke_check=smoke_check,
+                resume_on_early_end=resume_on_early_end,
+                repair_on_lint_failure=repair_on_lint_failure,
             )
             return
 
@@ -174,6 +212,8 @@ def compile(
             skill_model=skill_model,
             strict=strict,
             smoke_check_mode=smoke_check,
+            resume_on_early_end=resume_on_early_end,
+            repair_on_lint_failure=repair_on_lint_failure,
         )
     except Exception as e:
         LOGGER.error(str(e))
@@ -218,6 +258,8 @@ def _run_descriptor_compile(
     skill_model: Optional[str],
     strict: bool = False,
     smoke_check: str = "auto",
+    resume_on_early_end: bool = False,
+    repair_on_lint_failure: bool = False,
 ) -> None:
     """Descriptor-IR branch of `compile` (Phase 3.5.A wiring).
 
@@ -262,6 +304,8 @@ def _run_descriptor_compile(
         use_descriptor=True,
         strict=strict,
         smoke_check_mode=smoke_check,
+        resume_on_early_end=resume_on_early_end,
+        repair_on_lint_failure=repair_on_lint_failure,
     )
 
 
@@ -573,6 +617,83 @@ def export(
         raise
     except Exception as e:
         LOGGER.error(str(e))
+        raise typer.Exit(code=1)
+
+
+@contract_app.command("show")
+def contract_show(
+    json_out: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Emit the contract + computed graph as JSON (machine-readable).",
+        ),
+    ] = False,
+    order_only: Annotated[
+        bool,
+        typer.Option(
+            "--order",
+            help="Print only the topological step order (one step_id per line).",
+        ),
+    ] = False,
+) -> None:
+    """Show the pipeline contract — Mermaid + topological order + per-step I/O."""
+    from mellea_skills_compiler.compile.pipeline_contract import (
+        PIPELINE_CONTRACT,
+        render_contract_json,
+        render_markdown_report,
+        topological_order,
+    )
+
+    if order_only:
+        for sid in topological_order(PIPELINE_CONTRACT):
+            typer.echo(sid)
+        return
+    if json_out:
+        typer.echo(render_contract_json(PIPELINE_CONTRACT))
+        return
+    typer.echo(render_markdown_report(PIPELINE_CONTRACT))
+
+
+@contract_app.command("verify")
+def contract_verify() -> None:
+    """Run static checks against the pipeline contract.
+
+    Exit codes:
+      0 — no errors (warnings may still surface)
+      1 — at least one error
+    """
+    from mellea_skills_compiler.compile.pipeline_contract import (
+        PIPELINE_CONTRACT,
+        verify_contract,
+    )
+
+    result = verify_contract(PIPELINE_CONTRACT)
+    if result.errors:
+        typer.echo("Errors:")
+        for line in result.errors:
+            typer.echo(f"  [x] {line}")
+    if result.warnings:
+        typer.echo("Warnings:")
+        for line in result.warnings:
+            typer.echo(f"  [!] {line}")
+    if result.ok and not result.warnings:
+        typer.echo("[ok] pipeline contract verified — no errors, no warnings")
+    elif result.ok:
+        typer.echo(
+            f"[ok] pipeline contract verified — no errors "
+            f"({len(result.warnings)} warning"
+            f"{'s' if len(result.warnings) != 1 else ''})"
+        )
+    else:
+        typer.echo(
+            f"[fail] pipeline contract verification failed: "
+            f"{len(result.errors)} error"
+            f"{'s' if len(result.errors) != 1 else ''}, "
+            f"{len(result.warnings)} warning"
+            f"{'s' if len(result.warnings) != 1 else ''}"
+        )
+    if not result.ok:
         raise typer.Exit(code=1)
 
 

@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mellea-skills-compiler/schemas/step_5b_report.schema.json",
+  "title": "Step 5b in-session validation report",
+  "description": "Structured report Claude writes after applying the Step 5b subset of structural lints against the Step 5 emissions. Persisted at intermediate/step_5b_report.json.",
+  "type": "object",
+  "required": ["format_version", "verdict", "files_checked", "fixes_applied"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {
+      "const": "1.0",
+      "description": "Frozen at 1.0 for the initial Step 5b gate."
+    },
+    "verdict": {
+      "enum": ["pass", "fixed", "fail"],
+      "description": "pass = zero mismatches found; fixed = mismatches found and edited in place; fail = at least one mismatch could not be repaired in-session."
+    },
+    "files_checked": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Relative paths (from the package root) of the Step 5 emissions Claude enumerated. Typically a subset of pipeline.py, requirements.py, slots.py, tools.py, constrained_slots.py, mobjects.py, loader.py."
+    },
+    "call_sites_enumerated": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total count of Mellea-stdlib call sites visited across files_checked. Optional; used for telemetry."
+    },
+    "fixes_applied": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["file", "line", "issue", "fix_summary"],
+        "additionalProperties": false,
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Relative path inside the package."
+          },
+          "line": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "description": "1-indexed line number of the offending call site. May be null if the issue is structural (e.g. import path)."
+          },
+          "issue": {
+            "type": "string",
+            "description": "Short lint-id-style description of the defect (e.g. 'stdlib-arity', 'import-soundness', 'instruct-has-description')."
+          },
+          "fix_summary": {
+            "type": "string",
+            "description": "One-line explanation of the edit Claude applied (e.g. 'rewrote check(req) to check(req, ctx)', 'changed mellea.backends.tools to mellea.stdlib.tools')."
+          }
+        }
+      }
+    },
+    "remaining_issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["file", "line", "issue"],
+        "additionalProperties": false,
+        "properties": {
+          "file": {"type": "string"},
+          "line": {"type": ["integer", "null"], "minimum": 1},
+          "issue": {"type": "string"},
+          "reason_unfixable": {
+            "type": "string",
+            "description": "Optional. Why Claude could not repair in-session (e.g. 'canonical signature not in mellea_api_ref.json', 'symbol not present in surface — upstream rework needed')."
+          }
+        }
+      },
+      "description": "Issues Claude detected but could NOT repair in-session. Verdict MUST be 'fail' when this list is non-empty."
+    }
+  }
+}
