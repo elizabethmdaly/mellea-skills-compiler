@@ -2238,12 +2238,18 @@ class TestStdlibArity:
             assert lint_stdlib_arity(pkg).verdict == "pass"
 
     def test_fails_when_req_called_with_zero_positional(self):
+        """``req()`` omits the required ``description`` param both
+        positionally and by keyword — must still fail under the
+        slot-filling check (regression guard for the #37 rewrite).
+        """
         code = "from mellea.stdlib.requirements import req\nBAD = req()\n"
         with tempfile.TemporaryDirectory() as tmp:
             pkg = _make_package(Path(tmp), {"requirements.py": code})
             result = lint_stdlib_arity(pkg)
             assert result.verdict == "fail"
-            assert "0 positional" in result.failures[0].message
+            # New message names the missing param explicitly.
+            assert "missing required parameter" in result.failures[0].message
+            assert "description" in result.failures[0].message
 
     def test_fails_when_simple_validate_called_with_zero_args(self):
         code = (

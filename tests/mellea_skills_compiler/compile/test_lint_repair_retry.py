@@ -403,7 +403,24 @@ class TestSpawnClaudeWithLintRepair:
         assert call_n["n"] == 2
 
     def test_terminates_after_max_rounds(self, tmp_path):
-        """Spawn always produces errors → loops exactly max_rounds + 1 times."""
+        """Spawn always produces the same errors → stable-error detection
+        bails after the first repair round (B1 stable-error detection).
+
+        Behaviour contract:
+          - Round 0 (initial): runs lints; sees ``overall_verdict=fail`` →
+            spawns repair (round 1).
+          - Round 1: runs lints again; failure surface is byte-identical
+            to round 0; the classifier returns ``no-progress`` → loop
+            bails with a clear stable-error log; remaining budget
+            abandoned.
+
+        Result: 1 initial spawn + 1 repair spawn = 2 spawns total. The
+        repair budget (``max_repair_rounds=2``) is NOT exhausted because
+        burning further rounds on the same un-touched failures cannot
+        make progress (either the repair agent is single-tracking, or
+        the fix is outside the repair flow's reach). The helper still
+        does NOT raise — caller sees the final lint failure path.
+        """
         package = tmp_path / "weather_mellea"
         _write_step_7_report(
             package, lints=[_stdlib_arity_failure_lint()]
@@ -424,8 +441,8 @@ class TestSpawnClaudeWithLintRepair:
             max_repair_rounds=2,
         )
 
-        # 1 initial + 2 repair = 3 spawns; helper does NOT raise.
-        assert spawn.call_count == 3
+        # 1 initial + 1 repair (stable-error bail) = 2 spawns; helper does NOT raise.
+        assert spawn.call_count == 2
 
     def test_passes_use_descriptor_through_to_repair(self, tmp_path):
         """Initial argv has --use-descriptor → repair argv also has it."""

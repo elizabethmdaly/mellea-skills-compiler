@@ -2,8 +2,9 @@
 
 This module produces `mellea_api_ref.json` and `mellea_doc_index.json` in the
 compile pipeline's intermediate directory before the slash command runs. The
-slash command itself runs with `--allowed-tools Read,Write,Edit` and so cannot
-introspect the installed `mellea` package or fetch `https://docs.mellea.ai/`.
+slash command itself runs with `--allowed-tools Read,Write,Edit,Glob` and so
+cannot introspect the installed `mellea` package via Python or fetch
+`https://docs.mellea.ai/`.
 Doing it here means Steps 2.5e and 2.5f of the slash command have real
 grounding data to consume rather than silently degrading to static fallbacks.
 
@@ -212,7 +213,25 @@ def _introspect_mellea(referenced_modules: set[str]) -> dict[str, dict[str, Any]
         m.name
         for m in pkgutil.walk_packages(path=mellea_pkg.__path__, prefix="mellea.")
     }
-    to_scan = all_mellea & (CORE_MODULES | referenced_modules)
+    # The ``mellea.backends`` namespace is enumerated WHOLESALE rather
+    # than curated via CORE_MODULES. Rationale: the directive
+    # (``mellea-fy-generate.md`` Rule 5-2) tells the LLM that
+    # ``mellea_api_ref.json:.modules`` is the authoritative source for
+    # what's importable — any path not present is invalid. When the
+    # backends list drifts from runtime (as of 2026-05-19,
+    # ``mellea.backends.ollama`` was importable but missing from the
+    # curated set), the directive promises the LLM something the runtime
+    # contradicts: real imports get flagged as false positives by
+    # ``import-soundness``. Backends are small in count and high in
+    # user-facing-ness, so enumerating them is a better discipline than
+    # curating. Other namespaces (stdlib.components.*, etc.) remain
+    # curated via CORE_MODULES to keep the surface focused.
+    backends_namespace = {
+        name for name in all_mellea if name.startswith("mellea.backends.")
+    }
+    to_scan = all_mellea & (
+        CORE_MODULES | referenced_modules | backends_namespace
+    )
 
     api_ref: dict[str, dict[str, Any]] = {}
     for module_name in sorted(to_scan):
@@ -335,12 +354,63 @@ def _api_ref_cache_path(version: str, extras: set[str] | None = None) -> Path:
     return CACHE_DIR / f"api_ref_{version}_{cache_hash}.json"
 
 
+def _write_api_ref_sidecars(intermediate_dir: Path, payload: dict[str, Any]) -> None:
+    """Write small-field sidecars alongside the monolithic ``mellea_api_ref.json``.
+
+    The monolithic file is ~280 KB and exceeds the LLM-side Read tool's
+    256 KB hard limit. Two of its top-level fields (`forbidden_param_names`,
+    `compatibility`) are small (~1–2 KB each) and frequently consulted —
+    extracting them as separate files lets the LLM consume them in
+    full without seeking inside a file too large to read end-to-end.
+
+    Schema for each sidecar::
+
+        {
+          "format_version": "1.0",
+          "mellea_version": "<version>" | null,
+          "grounding_unavailable": <bool>,
+          "<field>": <field-payload>
+        }
+
+    Backwards-compatible: monolithic file is unchanged; sidecars are
+    additive. Coherence test (`test_grounding.py`) verifies the sidecar
+    field values match the monolithic file's corresponding top-level
+    fields exactly — preventing producer drift.
+    """
+    meta = {
+        "format_version": "1.0",
+        "mellea_version": payload.get("mellea_version"),
+        "grounding_unavailable": bool(payload.get("grounding_unavailable", False)),
+    }
+    compatibility_sidecar = {
+        **meta,
+        "compatibility": payload.get("compatibility", []),
+    }
+    forbidden_sidecar = {
+        **meta,
+        "forbidden_param_names": payload.get("forbidden_param_names", []),
+    }
+    _atomic_write(
+        intermediate_dir / "mellea_api_ref.compatibility.json",
+        json.dumps(compatibility_sidecar, indent=2),
+    )
+    _atomic_write(
+        intermediate_dir / "mellea_api_ref.forbidden_param_names.json",
+        json.dumps(forbidden_sidecar, indent=2),
+    )
+
+
 def write_mellea_api_ref(intermediate_dir: Path, refresh: bool = False) -> Path:
     """Write `mellea_api_ref.json` to `intermediate_dir`.
 
     Cached by installed mellea version under
     `~/.cache/mellea-skills-compiler/api_ref_<version>.json`. If `mellea` is
     not installed, writes the `grounding_unavailable: true` shape and returns.
+
+    Also writes two small-field sidecars (`mellea_api_ref.compatibility.json`
+    and `mellea_api_ref.forbidden_param_names.json`) so LLM consumers can
+    read those fields without seeking inside the 280+ KB monolithic file —
+    see :func:`_write_api_ref_sidecars`.
     """
     out_path = intermediate_dir / "mellea_api_ref.json"
 
@@ -350,7 +420,9 @@ def write_mellea_api_ref(intermediate_dir: Path, refresh: bool = False) -> Path:
         LOGGER.warning(
             "mellea package not installed; writing grounding_unavailable api_ref"
         )
-        _atomic_write(out_path, _grounding_unavailable_payload())
+        serialized = _grounding_unavailable_payload()
+        _atomic_write(out_path, serialized)
+        _write_api_ref_sidecars(intermediate_dir, json.loads(serialized))
         return out_path
 
     # Cache key includes modality-driven extras so a P2 (tool-dispatch)
@@ -361,7 +433,9 @@ def write_mellea_api_ref(intermediate_dir: Path, refresh: bool = False) -> Path:
 
     if cache_path.exists() and not refresh:
         LOGGER.info("Using cached mellea_api_ref for version %s", version)
-        _atomic_write(out_path, cache_path.read_text())
+        serialized = cache_path.read_text()
+        _atomic_write(out_path, serialized)
+        _write_api_ref_sidecars(intermediate_dir, json.loads(serialized))
         return out_path
 
     LOGGER.info("Introspecting mellea %s for api_ref", version)
@@ -381,6 +455,7 @@ def write_mellea_api_ref(intermediate_dir: Path, refresh: bool = False) -> Path:
 
     _atomic_write(cache_path, serialized)
     _atomic_write(out_path, serialized)
+    _write_api_ref_sidecars(intermediate_dir, payload)
     return out_path
 
 

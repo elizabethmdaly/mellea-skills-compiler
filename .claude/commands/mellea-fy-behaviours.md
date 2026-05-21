@@ -62,7 +62,6 @@ Note: `@generative` slots handle parsing internally and return typed values dire
 
 **Lint check**: `known-behaviours` sub-check 3a. Detection: parse `pipeline.py` with `ast`; identify variables assigned from `m.instruct(...)` calls with a `format=` keyword; flag any attribute access or method call on those variables that is not wrapped in `_parse_instruct_result(`, `_safe_parse_with_fallback(`, or `.model_validate_json(`. Hard failure.
 **Status**: empirically observed — re-verify on mellea upgrade.
-**Added**: 2026-04-29 (restored from v0c116fa, scope broadened from `.parsed_repr` to all field access) | **Last-validated**: 2026-04-29
 
 ---
 
@@ -72,7 +71,6 @@ When the LLM generates JSON for a complex Pydantic schema with large `grounding_
 
 **Lint check**: `known-behaviours` sub-check 3b. Detection: parse `pipeline.py` and `schemas.py` with `ast`; for each `m.instruct(format=Model)` call, look up the model's field count and list annotations in `schemas.py`; if the model qualifies as complex (>4 fields or a `list[...]` field), assert the call has a `strategy=` keyword or the result variable is passed to `_safe_parse_with_fallback`. Hard failure.
 **Status**: empirically observed — re-verify on mellea upgrade.
-**Added**: 2026-04-29 (restored from v0c116fa) | **Last-validated**: 2026-04-29
 
 ---
 
@@ -103,7 +101,7 @@ Generated pipelines should prefer Pattern A for all structural validators in `re
 
 **Lint check**: `validator-soundness` sub-check A (correct `(ctx, result)` signature).
 **Ref**: https://docs.mellea.ai/how-to/write-custom-verifiers
-**Added**: pre-2026-04-28 | **Last-validated**: 2026-04-28 | **Fixture**: tests/promptfoo/kb_03.yaml
+**Fixture**: `tests/promptfoo/kb_03.yaml`
 
 ---
 
@@ -148,7 +146,7 @@ empty_fixes = [f for f in report.findings if not f.fix.strip()]
 
 **Lint check**: `validator-soundness` sub-check B (non-vacuous lambda body).
 **Ref**: https://docs.mellea.ai/how-to/write-custom-verifiers
-**Added**: pre-2026-04-28 | **Last-validated**: 2026-04-28 | **Fixture**: tests/promptfoo/kb_04.yaml
+**Fixture**: `tests/promptfoo/kb_04.yaml`
 
 ---
 
@@ -186,7 +184,7 @@ severity = classify_severity(m1, ...)             # ClassifySeverityResponse —
 
 **Lint check**: `session-boundary` lint (dedicated Tier 2 lint).
 **Ref**: https://docs.mellea.ai/concepts/context-and-sessions
-**Added**: pre-2026-04-28 | **Last-validated**: 2026-04-28 | **Fixture**: tests/promptfoo/kb_05.yaml
+**Fixture**: `tests/promptfoo/kb_05.yaml`
 
 ---
 
@@ -222,7 +220,7 @@ Use `surrounding_context`, `finding_context`, `source_text`, `doc_context`, etc.
 
 **Lint check**: `known-behaviours` sub-check 3f.
 **Ref**: https://docs.mellea.ai/concepts/generative-functions
-**Added**: 2026-04-27 | **Last-validated**: 2026-04-28 | **Fixture**: tests/promptfoo/kb_06.yaml
+**Fixture**: `tests/promptfoo/kb_06.yaml`
 
 ---
 
@@ -254,7 +252,7 @@ result = m.instruct(
 
 **Lint check**: `known-behaviours` sub-check 3g. Detects `prefix=<config_constant>` being used as a persona mechanism. Note: `prefix=` for structured output generation patterns is permitted.
 **Ref**: https://docs.mellea.ai/how-to/configure-model-options
-**Added**: pre-2026-04-28 | **Last-validated**: 2026-04-28 | **Fixture**: tests/promptfoo/kb_07.yaml
+**Fixture**: `tests/promptfoo/kb_07.yaml`
 
 ---
 
@@ -264,7 +262,6 @@ Pass `return_sampling_results=True` to `m.instruct()` to get a `SamplingResult` 
 
 **Advisory only — no lint sub-check.** This entry documents a debugging pattern; the `known-behaviours` lint does not enforce it. Set `return_sampling_results=False` (or omit it) in all generated production pipelines.
 **Ref**: https://docs.mellea.ai/concepts/instruct-validate-repair
-**Added**: pre-2026-04-28 | **Last-validated**: 2026-04-28 | **Fixture**: none
 
 ---
 
@@ -280,7 +277,6 @@ no_vague_language = check("Output must not contain vague phrases like 'in genera
 ```
 
 **Ref**: https://docs.mellea.ai/concepts/requirements-system
-**Added**: pre-2026-04-28 | **Last-validated**: 2026-04-28 | **Fixture**: none
 
 ---
 
@@ -325,4 +321,118 @@ This applies to any `Optional` field in a P2 `m.instruct` schema where the value
 
 **Lint check**: `known-behaviours` sub-check 3m. Detection: parse `schemas.py` with `ast`; find `BaseModel` subclasses named `*Schema`, `*Intent`, or referenced as `format=` in a `m.instruct` call; for each `Optional`-annotated field, assert `Field(description=...)` is present and contains at least one of `"extract"`, `"do not ask"`, `"if the"`.
 **Ref**: https://docs.mellea.ai/how-to/enforce-structured-output
-**Added**: 2026-04-28 | **Last-validated**: 2026-04-28 | **Fixture**: tests/promptfoo/kb_11.yaml
+**Fixture**: `tests/promptfoo/kb_11.yaml`
+
+---
+
+# Writer & renderer accept-sets
+
+The entries above (KB1–KB11) document mellea library quirks. The entries below document accept-set contracts for the deterministic writers and renderers that consume LLM-emitted intermediates (`.claude/melleafy/writers/config_writer.py` and `mellea_skills_compiler.renderer.render_descriptor`). Both consumers are intentionally narrow — they enforce shape constraints precisely so that the rendered Python is safe and unambiguous. Violations produce hard schema-validation or render failures that the repair loop cannot rescue by re-emitting the same shape; you must emit in the accepted form on the first pass.
+
+Treat each entry below as a hard constraint on what to emit. The repair-mode slash command and the wrapper-built repair prompt both reference this section by name — when a Step 7 lint failure mentions `config_emission.schema.json` validation or a `RendererError`, this is the lookup table for what is and is not accepted.
+
+## ACCEPT-SET-1: `config_emission.json` constants are scalar-only (Amendment K)
+
+`config_emission.json` constants are scalar-only by design. Each entry's `type` MUST be one of `"str" | "int" | "float" | "bool"` and `value` MUST be the matching JSON scalar. The deterministic writer at `.claude/melleafy/writers/config_writer.py` rejects any constant with `type: "dict"`, `type: "list"`, or a non-scalar `value` — the wrapper hard-fails the entire `config.py` render and surfaces a schema-violation lint failure. The scalar-only contract is what lets the writer use `repr()` per value and produce safe Python without any quoting-ladder bugs (the Amendment K design property).
+
+**Do NOT route dict or list literals through `config_emission.json`.** For non-scalar constants (lookup tables, fixed lists, nested config blobs), pick one of the two alternatives below. There is no in-schema reshaping that preserves the original semantics, so the repair loop cannot rescue a violation — you must choose the right target on first emission.
+
+**Alternative (a) — split into scalars and reconstruct in `pipeline.py`** (preferred when entries are individually meaningful and may be referenced by name).
+
+```json
+// ❌ WRONG — will fail config_emission.schema.json validation
+{ "name": "BREACH_CATEGORIES", "type": "dict",
+  "value": {"simple": 1, "behavioral": 2, "financial": 3, "art9_sensitive": 4} }
+
+// ✅ RIGHT — emit each entry as its own scalar constant
+{ "name": "BREACH_CATEGORY_SIMPLE",         "type": "int", "value": 1 },
+{ "name": "BREACH_CATEGORY_BEHAVIORAL",     "type": "int", "value": 2 },
+{ "name": "BREACH_CATEGORY_FINANCIAL",      "type": "int", "value": 3 },
+{ "name": "BREACH_CATEGORY_ART9_SENSITIVE", "type": "int", "value": 4 }
+```
+
+Reconstruct the original shape in `pipeline.py` as a one-line literal referencing the scalars:
+
+```python
+from .config import (
+    BREACH_CATEGORY_SIMPLE, BREACH_CATEGORY_BEHAVIORAL,
+    BREACH_CATEGORY_FINANCIAL, BREACH_CATEGORY_ART9_SENSITIVE,
+)
+
+BREACH_CATEGORIES = {
+    "simple": BREACH_CATEGORY_SIMPLE,
+    "behavioral": BREACH_CATEGORY_BEHAVIORAL,
+    "financial": BREACH_CATEGORY_FINANCIAL,
+    "art9_sensitive": BREACH_CATEGORY_ART9_SENSITIVE,
+}
+```
+
+**Alternative (b) — inline the literal directly in `pipeline.py`** (preferred when the structure is opaque and its individual entries are never referenced separately).
+
+```python
+# In pipeline.py — inline Python literal, no config_emission.json round-trip
+_CATEGORY_WEIGHTS = {"simple": 0.1, "behavioral": 0.3, "financial": 0.4, "art9_sensitive": 0.5}
+```
+
+**Rule of thumb.** If you would write `"type": "dict"` or `"type": "list"` in `config_emission.json`, stop. The constant belongs in `pipeline.py` — either reconstructed from scalars (alternative a) or inlined directly (alternative b). The schema gate exists specifically to catch this.
+
+**Schema**: `.claude/schemas/config_emission.schema.json`.
+**Writer**: `.claude/melleafy/writers/config_writer.py`.
+**Source amendment**: `melleafy-handoff/amendments/2026-04-27-K-string-literal-safety-in-config.md`.
+
+---
+
+## ACCEPT-SET-2: Descriptor accept-set (type expressions, signatures, symbols)
+
+The deterministic descriptor renderer at `mellea_skills_compiler.renderer.render_descriptor` (invoked post-session by `compile/writer_renderer.py::render_descriptor_to_python` in descriptor mode) accepts a narrow set of forms for type expressions, dependency signatures, and symbol references. Emit every value in exactly the form below — the renderer rejects others with a `RendererError`, and the wrapper surfaces the rejection both as a `[writer:descriptor] render failed` log line and as a downstream `pipeline-entry-canonical` Step 7 lint failure (because `pipeline.py` was not produced).
+
+### Type expressions: PEP 585 lowercase forms only
+
+Use the built-in generic forms; do NOT import from `typing` and do NOT use capitalised aliases. The renderer parses bare names like `list[str]`, `dict[str, int]`, and union syntax `A | B`. Capitalised `typing.X` aliases (`List`, `Dict`, `Optional`, `Union`, `Tuple`) are rejected as `unrecognised type expression`.
+
+| ❌ Reject (`List[str]`-style)        | ✅ Accept (PEP 585 / `\|` union)   |
+| ------------------------------------ | --------------------------------- |
+| `List[str]`                          | `list[str]`                       |
+| `Dict[str, int]`                     | `dict[str, int]`                  |
+| `Tuple[int, str]`                    | `tuple[int, str]`                 |
+| `Set[str]`                           | `set[str]`                        |
+| `Optional[str]`                      | `str \| None`                     |
+| `Union[A, B]`                        | `A \| B`                          |
+| `Iterable[str]`                      | `list[str]` (use the concrete form when possible; if a truly abstract iterable is required, scope it via a Pydantic field) |
+
+This rule applies to every type expression in the descriptor: `inputs[].type`, `outputs[].type`, `state[].type`, `schemas[].fields[].type`, and `dependencies[].signature` parameter / return annotations.
+
+### Dependency signatures: parenthesised form, no leading function name
+
+The renderer's `_parse_signature()` expects signatures starting with `(`. The function name is taken from the `id` field, not from the signature string. Including the function name prefix produces `RendererError: unparseable dependency signature: '<name>(...)'`.
+
+```json
+// ❌ WRONG — function name prepended
+{ "id": "web_search_regulatory_queries",
+  "signature": "web_search_regulatory_queries(query: str) -> str" }
+
+// ✅ RIGHT — parenthesised form only; id carries the name
+{ "id": "web_search_regulatory_queries",
+  "signature": "(query: str) -> str" }
+```
+
+### Symbol references: defining-module paths, resolvable in the surface
+
+Symbols used as `state[].symbol`, pipeline node `call` fields, and strategy args must use the defining-module path as recorded in `intermediate/mellea_api_ref.json` (or the bundled `surface_0.5.0.json` fallback). The descriptor IR accepts only the keys the introspection wrote into the surface — not the Python user-facing import form.
+
+**The most common LLM mistake** is to use the form you'd write in Python after `from mellea import X`. That's the re-export form (without the full `stdlib.*` prefix). The surface only records the defining-module form (with the full `stdlib.*` path). Re-export forms and bare names are both rejected by the renderer.
+
+**Algorithm — look up every symbol before emitting:**
+
+1. Open `intermediate/mellea_api_ref.json:.modules`. Each top-level key is a module path; each module's value is a dict whose keys are the symbols recorded under that module (classes, functions, and methods — methods are recorded as `ClassName.method`).
+2. For a symbol you need to reference, find which module's key dict contains it.
+3. The canonical descriptor path is `<module_key>.<symbol_key>` — concatenate the two with a dot.
+
+If a symbol does not appear in any module's keys, do not invent a path. Either the symbol is not part of the Mellea surface (and cannot be referenced from the descriptor) or `mellea_api_ref.json` is stale and needs regenerating.
+
+Local-package helper functions (anything in `loader.py` or `requirements.py`) MUST NOT appear in `state[]`; they belong inside `pipeline.py` (rendered from elsewhere) or as `dependencies[]` entries with an explicit signature.
+
+The wrapper's renderer hard-fails on unresolvable symbols. The Step 7 `pipeline-entry-canonical` lint then surfaces the failure because `pipeline.py` is absent, not because the lint examined the descriptor — the actionable error appears in the wrapper's `[writer:descriptor]` log line and in the repair prompt as `DESCRIPTOR RENDER FAILED`.
+
+**Schema**: `src/mellea_skills_compiler/descriptor/schemas/descriptor.schema.v0.3.json`.
+**Renderer**: `mellea_skills_compiler.renderer.render_descriptor` (via `compile/writer_renderer.py::render_descriptor_to_python`).

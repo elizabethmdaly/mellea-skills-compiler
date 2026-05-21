@@ -716,13 +716,19 @@ PIPELINE_CONTRACT: tuple[StepContract, ...] = (
             ArtefactRef(
                 name="intermediate/step_7_report.json",
                 format="json",
+                schema_path=(
+                    "src/mellea_skills_compiler/compile/"
+                    "schemas/step_7_report.schema.json"
+                ),
                 kind="intermediate",
             ),
         ),
         notes=(
             "25 lints across 3 tiers (parseability, structural, "
             "cross-artifact). Severity model: `error` blocks compile; "
-            "`warning` / `info` surface as findings."
+            "`warning` / `info` surface as findings. Report shape "
+            "governed by step_7_report.schema.json (Draft-07); "
+            "validated against the schema by ``run_lints`` at write time."
         ),
     ),
 )

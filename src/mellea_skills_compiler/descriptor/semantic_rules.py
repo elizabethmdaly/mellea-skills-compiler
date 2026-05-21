@@ -76,7 +76,7 @@ _OPERATOR_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
 
 # Closed vocabulary for SchemaField.type strings — R-SEM-FIELD-TYPE-KNOWN.
 _KNOWN_FIELD_TYPE_TOKENS: frozenset[str] = frozenset(
-    {"str", "int", "float", "bool", "any", "Any", "model_ref", "enum_ref"}
+    {"str", "int", "float", "bool", "bytes", "any", "Any", "model_ref", "enum_ref"}
 )
 
 # Top-level parameterised constructors accepted by the field-type vocabulary.
@@ -847,7 +847,7 @@ def _slot_type_string(schema_ref: Any) -> str:
     if not isinstance(schema_ref, dict):
         return ""
     kind = schema_ref.get("kind")
-    if kind in ("str", "int", "float", "bool"):
+    if kind in ("str", "int", "float", "bool", "bytes"):
         return str(kind)
     if kind in ("model_ref", "enum_ref", "pydantic_model"):
         ref = schema_ref.get("ref")
@@ -1396,19 +1396,24 @@ def _check_modality_rules(*, descriptor: dict[str, Any]) -> list[ValidationError
                     )
                 )
 
-    # R-SEM-MODALITY-APPROVAL
-    if bool(classification.get("requires_approval_gates")):
-        if not _pipeline_has_human_approval(descriptor):
-            errors.append(
-                ValidationError(
-                    path="/skill/classification/requires_approval_gates",
-                    rule=R_MODALITY_APPROVAL,
-                    message=(
-                        "requires_approval_gates is true but pipeline "
-                        "contains no human_approval operator"
-                    ),
-                )
-            )
+    # R-SEM-MODALITY-APPROVAL — RETIRED 2026-05-20.
+    #
+    # The rule existed to catch a contradiction between two faces of
+    # the same fact:
+    #   (claim) skill.classification.requires_approval_gates = true
+    #   (fact)  pipeline contains a `human_approval` operator
+    # Following the deep-research finding that "collapsing faces when
+    # you can" is the strongest design move, we deleted the claim
+    # field from the descriptor schema entirely (v0.3 schema edit
+    # 2026-05-20). The pipeline's structure IS now the source of
+    # truth — the rule had nothing to check anymore. See task #42 /
+    # the audit-registry `r-sem-modality-approval` entry's motivation
+    # field for the full incident-history trail that led to retirement.
+    #
+    # The rule-id constant `R_MODALITY_APPROVAL` is retained at the
+    # top of this file as a soft reservation so a future identically-
+    # named rule doesn't get registered without re-reading this
+    # commit's reasoning.
 
     return errors
 
@@ -1813,7 +1818,7 @@ def _check_field_type_known(*, descriptor: dict[str, Any]) -> list[ValidationErr
                         message=(
                             f"schema field {sname}.{fname}.type "
                             f"{ftype!r} is not in the known vocabulary "
-                            f"{{str, int, float, bool, model_ref, enum_ref, "
+                            f"{{str, int, float, bool, bytes, model_ref, enum_ref, "
                             f"list[T], dict[K,V], Optional[T], Literal[...], "
                             f"or a declared schema-name identifier}}"
                         ),

@@ -15,6 +15,8 @@ from typing import Any, Optional
 
 from packaging.version import Version
 
+from mellea_skills_compiler.exit_codes import ExitCode
+
 
 EXPORT_VERSION = "0.1.0"
 MIN_MANIFEST_VERSION = Version("1.0.0")
@@ -527,7 +529,7 @@ def stage5_lint(result: EmitResult, loaded: LoadedContext, plan: TranslationPlan
         print("Stage 5 lint FAILED:")
         for f in failures:
             print(f"  ✗ {f}")
-        sys.exit(4)
+        sys.exit(ExitCode.EXPORT_LINT_FAIL)
 
 
 # ---------------------------------------------------------------------------

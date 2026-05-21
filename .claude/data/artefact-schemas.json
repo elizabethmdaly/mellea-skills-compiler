@@ -1,0 +1,113 @@
+{
+  "format_version": "0.2",
+  "description": "Canonical mapping from intermediate JSON artefacts to their schemas. Covers BOTH directions: artefacts the LLM EMITS (must read schema before emitting) and artefacts the wrapper EMITS (LLM consumes during repair / inspection). Drift between this file and reality is what the audit registry's `schema-first-consumption` and the orchestrator's universal 'Schemas to read before emitting' section guard against.",
+  "directories": {
+    "llm_emission_schemas": ".claude/schemas/",
+    "wrapper_compile_schemas": "src/mellea_skills_compiler/compile/schemas/",
+    "wrapper_descriptor_schemas": "src/mellea_skills_compiler/descriptor/schemas/"
+  },
+  "artefacts": {
+    "intermediate/classification.json": {
+      "direction": "llm_emits",
+      "step": 0,
+      "produced_by": "LLM at Step 0 via /mellea-fy-classify",
+      "schema": ".claude/schemas/classification.schema.json"
+    },
+    "intermediate/inventory.json": {
+      "direction": "llm_emits",
+      "step": "1a/1b",
+      "produced_by": "LLM at Step 1 via /mellea-fy-inventory",
+      "schema": ".claude/schemas/inventory.schema.json"
+    },
+    "intermediate/element_mapping.json": {
+      "direction": "llm_emits",
+      "step": 2,
+      "produced_by": "LLM at Step 2 via /mellea-fy-map",
+      "schema": ".claude/schemas/element_mapping.schema.json"
+    },
+    "intermediate/expected_signature.json": {
+      "direction": "llm_emits",
+      "step": 2,
+      "produced_by": "LLM at Step 2 via /mellea-fy-map (P3.5.D locked signature)",
+      "schema": "src/mellea_skills_compiler/descriptor/schemas/expected_signature.schema.json"
+    },
+    "intermediate/dependency_plan.json": {
+      "direction": "llm_emits",
+      "step": "2.5",
+      "produced_by": "LLM at Step 2.5 via /mellea-fy-deps",
+      "schema": ".claude/schemas/dependency_plan.schema.json"
+    },
+    "intermediate/fixtures_emission.json": {
+      "direction": "llm_emits",
+      "step": 4,
+      "produced_by": "LLM at Step 4 via /mellea-fy-fixtures",
+      "schema": ".claude/schemas/fixtures_emission.schema.json",
+      "observed_failure_modes": "2026-05-19 / 2026-05-20: LLM emitted `fixture_id`, `name`, `category_tags`, `expected_output_hints`, `format_version` — none of which are in the schema's closed property set. Canonical fixture entry uses `id` and the closed shape declared in the schema."
+    },
+    "intermediate/descriptor_emission.json": {
+      "direction": "llm_emits",
+      "step": 5,
+      "produced_by": "LLM at Step 5 via /mellea-fy-generate (descriptor mode)",
+      "schema": "src/mellea_skills_compiler/descriptor/schemas/descriptor.schema.v0.3.json",
+      "observed_failure_modes": "2026-05-19 / 2026-05-20: LLM emitted invented arg-value shapes, `callee` instead of `symbol`, `returns` on CallNode, `notes: <string>` instead of array, `bound_to: <string>` instead of `{ref: ...}` Ref object, `/pipeline` as `{id, kind, steps:[...]}` object instead of flat array, `primary_axis: <modality-value>` instead of axis-enum-value."
+    },
+    "intermediate/config_emission.json": {
+      "direction": "llm_emits",
+      "step": 5,
+      "produced_by": "LLM at Step 5 via /mellea-fy-generate",
+      "schema": ".claude/schemas/config_emission.schema.json"
+    },
+    "<package>/melleafy.json": {
+      "direction": "llm_emits",
+      "step": 6,
+      "produced_by": "LLM at Step 6 via /mellea-fy-artifacts",
+      "schema": ".claude/schemas/melleafy.schema.json"
+    },
+    "intermediate/step_7_report.json": {
+      "direction": "wrapper_emits",
+      "produced_by": "src/mellea_skills_compiler/compile/lints.py::run_lints",
+      "schema": "src/mellea_skills_compiler/compile/schemas/step_7_report.schema.json"
+    },
+    "intermediate/step_5b_report.json": {
+      "direction": "wrapper_emits",
+      "produced_by": "src/mellea_skills_compiler/compile/descriptor_emission.py (descriptor-mode Step 5b)",
+      "schema": "src/mellea_skills_compiler/descriptor/schemas/step_5b_report.schema.json"
+    },
+    "intermediate/step_7b_report.json": {
+      "direction": "wrapper_emits",
+      "produced_by": "src/mellea_skills_compiler/compile/smoke_check.py",
+      "schema": null,
+      "format_documented_at": "src/mellea_skills_compiler/compile/smoke_check.py (SmokeRunResult dataclass + report payload construction)"
+    },
+    "intermediate/mellea_api_ref.json": {
+      "direction": "wrapper_emits",
+      "produced_by": "src/mellea_skills_compiler/compile/grounding.py::write_mellea_api_ref",
+      "schema": null,
+      "format_documented_at": "src/mellea_skills_compiler/compile/grounding.py (introspection dump; see `_introspect_mellea` and `_grounding_unavailable_payload`)"
+    },
+    "intermediate/mellea_doc_index.json": {
+      "direction": "wrapper_emits",
+      "produced_by": "src/mellea_skills_compiler/compile/grounding.py::write_mellea_doc_index",
+      "schema": null,
+      "format_documented_at": "src/mellea_skills_compiler/compile/grounding.py"
+    },
+    "intermediate/runtime_directive.json": {
+      "direction": "wrapper_emits",
+      "produced_by": "src/mellea_skills_compiler/compile/claude_directives.py",
+      "schema": null,
+      "format_documented_at": "src/mellea_skills_compiler/compile/claude_directives.py (related to but distinct from runtime_defaults.schema.json — the directive is a superset of the defaults input, including a `source` field)"
+    },
+    "intermediate/_compile_settings.json": {
+      "direction": "wrapper_emits",
+      "produced_by": "src/mellea_skills_compiler/compile/claude_directives.py",
+      "schema": null,
+      "format_documented_at": "src/mellea_skills_compiler/compile/claude_directives.py (Claude Code permission/deny rules; see `_build_compile_settings`)"
+    },
+    "intermediate/symbol_normalisations.jsonl": {
+      "direction": "wrapper_emits",
+      "produced_by": "src/mellea_skills_compiler/compile/descriptor_symbol_gate.py::run_symbol_gate (JSONL, one record per auto-normalisation)",
+      "schema": null,
+      "format_documented_at": "src/mellea_skills_compiler/compile/descriptor_symbol_gate.py (SymbolMatch dataclass)"
+    }
+  }
+}

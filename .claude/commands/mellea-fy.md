@@ -109,7 +109,9 @@ intermediate/
   element_mapping.json
   element_mapping_amendments.json   ← from Step 2.5d
   dependency_plan.json
-  mellea_api_ref.json               ← from Step 2.5e
+  mellea_api_ref.json               ← from Step 2.5e (~280 KB; verification surface only — do NOT read end-to-end)
+  mellea_api_ref.compatibility.json          ← sidecar (~1 KB; targeted-read: just the `compatibility` field)
+  mellea_api_ref.forbidden_param_names.json  ← sidecar (~1 KB; targeted-read: just the `forbidden_param_names` field)
   element_mapping_judgment_calls.json
   coverage_report.json
   step_1b_trace.json
@@ -126,6 +128,39 @@ intermediate/
 **Wrapper-side lint repair (Fix A — `--repair-on-lint-failure`, opt-in).** Separately from the in-session repair loop, the wrapper supports an opt-in flag (`--repair-on-lint-failure`, see `mellea_skills_compiler/cli.py::compile`) that addresses a different failure mode: Claude self-reports lints PASS in-session, the wrapper's post-session `run_lints` disagrees and detects ERROR-severity failures, but the session has already exited so the in-session repair loop cannot engage. When the flag is on, the wrapper spawns a SECOND Claude session with `./mellea-fy-repair`, pre-baking F1 fix prescriptions to `intermediate/repair_prescriptions.md` for that session to consume. Up to 2 repair rounds per compile. The two opt-in flags (`--resume-on-early-end` and `--repair-on-lint-failure`) address distinct failure modes — incomplete pipeline vs complete-but-broken — and compose naturally as independent retry layers: resume runs first if its flag is set (Layer 1: initial spawn, possibly re-invoked to fill in missing canonical step artefacts), then lint-repair runs after (Layer 2: independent flag check; post-session writer-renderer → lints → repair re-spawn if needed). Either can fire alone; both can fire in sequence on the same compile. Default is OFF for both; opt in per batch.
 
 **Deterministic workflow with scoped LLM invocations** — melleafy is not an LLM agent. LLM invocations occur at specific, scoped steps: Step 1b (element tagging), Step 2 (narrow judgement calls), Step 4 (fixture generation), Step 5 (body generation), Step 6 (narrative prose). Steps 0, 1a, 2.5, 3, and 7 are entirely deterministic.
+
+### Schemas to READ before emitting (universal)
+
+Every intermediate JSON artefact you (the LLM) emit during this 10-step compile MUST conform to a canonical JSON Schema. Before drafting ANY of these emissions, READ the named schema in full via the `Read` tool. The schema is the ground truth — field names, `required` lists, and `additionalProperties: false` closures are non-negotiable.
+
+Do NOT infer field names from training memory. Do NOT carry over field names from JSON-IR formats you've seen elsewhere (OpenAPI, GraphQL, Protobuf-as-JSON, etc.). The schema decides; your priors do not.
+
+| Step | Emit this artefact | READ this schema FIRST |
+|---|---|---|
+| 0   | `intermediate/classification.json`         | `.claude/schemas/classification.schema.json` |
+| 1   | `intermediate/inventory.json`              | `.claude/schemas/inventory.schema.json` |
+| 2   | `intermediate/element_mapping.json`        | `.claude/schemas/element_mapping.schema.json` |
+| 2   | `intermediate/expected_signature.json`     | `src/mellea_skills_compiler/descriptor/schemas/expected_signature.schema.json` |
+| 2.5 | `intermediate/dependency_plan.json`        | `.claude/schemas/dependency_plan.schema.json` |
+| 4   | `intermediate/fixtures_emission.json`      | `.claude/schemas/fixtures_emission.schema.json` |
+| 5   | `intermediate/descriptor_emission.json` (descriptor mode) | `src/mellea_skills_compiler/descriptor/schemas/descriptor.schema.v0.3.json` |
+| 5   | `intermediate/config_emission.json`        | `.claude/schemas/config_emission.schema.json` |
+| 6   | `<package>/melleafy.json`                  | `.claude/schemas/melleafy.schema.json` |
+
+The canonical mapping (including consumption-side artefacts the wrapper emits) is at `.claude/data/artefact-schemas.json` — a machine-readable single source of truth that this table reflects.
+
+**After drafting each emission, re-open the schema and self-check.** Walk every top-level field and every repeated sub-shape against the corresponding schema definition. Verify field names, presence of `required` siblings, absence of fields not in `properties`. The schema gate at the writer-renderer post-session catches violations with precise JSON-path errors; emissions that bypass this self-check at draft time consistently produce schema-gate failures that halt the compile.
+
+**Empirically observed failure modes** that this directive exists to prevent (2026-05-19 to 2026-05-20):
+
+- `fixtures_emission.json` emitted with `fixture_id`/`name`/`category_tags`/`expected_output_hints`/`format_version` — none of which are in the schema's closed property set. The canonical fixture entry uses `id` and the closed property set declared in the schema.
+- `descriptor_emission.json` `/pipeline` emitted as `{"id":..., "kind":"sequence", "steps":[...]}` object — the schema requires a flat array. The `{id, kind, steps}` shape is the inner-`sequence`-node shape, not the top-level pipeline.
+- `descriptor_emission.json` `bound_to` emitted as bare string — the schema requires `{ref: "<name>"}` (a Ref object).
+- `descriptor_emission.json` `notes` emitted as scalar string — the schema requires array of strings.
+- `descriptor_emission.json` `skill.classification.primary_axis` set to a modality value (`synchronous_oneshot`) — that value belongs in `output_modality`/`input_modality`; `primary_axis` accepts axis enum values (`DOM`/`AGENT`/`DSL`/etc.).
+- `descriptor_emission.json` `CallNode` emitted with invented field `callee` (schema uses `symbol`) or invented field `returns` (no such CallNode field — return values are named via the node's own `id`).
+
+If you find yourself emitting any of those shapes, you are emitting from training memory rather than from the schema. Stop and re-read the schema.
 
 **Source fidelity** — every significant line of the source spec becomes an inventory element (≥95% coverage). Nothing is silently skipped.
 

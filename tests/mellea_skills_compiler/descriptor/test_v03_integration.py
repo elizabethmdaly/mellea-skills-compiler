@@ -46,7 +46,6 @@ def _synthetic_v03_descriptor() -> dict[str, Any]:
                 "interaction_style": "tool_using_loop",
                 "input_modality": ["text", "images"],
                 "output_modality": "streaming_text",
-                "requires_approval_gates": True,
                 "state_persistence": "cross_session",
             },
         },
@@ -173,7 +172,7 @@ def test_synthetic_v03_descriptor_each_rule_can_break_it(surface, tmp_path):
         R_BUNDLED_PATH_EXISTS,
         R_DISPOSITION_CONSISTENT,
         R_FIELD_TYPE_KNOWN,
-        R_MODALITY_APPROVAL,
+        # R_MODALITY_APPROVAL retired 2026-05-20; see retirement guard.
         R_MODALITY_IMAGE_INPUT,
         R_MODALITY_STREAMING,
         R_MODALITY_TOOL_LOOP,
@@ -204,12 +203,13 @@ def test_synthetic_v03_descriptor_each_rule_can_break_it(surface, tmp_path):
                       skill_root=tmp_path)
     assert any(e.rule == R_MODALITY_IMAGE_INPUT for e in report.errors)
 
-    # R-SEM-MODALITY-APPROVAL: remove the human_approval operator.
-    desc = _synthetic_v03_descriptor()
-    desc["pipeline"] = []
-    report = validate(desc, schema_version="0.3", surface=surface,
-                      skill_root=tmp_path)
-    assert any(e.rule == R_MODALITY_APPROVAL for e in report.errors)
+    # R-SEM-MODALITY-APPROVAL retired 2026-05-20 — the rule and its
+    # field were removed because the descriptor schema's
+    # ``requires_approval_gates`` claim was a redundant duplicate of
+    # the structural fact (whether pipeline contains a `human_approval`
+    # operator). Retirement-guard coverage now lives in
+    # ``tests/.../rules/test_rule_coherence_r_sem_modality_approval.py``
+    # which asserts the field can't be re-added to the schema.
 
     # R-SEM-DISPOSITION-CONSISTENT: drop the search_fn signature.
     desc = _synthetic_v03_descriptor()

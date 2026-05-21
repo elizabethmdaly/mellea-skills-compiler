@@ -267,6 +267,29 @@ Exit code 10 is distinct from all generated package exit codes (0–4) and from 
 
 ---
 
+## Required descriptor fields per (kind, disposition)
+
+Each dependency's `(kind, disposition)` pair selects a set of supporting fields the descriptor MUST carry. The descriptor schema's `allOf` block (`src/mellea_skills_compiler/descriptor/schemas/descriptor.schema.v0.3.json` → `$defs.Dependency.allOf`) enforces this structurally; the `R-SEM-DISPOSITION-CONSISTENT` semantic rule (`src/mellea_skills_compiler/descriptor/semantic_rules.py::_check_dispositions`) backs it up and additionally enforces parseability + symbol resolution. Both faces must agree.
+
+| Condition | Required field | Where enforced |
+| --- | --- | --- |
+| `disposition in {bundle, load_from_disk}` | `path` (non-empty string pointing at the asset) | Schema `allOf` (structural) |
+| `kind == "tool"` AND `disposition in {delegate_to_runtime, real_impl, stub, mock, external_input}` | `signature` (parseable Python signature) | Schema `allOf` (structural) + semantic rule (parseability) |
+| `kind == "tool"` AND `disposition == "real_impl"` AND `symbol` is set | `symbol` resolves in the introspected Mellea surface | Semantic rule only |
+
+**LLM action — what to emit**:
+
+- For any tool-kind dependency with a non-bundling disposition (`delegate_to_runtime`, `real_impl`, `stub`, `mock`, `external_input`), include a `signature` field whose value is a parenthesised Python signature: `(arg: Type, ...)` or `(arg: Type, ...) -> Return`. **Do NOT include the function name** — the `id` field already carries it. Examples:
+  - `"signature": "(query: str) -> list[str]"`
+  - `"signature": "(skill_id: str, *, force: bool = False) -> dict[str, Any]"`
+  - `"signature": "()"` (no args, no return type — accepted)
+- For any `bundle` or `load_from_disk` dependency, include a `path` field pointing at the bundled-asset location (Rule OUT-6 alignment — see the path-resolution rule above).
+- For `kind == "tool"` + `disposition == "real_impl"` + `symbol` set: the symbol must already exist in `intermediate/mellea_api_ref.json:.modules.<...>`. Verify before emitting; the semantic rule rejects unresolvable symbols with `dependency '<id>' symbol '<symbol>' does not resolve in surface modules`.
+
+**Parseability**: the semantic rule additionally regex-checks the signature string against `_SIGNATURE_RE = ^\s*\(.*\)\s*(-> .+)?\s*$` (`semantic_rules.py:1527`). JSON Schema cannot express this check, so the structural gate alone won't catch a malformed signature string — the semantic rule fills the gap. A `signature: "not a real signature"` value will pass the schema but fail the rule with `dependency '<id>' signature '<value>' is not a parseable Python signature string`.
+
+---
+
 ## Cross-checks before Step 2.5 declares done
 
 - Every element from `inventory.json` with category ≠ `—` has a corresponding entry in `dependency_plan.json`

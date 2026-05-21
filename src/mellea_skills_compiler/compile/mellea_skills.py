@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -27,7 +28,9 @@ from mellea_skills_compiler.compile.grounding import (
     write_mellea_api_ref,
     write_mellea_doc_index,
 )
+from mellea_skills_compiler.compile.lints import LintFailureError
 from mellea_skills_compiler.compile.proxy import ContextMgmtStrippingProxy
+from mellea_skills_compiler.compile.smoke_check import SmokeCheckFailure
 from mellea_skills_compiler.enums import (
     ClaudeResponseMessageType,
     ClaudeResponseType,
@@ -162,7 +165,13 @@ def _build_claude_argv(
         "--append-system-prompt",
         system_prompt,
         "--allowed-tools",
-        "Read,Write,Edit",
+        # ``Glob`` added 2026-05-19. Without it the LLM cannot enumerate
+        # directories — observed problem: skills with a ``references/``
+        # subdirectory could not have its contents discovered, leading
+        # to incomplete ``pyproject.toml`` package-data globs and missed
+        # source-spec context. Glob is read-only; Claude Code's
+        # workspace policy still bounds the reachable filesystem.
+        "Read,Write,Edit,Glob",
         "--output-format",
         "stream-json",
         "--verbose",
@@ -581,6 +590,27 @@ def _build_lint_repair_system_prompt(
         "repair loop did NOT engage because the previous session "
         "self-reported success."
         f"{descriptor_block}\n\n"
+        "MULTI-ERROR-CLASS TRIAGE (REQUIRED). Enumerate every distinct "
+        "error class in the lint report below. Produce a fix for each "
+        "one in this session before exiting. Do not declare any error "
+        "class \"already correct\" or \"out of scope\" without showing "
+        "in your diagnosis why no edit is needed. If two error classes "
+        "touch different intermediate files (e.g. one in "
+        "`config_emission.json`, another in `descriptor_emission.json`), "
+        "fix both — do not return after fixing only the loudest. The "
+        "wrapper will compare the lint surface before and after this "
+        "session: if any failing lint id is unchanged after your edits, "
+        "the wrapper treats the session as a triage failure and stops "
+        "the repair loop. Each distinct lint id below is its own class; "
+        "treat them independently.\n\n"
+        "WRITER / RENDERER ACCEPT-SET VIOLATIONS. When the lint failure "
+        "below cites `config_emission.schema.json` validation or a "
+        "descriptor `RendererError`, the actionable rule is in "
+        "`mellea-fy-behaviours.md` § \"Writer & renderer accept-sets\" "
+        "(ACCEPT-SET-1 for the config writer, ACCEPT-SET-2 for the "
+        "descriptor renderer). Read that section before drafting the "
+        "fix — these failures cannot be auto-repaired by re-emitting "
+        "the same shape; you must change the emission target.\n\n"
         f"Failing lints (ERROR severity):\n{failing_block}\n\n"
         f"{prescription_hint}\n\n"
         f"The full lint report is at "
@@ -691,6 +721,84 @@ def _collect_error_failures(report: dict) -> list[tuple[str, list[str]]]:
     return out
 
 
+def _failures_signature(
+    failures: list[tuple[str, list[str]]],
+) -> dict[str, str]:
+    """Per-lint stable signature for stable-error / single-track-triage detection.
+
+    Returns a dict mapping ``lint_id`` → SHA-256 of the lint's sorted
+    failure locations. Two rounds with byte-identical failures for a given
+    lint produce identical hashes; any change (added/removed/moved
+    failure) produces a different hash. Used by
+    :func:`_classify_repair_progress` to detect whether a repair round
+    touched a given error class.
+    """
+    out: dict[str, str] = {}
+    for lid, locs in failures:
+        payload = json.dumps(sorted(locs), separators=(",", ":"))
+        out[lid] = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return out
+
+
+def _classify_repair_progress(
+    *,
+    previous_lint_sig: Optional[dict[str, str]],
+    current_lint_sig: dict[str, str],
+    previous_descriptor_reason: Optional[str],
+    current_descriptor_reason: Optional[str],
+) -> tuple[str, set[str]]:
+    """Classify how the latest repair round changed the failure surface.
+
+    Returns ``(classification, unchanged_classes)`` where:
+
+    - ``"first-round"`` — no previous signature to compare; nothing to do.
+    - ``"no-progress"`` — every previous error class is still present
+      with an identical signature. The repair was a complete no-op;
+      caller should bail with a stable-error classification.
+    - ``"single-track-triage"`` — some previous classes were touched
+      (signature changed or class disappeared) but at least one survives
+      unchanged. The repair agent likely fixed only the loudest class
+      and ignored others. Caller should bail with a triage-failure
+      classification.
+    - ``"progress"`` — every previous class either changed signature or
+      disappeared; the repair touched every error class. New classes
+      may have appeared (the model exposed a deeper bug); that's normal
+      exploration and the loop continues.
+
+    The descriptor render failure is treated as a synthetic class
+    ``"__descriptor_render__"`` so a stable descriptor-only failure is
+    caught the same way as a stable lint-only failure.
+    """
+    descriptor_class = "__descriptor_render__"
+
+    previous_classes: set[str] = (
+        set(previous_lint_sig.keys()) if previous_lint_sig is not None else set()
+    )
+    if previous_descriptor_reason:
+        previous_classes.add(descriptor_class)
+
+    if previous_lint_sig is None and previous_descriptor_reason is None:
+        return "first-round", set()
+
+    unchanged: set[str] = {
+        lid for lid, sig in (previous_lint_sig or {}).items()
+        if current_lint_sig.get(lid) == sig
+    }
+    if (
+        previous_descriptor_reason is not None
+        and previous_descriptor_reason == current_descriptor_reason
+    ):
+        unchanged.add(descriptor_class)
+
+    if not previous_classes:
+        return "first-round", set()
+    if unchanged == previous_classes:
+        return "no-progress", unchanged
+    if unchanged:
+        return "single-track-triage", unchanged
+    return "progress", set()
+
+
 def _lint_repair_retry_loop(
     *,
     spec_path: Path,
@@ -792,6 +900,12 @@ def _lint_repair_retry_loop(
 
     rounds_used = 0
     descriptor_render_failure_reason: Optional[str] = None
+    # Stable-error / single-track-triage detection state (B1 + B2 wrapper-side
+    # check). Populated at the end of each repair round; consulted at the
+    # top of the next round to decide whether the repair made progress on
+    # every named error class.
+    previous_lint_sig: Optional[dict[str, str]] = None
+    previous_descriptor_reason: Optional[str] = None
     while True:
         # 1. Run writer-renderer (config.py + fixtures/) so lint sees the
         #    authoritative wrapper-rendered files. Best-effort: a render
@@ -854,6 +968,51 @@ def _lint_repair_retry_loop(
         except (json.JSONDecodeError, OSError, FileNotFoundError):
             report = {}
         failing_lints = _collect_error_failures(report)
+        current_lint_sig = _failures_signature(failing_lints)
+
+        # 3a. Stable-error / single-track-triage detection (B1 + B2).
+        # Compare this round's failure surface against the previous
+        # round's. If the repair made zero progress, bail with a clear
+        # stable-error message rather than burning another Claude round.
+        # If it only fixed some classes (single-track triage), bail with
+        # a triage-failure classification — the repair agent left at
+        # least one error class untouched, and continuing won't help.
+        classification, unchanged_classes = _classify_repair_progress(
+            previous_lint_sig=previous_lint_sig,
+            current_lint_sig=current_lint_sig,
+            previous_descriptor_reason=previous_descriptor_reason,
+            current_descriptor_reason=descriptor_render_failure_reason,
+        )
+        if classification == "no-progress":
+            LOGGER.error(
+                "Lint-repair stable-error: round %d's failure surface is "
+                "byte-identical to round %d (unchanged classes: %s). The "
+                "repair flow cannot make progress on these errors — "
+                "either the repair agent isn't triaging them, or the "
+                "fix is outside the repair flow's reach. Returning to "
+                "caller for the final failure path; remaining budget "
+                "(%d round(s)) abandoned.",
+                rounds_used,
+                rounds_used - 1 if rounds_used >= 1 else 0,
+                sorted(unchanged_classes),
+                max(0, max_repair_rounds - rounds_used),
+            )
+            return
+        if classification == "single-track-triage":
+            LOGGER.error(
+                "Lint-repair triage failure: round %d touched some error "
+                "classes but left others unchanged (unchanged: %s). This "
+                "usually means the repair agent fixed only the loudest "
+                "error class and ignored the rest. Continuing would "
+                "burn budget on the same un-touched failures. Returning "
+                "to caller for the final failure path; remaining budget "
+                "(%d round(s)) abandoned.",
+                rounds_used,
+                sorted(unchanged_classes),
+                max(0, max_repair_rounds - rounds_used),
+            )
+            return
+
         rounds_used += 1
         LOGGER.warning(
             "Wrapper-side lint check found %d ERROR-severity failure(s) "
@@ -886,6 +1045,10 @@ def _lint_repair_retry_loop(
             timeout=timeout,
             processing=processing,
         )
+        # Snapshot the failure surface we just asked the repair agent to
+        # fix; the next iteration's classifier compares against it.
+        previous_lint_sig = current_lint_sig
+        previous_descriptor_reason = descriptor_render_failure_reason
         # Loop back: re-render, re-lint, decide.
 
 
@@ -1050,7 +1213,33 @@ def _spawn_claude(
 
         stream_dump_path = intermediate_dir / "claude_stream.jsonl"
         stream_dump_path.parent.mkdir(parents=True, exist_ok=True)
-        stream_dump = stream_dump_path.open("w")
+        # Append mode preserves traces across repair-loop rounds — each
+        # Claude subprocess invocation appends to the same file so the
+        # full thinking-trace history is available for post-mortem.
+        # A synthetic session-boundary event marks the start of each new
+        # invocation so readers can find round boundaries by searching
+        # for ``"_meta_event":"session_boundary"``.
+        had_prior_content = (
+            stream_dump_path.exists() and stream_dump_path.stat().st_size > 0
+        )
+        stream_dump = stream_dump_path.open("a")
+        if had_prior_content:
+            stream_dump.write(
+                json.dumps(
+                    {
+                        "_meta_event": "session_boundary",
+                        "timestamp": time.time(),
+                        "note": (
+                            "Events below are from a new Claude subprocess "
+                            "invocation (typically a repair-loop round). "
+                            "Events above are from prior invocations preserved "
+                            "for trace analysis."
+                        ),
+                    }
+                )
+                + "\n"
+            )
+            stream_dump.flush()
 
         start_time = time.time()
         processing.start()
@@ -1129,7 +1318,11 @@ def validate(
     if not package_dir.exists() or not package_dir.is_dir():
         raise Exception("Package directory does not exist: %s", package_dir)
 
-    from mellea_skills_compiler.compile.lints import LintSeverity, run_lints
+    from mellea_skills_compiler.compile.lints import (
+        LintFailureError,
+        LintSeverity,
+        run_lints,
+    )
 
     lint_result = run_lints(
         package_dir, strict=strict, smoke_check=smoke_check_mode
@@ -1152,9 +1345,10 @@ def validate(
                     if failure.line is not None:
                         location = f"{location}:{failure.line}"
                     LOGGER.error("  %s — %s", location, failure.message)
-        raise Exception(
-            "Step 7 lints failed. Report at %s/intermediate/step_7_report.json",
-            package_dir,
+        report_path = package_dir / "intermediate" / "step_7_report.json"
+        raise LintFailureError(
+            f"Step 7 lints failed. Report at {report_path}",
+            report_path=report_path,
         )
 
     # Surface non-blocking findings — these are now both legacy "warning"-
@@ -1403,8 +1597,9 @@ def compile(
         )
 
     # Pre-populate the deterministic grounding artifacts (Steps 2.5e and 2.5f
-    # of mellea-fy). The slash command runs with --allowed-tools Read,Write,Edit,
-    # so it cannot introspect the installed mellea package or fetch
+    # of mellea-fy). The slash command runs with --allowed-tools
+    # Read,Write,Edit,Glob, so it cannot introspect the installed mellea
+    # package via Python or fetch
     # docs.mellea.ai itself. We write `mellea_api_ref.json` and
     # `mellea_doc_index.json` here; the slash command's responsibility shrinks
     # to verifying the files exist and consuming them.
@@ -1623,7 +1818,13 @@ def compile(
             # triggers ONE smoke-aware repair re-spawn before failing — the
             # lint-repair loop covers Step 7, this covers Step 8. Anything
             # other than SmokeCheckFailure propagates unchanged.
-            from mellea_skills_compiler.compile.smoke_check import SmokeCheckFailure
+            # ``SmokeCheckFailure`` is imported at module scope (top of file)
+            # — do NOT re-import locally here; a local ``from ... import`` in
+            # this function shadows the module-level binding for ALL except
+            # clauses in ``compile()``, including the outer
+            # ``except (LintFailureError, SmokeCheckFailure):`` at the bottom.
+            # That shadowing caused UnboundLocalError on any failure path
+            # that did not reach this line (FU3-fix, 2026-05-19).
             try:
                 validate(
                     mellea_dirs[0],
@@ -1685,6 +1886,15 @@ def compile(
             )
 
     except (TimeoutError, subprocess.SubprocessError):
+        processing.stop()
+        raise
+    except (LintFailureError, SmokeCheckFailure):
+        # Preserve typed exceptions so the CLI can route them to the
+        # correct ExitCode (LINT_FAIL=11, SMOKE_CHECK_FAIL=12). Wrapping
+        # in a generic ``Exception`` collapses them all to
+        # GENERAL_ERROR=1, which is what the pre-2026-05-18 behaviour
+        # did and what the exit_codes.py module's migration note flags
+        # as the next cleanup.
         processing.stop()
         raise
     except Exception as e:

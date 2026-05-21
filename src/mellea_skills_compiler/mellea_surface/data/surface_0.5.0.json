@@ -34749,6 +34749,16 @@
           }
         }
       }
+    },
+    "weather_mellea.tools": {
+      "doc": "Weather skill HTTP tool implementations.",
+      "symbols": {
+        "fetch_weather": {
+          "kind": "function",
+          "signature": "(location: str, query_params: str) -> str",
+          "doc": "Fetch weather data from wttr.in for the given location and query params."
+        }
+      }
     }
   },
   "python_version": "3.12.7"

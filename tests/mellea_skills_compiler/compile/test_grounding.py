@@ -118,6 +118,94 @@ class TestWriteMelleaApiRef:
         assert isinstance(payload["forbidden_param_names"], list)
         assert len(payload["forbidden_param_names"]) > 0
 
+    def test_sidecars_match_monolithic_fields(
+        self, patched_cache, intermediate_dir, monkeypatch
+    ):
+        """**Coherence**: the sidecar files MUST carry the same values as
+        the monolithic file's corresponding top-level fields. Drift here
+        would silently let the LLM consume stale values for
+        `forbidden_param_names` or `compatibility`.
+        """
+
+        def _raise(_pkg):
+            raise importlib.metadata.PackageNotFoundError("mellea")
+
+        monkeypatch.setattr(
+            "mellea_skills_compiler.compile.grounding.importlib.metadata.version",
+            _raise,
+        )
+
+        write_mellea_api_ref(intermediate_dir)
+        monolithic = json.loads((intermediate_dir / "mellea_api_ref.json").read_text())
+        forbidden_sc = json.loads(
+            (intermediate_dir / "mellea_api_ref.forbidden_param_names.json").read_text()
+        )
+        compat_sc = json.loads(
+            (intermediate_dir / "mellea_api_ref.compatibility.json").read_text()
+        )
+
+        # Field values agree exactly.
+        assert (
+            forbidden_sc["forbidden_param_names"]
+            == monolithic["forbidden_param_names"]
+        )
+        assert compat_sc["compatibility"] == monolithic["compatibility"]
+
+        # Sidecars carry the same provenance shape.
+        for sc in (forbidden_sc, compat_sc):
+            assert sc["format_version"] == monolithic["format_version"]
+            assert sc["mellea_version"] == monolithic["mellea_version"]
+            assert sc["grounding_unavailable"] == monolithic["grounding_unavailable"]
+
+        # Sidecars are small (well under the 256 KB Read-tool limit) — the
+        # whole point of the split. Pin a generous upper bound so a
+        # regression that stuffs the modules dict into a sidecar fails
+        # loudly here.
+        assert (intermediate_dir / "mellea_api_ref.forbidden_param_names.json").stat().st_size < 8_192
+        assert (intermediate_dir / "mellea_api_ref.compatibility.json").stat().st_size < 8_192
+
+    def test_sidecars_written_on_cache_hit(
+        self, patched_cache, intermediate_dir, monkeypatch
+    ):
+        """**Coherence**: cache-hit path must also write sidecars. Without
+        this, the very-common second-compile-of-same-skill case would
+        produce a monolithic file but no sidecars.
+        """
+        monkeypatch.setattr(
+            "mellea_skills_compiler.compile.grounding.importlib.metadata.version",
+            lambda pkg: "0.4.2",
+        )
+        monkeypatch.setattr(
+            grounding, "_introspect_mellea", lambda referenced: {"fake.module": {}}
+        )
+        monkeypatch.setattr(
+            grounding, "_extract_forbidden_param_names", lambda: ["forbidden_x"]
+        )
+        monkeypatch.setattr(
+            grounding,
+            "_load_compatibility_entries",
+            lambda v: [{"note": "test_entry"}],
+        )
+
+        # First call populates the cache + sidecars.
+        write_mellea_api_ref(intermediate_dir)
+
+        # Delete the sidecars so we can verify the cache-hit path re-creates them.
+        (intermediate_dir / "mellea_api_ref.forbidden_param_names.json").unlink()
+        (intermediate_dir / "mellea_api_ref.compatibility.json").unlink()
+
+        # Second call (cache hit) MUST regenerate sidecars.
+        write_mellea_api_ref(intermediate_dir)
+        assert (
+            intermediate_dir / "mellea_api_ref.forbidden_param_names.json"
+        ).exists()
+        assert (intermediate_dir / "mellea_api_ref.compatibility.json").exists()
+
+        forbidden_sc = json.loads(
+            (intermediate_dir / "mellea_api_ref.forbidden_param_names.json").read_text()
+        )
+        assert forbidden_sc["forbidden_param_names"] == ["forbidden_x"]
+
     def test_uses_cache_on_second_call(
         self, patched_cache, intermediate_dir, monkeypatch
     ):

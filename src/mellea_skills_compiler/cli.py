@@ -5,7 +5,10 @@ from typing import Annotated, Literal, Optional
 
 import typer
 
+from mellea_skills_compiler.compile.lints import LintFailureError
+from mellea_skills_compiler.compile.smoke_check import SmokeCheckFailure
 from mellea_skills_compiler.enums import InferenceEngineType
+from mellea_skills_compiler.exit_codes import ExitCode
 from mellea_skills_compiler.toolkit.logging import configure_logger
 
 
@@ -154,18 +157,21 @@ def compile(
         ),
     ] = False,
     repair_on_lint_failure: Annotated[
-        bool,
+        Optional[bool],
         typer.Option(
-            "--repair-on-lint-failure",
+            "--repair-on-lint-failure/--no-repair-on-lint-failure",
             help=(
-                "When the wrapper detects error-severity Step 7 lint failures "
-                "after the Claude session ends, automatically spawn a second "
-                "Claude session in repair mode with structured F1 fix "
-                "prescriptions. Up to 2 repair rounds per compile. "
-                "Default: False (legacy behaviour — compile fails hard on lint)."
+                "When the wrapper detects error-severity Step 7 lint failures, "
+                "schema-gate failures, or smoke-check failures, automatically "
+                "spawn a second Claude session in repair mode with structured "
+                "fix prescriptions. Up to 2 repair rounds per compile. "
+                "Default: True when --use-descriptor is set (the descriptor "
+                "IR contracts make repair prompts precise), False otherwise "
+                "(legacy free-form emission). Pass --no-repair-on-lint-failure "
+                "to opt out under --use-descriptor."
             ),
         ),
-    ] = False,
+    ] = None,
 ):
     """
     Compile Mellea skill specification into a Mellea pipeline using mellea-fy Claude command.
@@ -180,7 +186,22 @@ def compile(
         LOGGER.error(
             "--smoke-check must be one of auto|always|never, got %r", smoke_check
         )
-        raise typer.Exit(code=2)
+        raise typer.Exit(code=ExitCode.INVALID_INVOCATION)
+    # D1 — mode-dependent default for repair-on-lint-failure. The repair
+    # loop's value depends on having precise contracts to feed back to
+    # the LLM; descriptor IR mode (--use-descriptor) gives us the
+    # schema-gate JSON paths + C1 symbol candidates + stdlib-arity
+    # failures + smoke-check tracebacks, all of which make repair
+    # prompts actionable. Free-form emission mode has weaker contracts,
+    # so repair is harder to make productive — keep its default off.
+    # User can always override with the explicit boolean flag.
+    if repair_on_lint_failure is None:
+        repair_on_lint_failure = use_descriptor
+        if use_descriptor:
+            LOGGER.info(
+                "[cli] --use-descriptor enables --repair-on-lint-failure by "
+                "default; pass --no-repair-on-lint-failure to opt out."
+            )
     try:
         if use_descriptor:
             _run_descriptor_compile(
@@ -215,9 +236,15 @@ def compile(
             resume_on_early_end=resume_on_early_end,
             repair_on_lint_failure=repair_on_lint_failure,
         )
+    except LintFailureError as e:
+        LOGGER.error(str(e))
+        raise typer.Exit(code=ExitCode.LINT_FAIL)
+    except SmokeCheckFailure as e:
+        LOGGER.error(str(e))
+        raise typer.Exit(code=ExitCode.SMOKE_CHECK_FAIL)
     except Exception as e:
         LOGGER.error(str(e))
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=ExitCode.GENERAL_ERROR)
 
 
 def _resolve_descriptor_spec_path(spec_path: Path) -> Path:
@@ -366,7 +393,7 @@ def validate(
         LOGGER.error(
             "--smoke-check must be one of auto|always|never, got %r", smoke_check
         )
-        raise typer.Exit(code=2)
+        raise typer.Exit(code=ExitCode.INVALID_INVOCATION)
     try:
         from mellea_skills_compiler.compile import mellea_skills
 
@@ -377,9 +404,15 @@ def validate(
             strict=strict,
             smoke_check_mode=smoke_check,
         )
+    except LintFailureError as e:
+        LOGGER.error(str(e))
+        raise typer.Exit(code=ExitCode.LINT_FAIL)
+    except SmokeCheckFailure as e:
+        LOGGER.error(str(e))
+        raise typer.Exit(code=ExitCode.SMOKE_CHECK_FAIL)
     except Exception as e:
         LOGGER.error(str(e))
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=ExitCode.GENERAL_ERROR)
 
 
 @app.command(help="Run Mellea Skill Pipeline")
@@ -426,9 +459,12 @@ def run(
         skill_pipeline(
             Path(pipeline_dir), fixture, enforce=enforce, no_guardian=no_guardian
         )
+    except SmokeCheckFailure as e:
+        LOGGER.error(str(e))
+        raise typer.Exit(code=ExitCode.SMOKE_CHECK_FAIL)
     except Exception as e:
         LOGGER.error(str(e))
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=ExitCode.GENERAL_ERROR)
 
 
 @app.command(help="Run Risk Analysis and Policy Generation Pipeline for Mellea skills")
@@ -482,7 +518,7 @@ def ingest(
         )
     except Exception as e:
         LOGGER.error(str(e))
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=ExitCode.GENERAL_ERROR)
 
 
 @app.command(help="Run Full Certification Pipeline for Mellea skill")
@@ -556,7 +592,7 @@ def certify(
         )
     except Exception as e:
         LOGGER.error(str(e))
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=ExitCode.GENERAL_ERROR)
 
 
 @app.command(
@@ -617,7 +653,7 @@ def export(
         raise
     except Exception as e:
         LOGGER.error(str(e))
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=ExitCode.GENERAL_ERROR)
 
 
 @contract_app.command("show")
@@ -694,7 +730,7 @@ def contract_verify() -> None:
             f"{'s' if len(result.warnings) != 1 else ''}"
         )
     if not result.ok:
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=ExitCode.GENERAL_ERROR)
 
 
 if __name__ == "__main__":

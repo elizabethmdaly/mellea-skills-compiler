@@ -1,0 +1,167 @@
+{
+  "format_version": "0.1",
+  "metadata": {
+    "classification": {
+      "archetype": "D1",
+      "shape": "One-shot",
+      "modality": "synchronous_oneshot",
+      "tool_involvement_variant": "P2",
+      "source_runtime": "hybrid"
+    },
+    "source": "weather",
+    "harvested_at": "2026-05-21",
+    "notes": "Smallest clean compile in the test set (112-line spec). One-shot reasoning with public HTTP tool (wttr.in). Demonstrates the minimal D1 / One-shot pattern: single input slot, single output, no nested compositions. Use as worked example for request-response skills where the pipeline is a straight call-and-return."
+  },
+  "descriptor": {
+    "descriptor_version": "0.3",
+    "mellea_version": "0.5.0",
+    "notes": [
+      "D1/P2 thin wrapper around wttr.in HTTP API.",
+      "call_wttr is emitted as a stub in pipeline.py (returns empty string).",
+      "main.py patches pipeline.call_wttr with tools.call_wttr before invoking run_pipeline.",
+      "This pattern allows fixtures to run without network access (stub returns '') while production uses the real HTTP implementation."
+    ],
+    "skill": {
+      "name": "weather",
+      "classification": {
+        "primary_axis": "DOM",
+        "interaction_style": "single_turn",
+        "input_modality": [
+          "text"
+        ],
+        "output_modality": "structured",
+        "state_persistence": "none"
+      }
+    },
+    "inputs": [
+      {
+        "name": "query",
+        "schema": {
+          "kind": "str"
+        },
+        "description": "Natural language weather query including a location (e.g. 'What is the weather in London?' or 'Will it rain in Tokyo tomorrow?')"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "result",
+        "schema": {
+          "kind": "model_ref",
+          "ref": "#/schemas/WeatherResponse"
+        },
+        "description": "Formatted weather response for the user"
+      }
+    ],
+    "schemas": {
+      "WeatherQuery": {
+        "kind": "model",
+        "fields": {
+          "intent": {
+            "type": "str",
+            "description": "Weather query intent: current_conditions, forecast_3day, forecast_week, forecast_day, precipitation, custom_format, or out_of_scope"
+          },
+          "location": {
+            "type": "str",
+            "description": "City, region, or airport code for the weather query. Empty string if intent is out_of_scope."
+          }
+        }
+      },
+      "WeatherResponse": {
+        "kind": "model",
+        "fields": {
+          "response": {
+            "type": "str",
+            "description": "Formatted weather response text for the user."
+          }
+        }
+      }
+    },
+    "state": [
+      {
+        "id": "backend",
+        "symbol": "mellea.backends.ollama.OllamaModelBackend",
+        "scope": "module",
+        "args": {
+          "model_id": {
+            "value": "granite4.1:8b"
+          }
+        }
+      },
+      {
+        "id": "session",
+        "symbol": "mellea.stdlib.session.MelleaSession",
+        "scope": "module",
+        "args": {
+          "backend": {
+            "ref": "backend"
+          }
+        }
+      }
+    ],
+    "dependencies": [
+      {
+        "id": "call_wttr",
+        "kind": "tool",
+        "disposition": "stub",
+        "signature": "(location: str, intent: str) -> str",
+        "rationale": "HTTP tool calling wttr.in. Stub returns empty string so fixtures run offline. main.py replaces with tools.call_wttr via module-level patching before calling run_pipeline."
+      }
+    ],
+    "pipeline": [
+      {
+        "id": "parsed_query",
+        "kind": "call",
+        "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+        "bound_to": {
+          "ref": "session"
+        },
+        "args": {
+          "description": {
+            "template": "Parse this weather query. Set 'intent' to one of: [current_conditions, forecast_3day, forecast_week, forecast_day, precipitation, custom_format, out_of_scope]. Set 'location' to the city, region, or airport code mentioned (empty string if intent is out_of_scope). Query: {query}"
+          },
+          "format": {
+            "schema_ref": "#/schemas/WeatherQuery"
+          }
+        },
+        "source_elements": [
+          "E6",
+          "E7",
+          "E8"
+        ],
+        "notes": [
+          "Extracts weather intent and location from natural language query"
+        ]
+      },
+      {
+        "id": "weather_result",
+        "kind": "call",
+        "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+        "bound_to": {
+          "ref": "session"
+        },
+        "args": {
+          "description": {
+            "template": "You are a weather assistant. Format the following weather information clearly and helpfully for the user.\n\nIf the intent is out_of_scope, politely explain that you only answer weather-related questions.\n\nOriginal query: {query}\nWeather intent: {parsed_query.intent}\nLocation: {parsed_query.location}\nRaw weather data from wttr.in:\n{call_wttr(parsed_query.location, parsed_query.intent)}\n\nProvide a clear, concise weather response."
+          },
+          "format": {
+            "schema_ref": "#/schemas/WeatherResponse"
+          }
+        },
+        "captures": {
+          "result": "#/outputs/result"
+        },
+        "source_elements": [
+          "E9",
+          "E10",
+          "E11",
+          "E13",
+          "E14",
+          "E15"
+        ],
+        "notes": [
+          "Fetches weather data via call_wttr and formats the response using LLM"
+        ]
+      }
+    ]
+  }
+}

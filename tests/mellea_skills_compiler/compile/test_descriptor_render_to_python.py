@@ -121,6 +121,108 @@ class TestRenderDescriptorToPython:
             schemas_text = (pkg / "schemas.py").read_text()
             assert "stale" not in schemas_text
 
+    def test_schema_gate_rejects_invented_arg_value_shape(self):
+        """gpai-code-of-practice failure pattern: the LLM emitted an
+        invented ``args`` value of shape ``{'<name>': '#/outputs/<name>'}``
+        (extrapolated from the legal ``captures`` shape into the illegal
+        ``args`` location). The descriptor IR schema's ``ArgValue`` is a
+        closed ``oneOf`` over six exact shapes; this is not one of them.
+
+        Before this gate existed, the renderer failed at AST-lowering
+        time with a generic ``RendererError: unknown argument value
+        shape: ...`` message. With the gate, the failure now happens
+        before the renderer is invoked, with a precise JSON path naming
+        the violation location.
+        """
+        descriptor = _load_bundled_descriptor()
+        # Inject the invented shape into a call node's args. The
+        # bundled descriptor uses v0.1; ArgValue's closed ``oneOf`` is
+        # consistent across v0.1/v0.2/v0.3, so this triggers the same
+        # schema rejection regardless of declared version.
+        target = None
+        for entry in descriptor.get("pipeline", []):
+            if entry.get("kind") == "call" and "args" in entry:
+                target = entry
+                break
+        assert target is not None, (
+            "bundled descriptor missing a call node with args; this "
+            "test depends on the fixture's shape"
+        )
+        target["args"]["__invented__"] = {
+            "privacy_notice_delivery": "#/outputs/privacy_notice_delivery"
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_pkg_with_descriptor(Path(tmp), descriptor)
+            result = render_descriptor_to_python(pkg)
+
+            assert result is not None
+            assert result["verdict"] == "failed", (
+                "Schema-invalid descriptor must fail at the gate, not reach "
+                "the renderer. Got: " + repr(result)
+            )
+            assert "schema_errors" in result, (
+                "Schema-gate failures must carry structured errors so D1 "
+                "auto-repair can feed them back to the LLM"
+            )
+            assert result["schema_errors"], (
+                "schema_errors should be non-empty when verdict=failed via "
+                "the schema gate"
+            )
+            # Reason string names the schema file.
+            assert "descriptor.schema" in result["reason"]
+            # The violating pipeline node should be referenced in at
+            # least one error path. jsonschema reports oneOf failures at
+            # the top of the failing union, so we check for the node
+            # path itself (e.g. ``/pipeline/0``) rather than the leaf
+            # location of the invented key.
+            assert any(
+                "/pipeline/" in e["path"] for e in result["schema_errors"]
+            ), (
+                "Expected at least one schema error pointing into the "
+                "pipeline subtree; got paths: "
+                + repr([e["path"] for e in result["schema_errors"]])
+            )
+            # Files NOT written — renderer must not have been invoked.
+            assert not (pkg / "pipeline.py").exists()
+            assert not (pkg / "schemas.py").exists()
+
+    def test_schema_gate_rejects_missing_required_field(self):
+        """A descriptor missing a top-level required field (e.g.
+        ``pipeline``) is rejected by the gate. Catches a different class
+        of structural mistake than the gpai case — exercising the same
+        gate for breadth coverage.
+        """
+        descriptor = _load_bundled_descriptor()
+        # Strip a required field. The schema declares pipeline as required.
+        descriptor.pop("pipeline", None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_pkg_with_descriptor(Path(tmp), descriptor)
+            result = render_descriptor_to_python(pkg)
+
+            assert result["verdict"] == "failed"
+            assert result["schema_errors"], (
+                "missing-required-field violation must surface as "
+                "structured schema errors"
+            )
+
+    def test_schema_gate_passes_valid_descriptor_through(self):
+        """A schema-valid descriptor must still render normally — the
+        gate is transparent in the happy path.
+        """
+        descriptor = _load_bundled_descriptor()
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = _make_pkg_with_descriptor(Path(tmp), descriptor)
+            result = render_descriptor_to_python(pkg)
+
+            assert result["verdict"] == "rendered", (
+                "The schema gate must not interfere with valid descriptors. "
+                f"Got: {result}"
+            )
+            assert "schema_errors" not in result
+            assert (pkg / "pipeline.py").exists()
+
     def test_idempotent(self):
         """Running render twice produces byte-identical output."""
         descriptor = _load_bundled_descriptor()

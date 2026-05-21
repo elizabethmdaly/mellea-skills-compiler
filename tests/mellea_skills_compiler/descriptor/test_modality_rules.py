@@ -5,7 +5,7 @@ from typing import Any
 
 from mellea_skills_compiler.descriptor import validate
 from mellea_skills_compiler.descriptor.semantic_rules import (
-    R_MODALITY_APPROVAL,
+    R_MODALITY_APPROVAL,  # retained as soft reservation; rule itself retired 2026-05-20
     R_MODALITY_IMAGE_INPUT,
     R_MODALITY_STREAMING,
     R_MODALITY_TOOL_LOOP,
@@ -321,78 +321,45 @@ class TestModalityImageInput:
 # ---------------------------------------------------------------------------
 
 
-class TestModalityApproval:
-    def _desc(self, *, pipeline, requires_approval_gates=None):
+class TestModalityApprovalRetirement:
+    """R-SEM-MODALITY-APPROVAL was retired 2026-05-20. The rule existed
+    to enforce that ``skill.classification.requires_approval_gates: true``
+    was matched by a ``human_approval`` operator in the pipeline. The
+    field was a *claim* duplicating a *structural fact* (the pipeline's
+    own shape), which invited LLM hallucination with no upstream artefact
+    to consult. We removed the schema field and retired the rule. See
+    the audit-registry entry ``r-sem-modality-approval``'s motivation
+    for the full incident-history trail.
+
+    These tests verify the retirement is complete: the rule no longer
+    fires under any input, and the schema rejects the retired field.
+    """
+
+    def test_rule_does_not_fire_when_field_absent(self):
+        """The legitimate post-retirement world: descriptors omit the
+        field entirely. R-SEM-MODALITY-APPROVAL must not fire."""
         d = _v03()
-        d["pipeline"] = pipeline
-        if requires_approval_gates is not None:
-            d["skill"]["classification"]["requires_approval_gates"] = requires_approval_gates
-        return d
-
-    def test_pre_not_met_does_not_fire(self):
-        d = self._desc(pipeline=[])
         report = validate(d, schema_version="0.3")
-        assert not _rule_fired(report, R_MODALITY_APPROVAL)
-
-    def test_approval_required_with_operator_passes(self):
-        d = self._desc(
-            requires_approval_gates=True,
-            pipeline=[
-                {
-                    "id": "gate",
-                    "kind": "composition",
-                    "operator": "human_approval",
-                    "prompt": {"value": "?"},
-                    "branches": {"approved": [], "rejected": []},
-                }
-            ],
+        assert not _rule_fired(report, R_MODALITY_APPROVAL), (
+            "R-SEM-MODALITY-APPROVAL is retired and should never fire."
         )
-        report = validate(d, schema_version="0.3")
-        assert not _rule_fired(report, R_MODALITY_APPROVAL)
 
-    def test_approval_required_without_operator_fires(self):
-        d = self._desc(
-            requires_approval_gates=True,
-            pipeline=[
-                {
-                    "id": "c",
-                    "kind": "call",
-                    "symbol": "mellea.stdlib.session.MelleaSession.instruct",
-                    "args": {},
-                }
-            ],
+    def test_schema_rejects_retired_field(self):
+        """A descriptor that includes the retired field MUST be rejected
+        at the schema level (additionalProperties: false on the
+        classification object). Belt-and-braces: the rule won't fire,
+        but the schema gate stops the emission much earlier."""
+        d = _v03()
+        d["skill"]["classification"]["requires_approval_gates"] = True
+        report = validate(d, schema_version="0.3")
+        # The schema gate should reject the unexpected property.
+        schema_errors = [
+            e for e in report.errors
+            if e.rule.startswith("jsonschema:")
+        ]
+        assert schema_errors, (
+            "Schema gate did not reject the retired "
+            "`requires_approval_gates` field. The field was removed "
+            "2026-05-20 from descriptor.schema.v0.3.json; if it has been "
+            "re-added, see C-FIELD-STAYS-RETIRED in the audit registry."
         )
-        report = validate(d, schema_version="0.3")
-        assert _rule_fired(report, R_MODALITY_APPROVAL)
-
-    def test_default_false_no_operator_passes(self):
-        d = self._desc(pipeline=[])
-        report = validate(d, schema_version="0.3")
-        assert not _rule_fired(report, R_MODALITY_APPROVAL)
-
-    def test_approval_inside_branch_case_passes(self):
-        d = self._desc(
-            requires_approval_gates=True,
-            pipeline=[
-                {
-                    "id": "br",
-                    "kind": "composition",
-                    "operator": "branch",
-                    "on": {"ref": "doc"},
-                    "cases": {
-                        "yes": [
-                            {
-                                "id": "gate",
-                                "kind": "composition",
-                                "operator": "human_approval",
-                                "prompt": {"value": "?"},
-                                "branches": {"approved": [], "rejected": []},
-                            }
-                        ],
-                        "no": [],
-                    },
-                }
-            ],
-        )
-        report = validate(d, schema_version="0.3")
-        assert not _rule_fired(report, R_MODALITY_APPROVAL)

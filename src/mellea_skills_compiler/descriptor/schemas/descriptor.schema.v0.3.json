@@ -120,10 +120,6 @@
           "enum": ["structured", "freeform_text", "streaming_text", "sequence"],
           "default": "structured"
         },
-        "requires_approval_gates": {
-          "type": "boolean",
-          "default": false
-        },
         "state_persistence": {
           "type": "string",
           "enum": ["none", "session_scoped", "cross_session"],
@@ -177,6 +173,26 @@
           },
           "then": {
             "required": ["path"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "tool" },
+              "disposition": {
+                "enum": [
+                  "delegate_to_runtime",
+                  "real_impl",
+                  "stub",
+                  "mock",
+                  "external_input"
+                ]
+              }
+            },
+            "required": ["kind", "disposition"]
+          },
+          "then": {
+            "required": ["signature"]
           }
         }
       ]
@@ -370,7 +386,11 @@
       "required": ["ref"],
       "additionalProperties": false,
       "properties": {
-        "ref": { "type": "string", "minLength": 1 },
+        "ref": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_]*$",
+          "description": "Plain identifier targeting a state[].id, input.name, or prior pipeline-node id. JSON Pointer syntax (#/state/...) belongs in the distinct SchemaRef shape; this Ref form is for value-binding refs only."
+        },
         "select": {
           "type": "string",
           "description": "Dotted path applied to the resolved value."

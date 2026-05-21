@@ -227,6 +227,119 @@ class TestRepairModeRouting:
         assert compile_mock.call_args.kwargs.get("repair_mode") is True
 
 
+# ---- D1: repair-on-lint-failure default resolution ------------------------
+
+
+class TestRepairOnLintFailureDefault:
+    """D1 — when ``--use-descriptor`` is set, the wrapper defaults
+    ``--repair-on-lint-failure`` to True (the descriptor IR contracts
+    make repair prompts precise enough that the loop is productive).
+    When ``--use-descriptor`` is NOT set, the flag retains its legacy
+    False default. The user can override either default with the
+    explicit ``--repair-on-lint-failure`` / ``--no-repair-on-lint-failure``
+    toggle.
+    """
+
+    def test_use_descriptor_enables_repair_by_default(
+        self, skill_with_spec, compile_mock
+    ):
+        """``--use-descriptor`` (no explicit flag) → repair_on_lint_failure=True."""
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            ["compile", str(skill_with_spec), "--use-descriptor", "--no-run"],
+        )
+        assert result.exit_code == 0, result.stdout
+        assert (
+            compile_mock.call_args.kwargs.get("repair_on_lint_failure") is True
+        )
+
+    def test_use_descriptor_with_explicit_no_repair_opts_out(
+        self, skill_with_spec, compile_mock
+    ):
+        """``--use-descriptor --no-repair-on-lint-failure`` → False (user opt-out).
+
+        The default kicks in only when the flag is omitted; an explicit
+        ``--no-repair-on-lint-failure`` must override the descriptor-mode
+        default so users can restore legacy halting behaviour.
+        """
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "compile",
+                str(skill_with_spec),
+                "--use-descriptor",
+                "--no-repair-on-lint-failure",
+                "--no-run",
+            ],
+        )
+        assert result.exit_code == 0, result.stdout
+        assert (
+            compile_mock.call_args.kwargs.get("repair_on_lint_failure") is False
+        )
+
+    def test_use_descriptor_with_explicit_repair_stays_true(
+        self, skill_with_spec, compile_mock
+    ):
+        """``--use-descriptor --repair-on-lint-failure`` → True (user-explicit)."""
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "compile",
+                str(skill_with_spec),
+                "--use-descriptor",
+                "--repair-on-lint-failure",
+                "--no-run",
+            ],
+        )
+        assert result.exit_code == 0, result.stdout
+        assert (
+            compile_mock.call_args.kwargs.get("repair_on_lint_failure") is True
+        )
+
+    def test_legacy_mode_keeps_repair_off_by_default(
+        self, skill_with_spec, compile_mock
+    ):
+        """Without ``--use-descriptor`` and no explicit flag, repair stays
+        off — the legacy free-form emission flow doesn't benefit from
+        auto-repair the way the descriptor IR does (weaker contracts =
+        less precise repair prompts).
+        """
+        runner = CliRunner()
+        result = runner.invoke(
+            app, ["compile", str(skill_with_spec), "--no-run"]
+        )
+        assert result.exit_code == 0, result.stdout
+        assert (
+            compile_mock.call_args.kwargs.get("repair_on_lint_failure")
+            is False
+        )
+
+    def test_legacy_mode_with_explicit_repair_still_works(
+        self, skill_with_spec, compile_mock
+    ):
+        """Without ``--use-descriptor`` but with explicit
+        ``--repair-on-lint-failure``, the user opt-in is preserved (the
+        D1 default change must not eat the explicit-True case).
+        """
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "compile",
+                str(skill_with_spec),
+                "--repair-on-lint-failure",
+                "--no-run",
+            ],
+        )
+        assert result.exit_code == 0, result.stdout
+        assert (
+            compile_mock.call_args.kwargs.get("repair_on_lint_failure") is True
+        )
+
+
 # ---- Exit codes -----------------------------------------------------------
 
 

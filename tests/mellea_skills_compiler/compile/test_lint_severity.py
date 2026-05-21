@@ -33,7 +33,9 @@ from mellea_skills_compiler.compile.lints import (
     ALL_LINTS,
     LintResult,
     LintSeverity,
+    _LINT_HALTS_IMMEDIATELY,
     _LINT_SEVERITY,
+    _LINT_TIER,
     _apply_severity,
     run_lints,
 )
@@ -114,30 +116,36 @@ def test_severity_classification_matches_user_decision(
     """The 14+3 ERROR / 5 WARNING / 1 INFO split is a product decision.
 
     If this test fails, do NOT just flip the expected value — re-read
-    the original classification rationale in
-    ``.claude/commands/mellea-fy-validate.md`` and confirm with the
-    compiler owner before changing.
+    the rationale comments next to each entry in
+    ``src/mellea_skills_compiler/compile/lints.py:_LINT_SEVERITY`` and
+    confirm with the compiler owner before changing.
     """
     actual = _LINT_SEVERITY.get(lint_id)
     assert actual == expected_severity, (
         f"Severity mismatch for {lint_id!r}: expected {expected_severity}, "
-        f"got {actual}. See .claude/commands/mellea-fy-validate.md for the "
-        f"authoritative classification."
+        f"got {actual}. See the comment block above ``_LINT_SEVERITY`` in "
+        f"compile/lints.py for the authoritative classification."
     )
 
 
 def test_severity_counts_match_documented_classification():
-    """The documented 14+4 / 5 / 1 split should be the actual content of
+    """The documented 15+4 / 5 / 1 split should be the actual content of
     ``_LINT_SEVERITY``. This catches drift between the docs and the table.
+
+    Count history:
+      * 19 ERROR / 5 WARNING / 1 INFO  — pre-2026-05-20 baseline.
+      * 20 ERROR / 5 WARNING / 1 INFO  — added ``stdlib-arg-types`` (#36)
+        which catches the runtime-AttributeError class observed in real
+        compiles (tech-contract, gpai-code-of-practice).
     """
     errors = [k for k, v in _LINT_SEVERITY.items() if v == LintSeverity.ERROR]
     warnings = [k for k, v in _LINT_SEVERITY.items() if v == LintSeverity.WARNING]
     infos = [k for k, v in _LINT_SEVERITY.items() if v == LintSeverity.INFO]
 
-    # 14 always-breaks-runtime + 4 deployment-context-sensitive + 1
-    # fixtures-loader-contract = 19 ERROR.
-    assert len(errors) == 19, (
-        f"Expected 19 ERROR lints (14 always-breaks + 4 deployment-context "
+    # 15 always-breaks-runtime + 4 deployment-context-sensitive + 1
+    # fixtures-loader-contract = 20 ERROR.
+    assert len(errors) == 20, (
+        f"Expected 20 ERROR lints (15 always-breaks + 4 deployment-context "
         f"+ fixtures-loader-contract); got {len(errors)}: {sorted(errors)}"
     )
     assert len(warnings) == 5, (
@@ -145,6 +153,99 @@ def test_severity_counts_match_documented_classification():
     )
     assert len(infos) == 1, (
         f"Expected 1 INFO lint; got {len(infos)}: {sorted(infos)}"
+    )
+
+
+# ─── Tier classification ───
+
+
+def test_each_lint_has_declared_tier():
+    """Every lint id in ``_LINT_SEVERITY`` must have a matching entry in
+    ``_LINT_TIER``.
+
+    Catches the "added a new lint, classified its severity, forgot to set
+    its tier" regression. Tier is data — it controls the run order in
+    ``run_lints`` and which lints participate in the repair loop. A
+    missing entry would default to nothing meaningful, so we want every
+    lint's tier to be an explicit decision recorded in source.
+    """
+    missing_tier = set(_LINT_SEVERITY) - set(_LINT_TIER)
+    extra_tier = set(_LINT_TIER) - set(_LINT_SEVERITY)
+    assert not missing_tier, (
+        f"Lints in _LINT_SEVERITY missing tier classification: "
+        f"{sorted(missing_tier)}. Add an entry to ``_LINT_TIER`` in "
+        f"compile/lints.py."
+    )
+    assert not extra_tier, (
+        f"_LINT_TIER references lints not in _LINT_SEVERITY: "
+        f"{sorted(extra_tier)}. Add severity entries or drop the tier "
+        f"entries in compile/lints.py."
+    )
+
+
+def test_tier_values_are_valid():
+    """Every ``_LINT_TIER`` value must be 1, 2, or 3. No other tiers exist.
+
+    The runtime gate (``run_lints``) is structured around exactly three
+    tiers; an out-of-range value would have no defined behaviour.
+    """
+    invalid = {lid: t for lid, t in _LINT_TIER.items() if t not in (1, 2, 3)}
+    assert not invalid, (
+        f"Invalid tier values (must be 1, 2, or 3): {invalid}"
+    )
+
+
+def test_tier_counts_match_documented_classification():
+    """1 Tier-1 (parseability gate) + 24 Tier-2 (structural/behavioural)
+    + 1 Tier-3 (cross-artifact) = 26 lints total (post ``stdlib-arg-types``).
+    """
+    by_tier = {1: [], 2: [], 3: []}
+    for lid, t in _LINT_TIER.items():
+        by_tier[t].append(lid)
+    assert len(by_tier[1]) == 1, (
+        f"Expected exactly 1 Tier-1 lint (parseability gate); got "
+        f"{len(by_tier[1])}: {sorted(by_tier[1])}"
+    )
+    assert by_tier[1] == ["parseable"], (
+        f"Tier-1 should be exactly ['parseable']; got {sorted(by_tier[1])}"
+    )
+    assert len(by_tier[2]) == 24, (
+        f"Expected 24 Tier-2 lints; got {len(by_tier[2])}: "
+        f"{sorted(by_tier[2])}"
+    )
+    assert len(by_tier[3]) == 1, (
+        f"Expected exactly 1 Tier-3 lint (cross-artifact consistency); "
+        f"got {len(by_tier[3])}: {sorted(by_tier[3])}"
+    )
+    assert by_tier[3] == ["melleafy-json-consistency"], (
+        f"Tier-3 should be exactly ['melleafy-json-consistency']; got "
+        f"{sorted(by_tier[3])}"
+    )
+
+
+def test_halts_immediately_references_known_lints():
+    """``_LINT_HALTS_IMMEDIATELY`` must only reference lint ids that exist
+    in ``_LINT_SEVERITY`` and are Tier 2 (the only tier where the repair
+    loop runs in the first place).
+
+    A halt-immediately entry for a Tier-1 lint is meaningless (Tier 1
+    halts the gate anyway) and for Tier 3 is unreachable (Tier 3 doesn't
+    go through repair).
+    """
+    unknown = _LINT_HALTS_IMMEDIATELY - set(_LINT_SEVERITY)
+    assert not unknown, (
+        f"_LINT_HALTS_IMMEDIATELY references unknown lints: "
+        f"{sorted(unknown)}. Either add them to _LINT_SEVERITY/_LINT_TIER "
+        f"or remove from the halt-immediately set."
+    )
+    wrong_tier = {
+        lid for lid in _LINT_HALTS_IMMEDIATELY
+        if _LINT_TIER.get(lid) != 2
+    }
+    assert not wrong_tier, (
+        f"_LINT_HALTS_IMMEDIATELY entries must all be Tier 2 (the only "
+        f"tier where the repair loop runs). Wrong-tier entries: "
+        f"{sorted(wrong_tier)}"
     )
 
 

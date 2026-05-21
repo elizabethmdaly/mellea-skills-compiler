@@ -90,8 +90,11 @@ def test_smoke_check_passes_with_working_pipeline(monkeypatch):
 
     # Substitute the inline runner so we never touch real smoke_check.py.
     def _fake_smoke(_: Path, **_kwargs) -> SmokeCheckOutcome:
+        # Schema for step_7_report.smoke_check.verdict requires past-
+        # tense values: passed/failed/skipped. Test fixtures must use
+        # the same vocabulary so the writer's emission validates.
         return SmokeCheckOutcome(
-            verdict="pass",
+            verdict="passed",
             fixture_used="fx-001",
             duration_seconds=1.2,
             backend_available=True,
@@ -103,7 +106,7 @@ def test_smoke_check_passes_with_working_pipeline(monkeypatch):
         pkg = Path(tmp)
         result = run_lints(pkg, smoke_check="auto")
 
-    assert result.smoke_check.verdict == "pass"
+    assert result.smoke_check.verdict == "passed"
     assert result.smoke_check.fixture_used == "fx-001"
     # WARNING failure + smoke confirmed working → overall stays pass
     assert result.overall_verdict == "pass"
@@ -118,7 +121,7 @@ def test_smoke_check_escalates_warnings_on_failure(monkeypatch):
 
     def _fake_smoke_fail(_: Path, **_kwargs) -> SmokeCheckOutcome:
         return SmokeCheckOutcome(
-            verdict="fail",
+            verdict="failed",  # schema-conformant past-tense
             fixture_used="fx-001",
             duration_seconds=0.7,
             backend_available=True,
@@ -140,7 +143,10 @@ def test_smoke_check_escalates_warnings_on_failure(monkeypatch):
     by_id = {entry["lint_id"]: entry for entry in report["lints"]}
     assert by_id["no-watsonx"]["severity"] == "warning"
     assert by_id["no-watsonx"]["effective_severity"] == "error"
-    assert report["warnings_escalated_by_smoke"] is True
+    # Per the step_7_report schema, this field is the LIST of escalated
+    # lint ids (not a flat bool). The single escalated warning should
+    # appear by id.
+    assert report["warnings_escalated_by_smoke"] == ["no-watsonx"]
 
 
 def test_smoke_check_confirms_advisory_on_pass(monkeypatch):
@@ -150,7 +156,7 @@ def test_smoke_check_confirms_advisory_on_pass(monkeypatch):
 
     def _fake_smoke_pass(_: Path, **_kwargs) -> SmokeCheckOutcome:
         return SmokeCheckOutcome(
-            verdict="pass",
+            verdict="passed",  # schema-conformant past-tense
             fixture_used="fx-001",
             duration_seconds=1.0,
             backend_available=True,
@@ -166,7 +172,8 @@ def test_smoke_check_confirms_advisory_on_pass(monkeypatch):
     assert result.overall_verdict == "pass"
     by_id = {entry["lint_id"]: entry for entry in report["lints"]}
     assert by_id["no-watsonx"]["effective_severity"] == "warning"
-    assert report["warnings_escalated_by_smoke"] is False
+    # No warnings escalated → empty list (schema-typed as array).
+    assert report["warnings_escalated_by_smoke"] == []
 
 
 def test_smoke_never_mode(monkeypatch):
@@ -198,7 +205,7 @@ def test_smoke_does_not_run_when_errors_already_block(monkeypatch):
 
     def _fake_smoke(_: Path, **_kwargs) -> SmokeCheckOutcome:
         inline_calls["count"] += 1
-        return SmokeCheckOutcome(verdict="pass", backend_available=True)
+        return SmokeCheckOutcome(verdict="passed", backend_available=True)
 
     monkeypatch.setattr(lints_mod, "_run_smoke_check_inline", _fake_smoke)
 
@@ -226,7 +233,7 @@ def test_smoke_outcome_serialised_in_report(monkeypatch):
 
     def _fake_smoke(_: Path, **_kwargs) -> SmokeCheckOutcome:
         return SmokeCheckOutcome(
-            verdict="pass",
+            verdict="passed",  # schema-conformant past-tense
             fixture_used="hello-world",
             duration_seconds=0.42,
             backend_available=True,
@@ -240,7 +247,7 @@ def test_smoke_outcome_serialised_in_report(monkeypatch):
         report = json.loads((pkg / "intermediate" / "step_7_report.json").read_text())
 
     smoke = report["smoke_check"]
-    assert smoke["verdict"] == "pass"
+    assert smoke["verdict"] == "passed"
     assert smoke["fixture_used"] == "hello-world"
     assert smoke["duration_seconds"] == pytest.approx(0.42)
     assert smoke["backend_available"] is True

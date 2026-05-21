@@ -1,0 +1,193 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "audit-coherence-registry.schema.v0.3",
+  "title": "Audit Coherence Registry",
+  "description": "Single source of truth mapping each auditable artifact in the compiler to its faces — directive (what the LLM is told), implementation (what runtime actually requires), validation (what enforces / tests for correctness), plus motivation (why the rule exists; non-enforced but mandatory). Drift between any two enforced faces is the root failure class this registry exists to catch. The directive ↔ validation drift class specifically is what Shankar et al. 2024 (EvalGen) name *criteria drift*: 'users need criteria to grade outputs, but grading outputs helps users define criteria.' For our setting: the LLM (the 'user' being graded) is given directives that may not match the validation criteria the runtime ultimately enforces.\n\nVersion history:\n  v0.3 — added `motivation` (required, non-coherence-checked) field per DO-178C ADR-style discipline: every entry must record WHY the rule exists so future maintainers know whether to weaken or strengthen it. Added optional `xfail_until` field to coherence checks so pending-implementation checks have a deadline rather than normalising to permanently-xfail. Aligned vocabulary with Shankar et al.'s 'criteria drift' for the directive ↔ validation class.\n  v0.2 — broadened scope from 'rules' (validation-gated contracts) to 'audit entries' (any artifact with the three-face drift risk). Added `repair-enrichment` category for mechanisms like D2 (closest-match suggestions in repair prompts). Made `validation.location` optional since repair-enrichments may not have a single canonical callable. Renamed `Rule` definition → `AuditEntry`.\n  v0.1 — initial scope: rules with static-lint / semantic-rule / schema-validation / smoke-check validation faces.\n\nClosest mainstream label: 'prompt-contract coherence registry' — the structural pattern is a fusion of a Requirements Traceability Matrix (safety-critical engineering) with translation validation (compiler verification), applied to an LLM-as-translator.",
+  "type": "object",
+  "required": ["format_version", "rules"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Self-referencing pointer to this schema file. Allowed for tooling that auto-resolves JSON Schema (VSCode, etc.)."
+    },
+    "format_version": {
+      "type": "string",
+      "description": "Registry schema version. Bump when the entry shape changes incompatibly."
+    },
+    "rules": {
+      "type": "object",
+      "description": "Audit entries keyed by stable id (matches lint_id, semantic rule name, mechanism id, etc.). Key name retained as `rules` for backward compatibility with v0.1 callers — semantically these are AuditEntry items, not strictly rules.",
+      "additionalProperties": {"$ref": "#/definitions/AuditEntry"}
+    }
+  },
+  "definitions": {
+    "AuditEntry": {
+      "type": "object",
+      "required": ["about", "motivation", "category", "directive", "implementation", "validation", "coherence_checks"],
+      "additionalProperties": false,
+      "properties": {
+        "motivation": {
+          "type": "string",
+          "minLength": 60,
+          "description": "Non-enforced 4th face (added v0.3 per DO-178C ADR-style discipline): why does this rule exist? Records the historical incident, design choice, or correctness invariant that motivated registering the rule. Future maintainers consult this to decide whether to weaken or strengthen the rule when it fires unexpectedly. Coherence checks DO NOT bind motivation — it's auditable but not enforced; the discipline is to require its presence (minLength) so we never have a registered rule with no rationale."
+        },
+        "about": {
+          "type": "string",
+          "description": "One-paragraph description of what the artifact does and why it exists. Audience: a developer touching any of the three faces who needs to know whether their change is consistent with the artifact's intent."
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "static-lint",
+            "semantic-rule",
+            "schema-validation",
+            "smoke-check",
+            "repair-enrichment"
+          ],
+          "description": "Which subsystem this entry lives in. Determines which conventions apply to the validation face. The first four are contract-enforcing rules; `repair-enrichment` covers mechanisms that operate on top of rules' failures (e.g. closest-match suggestions injected into repair prompts)."
+        },
+        "directive": {
+          "type": "object",
+          "required": ["stance"],
+          "additionalProperties": false,
+          "properties": {
+            "doc": {
+              "type": ["string", "null"],
+              "description": "Repo-relative path to the slash command, prompt, or doc that tells the LLM (or human author) what to do. Null when no directive doc exists yet — flagged by the coherence-check that asserts directive coverage."
+            },
+            "section": {
+              "type": ["string", "null"],
+              "description": "Section heading or line-anchor within `doc`."
+            },
+            "stance": {
+              "type": "string",
+              "description": "Plain-English statement of the directive. This is what the registry says the LLM is being told — if the doc says something different, the C-DIRECTIVE-MATCHES-STANCE coherence check fails."
+            }
+          }
+        },
+        "implementation": {
+          "type": "object",
+          "required": ["ground_truth"],
+          "additionalProperties": false,
+          "properties": {
+            "ground_truth": {
+              "type": "string",
+              "description": "What runtime/implementation actually requires (for rules) or what the mechanism actually does (for repair-enrichments) — the single thing the directive and validation must agree with."
+            },
+            "surface_artifact": {
+              "type": ["string", "null"],
+              "description": "Path (relative to a compiled package or to source) to the artifact that the implementation reads from or produces. Null when the entry has no on-disk artifact."
+            },
+            "key_invariant": {
+              "type": "string",
+              "description": "The specific testable invariant the implementation relies on (rule-flavoured entries) or upholds (mechanism-flavoured entries). The coherence checks verify the validation face honours this invariant."
+            }
+          }
+        },
+        "validation": {
+          "type": "object",
+          "required": [],
+          "additionalProperties": false,
+          "properties": {
+            "location": {
+              "type": ["string", "null"],
+              "description": "Repo-relative `path::callable` pointer to the gate/lint/check that enforces this rule, or the entry-point function for mechanism-flavoured entries. Null when the validation face is distributed across multiple callables — the per-entry coherence tests then cover the surface."
+            },
+            "severity": {
+              "type": ["string", "null"],
+              "enum": ["error", "warning", "info", null],
+              "description": "For lint-category entries, the declared severity. Must agree with _LINT_SEVERITY in compile/lints.py — verified by a coherence check. Null for non-lint categories."
+            },
+            "exit_code": {
+              "type": ["string", "null"],
+              "description": "Name of the ExitCode constant the wrapper uses when this entry blocks compilation (e.g. `LINT_FAIL`, `DESCRIPTOR_SCHEMA_FAIL`). Null for non-blocking categories."
+            }
+          }
+        },
+        "coherence_checks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/definitions/CoherenceCheck"},
+          "description": "Tests that synthesize the three faces and assert they agree. Each entry MUST have a runnable test."
+        },
+        "examples": {
+          "type": "object",
+          "description": "Optional 5th face (pilot — added 2026-05-20). Canonical positive/negative/near-miss descriptor snippets that exercise the rule. Two cornerstone coherence checks couple this face to validation by construction: positive examples MUST pass all validators; negative examples MUST fail at least one. The example face replaces hand-written few-shot demonstrations in slash-command prompts: source LLM examples here, never duplicate the snippets elsewhere. Optional during the pilot (only one rule populates it). Discipline: Mellea-API-touching examples MUST be introspection-driven (generator code consuming `mellea_api_ref.json`); literal example fragments are reserved for descriptor-IR-shape rules where the snippet carries no Mellea-version-specific names.",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "properties": {
+            "positive": {
+              "type": "array",
+              "minItems": 1,
+              "items": {"$ref": "#/definitions/Example"},
+              "description": "Canonical valid emissions. Each MUST pass every validator face."
+            },
+            "negative": {
+              "type": "array",
+              "minItems": 1,
+              "items": {"$ref": "#/definitions/Example"},
+              "description": "Canonical invalid emissions. Each MUST fail at least one validator face. The `fails_at` field records the expected failure layer for attribution."
+            },
+            "near_miss": {
+              "type": "array",
+              "items": {"$ref": "#/definitions/Example"},
+              "description": "Plausible-mistake emissions (typos, common LLM hallucination shapes) that should still fail validation with attribution to THIS rule (not some unrelated one). Drift detector: if a near-miss starts passing, the validator boundary moved."
+            }
+          }
+        }
+      }
+    },
+    "Example": {
+      "type": "object",
+      "required": ["id", "rationale", "descriptor"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "description": "Stable id within the rule's example pool. Used in test failure messages so the failing example is attributable."
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 20,
+          "description": "Why this example is positive/negative/near-miss. Audience: a maintainer deciding whether to retire or amend the example."
+        },
+        "descriptor": {
+          "type": "object",
+          "description": "A minimal-but-complete descriptor that exercises the rule. MUST be valid enough to feed to both jsonschema validation against descriptor.schema.v0.3.json AND descriptor/validator.py::validate(). The two cornerstone coherence checks run that two-validator pipeline against this object."
+        },
+        "fails_at": {
+          "type": "string",
+          "enum": ["schema", "semantic-rule", "renderer"],
+          "description": "For negative + near-miss examples: which validator layer the example is EXPECTED to fail at. Coherence checks verify the failure attribution matches. Not applicable for positive examples (which must pass everything)."
+        }
+      }
+    },
+    "CoherenceCheck": {
+      "type": "object",
+      "required": ["id", "description", "test"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9-]*$",
+          "description": "Stable identifier for this check (e.g. `C-POSONLY-KW-OR-POS`). Used in test names and failure messages so the failing face is clearly attributable."
+        },
+        "description": {
+          "type": "string",
+          "description": "What invariant this check asserts and which face would be wrong if it fails."
+        },
+        "test": {
+          "type": "string",
+          "description": "Repo-relative `path::callable` pointer to the pytest test function that realizes this check."
+        },
+        "xfail_until": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "description": "ISO-8601 date (YYYY-MM-DD) before which this check is permitted to xfail (test calls `pytest.xfail` rather than asserting). On or after this date, the check MUST pass — otherwise the suite fails with a deadline-expired message. Mechanism prevents the 'xfail ossifies into permanent xfail' failure mode the research warned about. Use when a coherence check encodes a contract the implementation hasn't met yet (e.g. waiting on a doc author to write a section). Null or absent → no deadline (the check is unconditional)."
+        }
+      }
+    }
+  }
+}

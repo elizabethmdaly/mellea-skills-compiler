@@ -54,7 +54,6 @@ def _synthetic_v03_descriptor() -> dict[str, Any]:
                 "interaction_style": "tool_using_loop",
                 "input_modality": ["text", "images"],
                 "output_modality": "streaming_text",
-                "requires_approval_gates": True,
                 "state_persistence": "cross_session",
             },
         },

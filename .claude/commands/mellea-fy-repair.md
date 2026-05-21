@@ -4,7 +4,7 @@
 
 You are a Melleafy repair specialist. Given a path to a skill root or compiled package directory, you inspect every intermediate artifact and Python file, determine the pipeline's health state step by step, identify the first broken or missing step, and resume the pipeline from that point — or report exactly what is unrecoverable and why.
 
-**Invocation contexts (Fix A — 2026-05-17):**
+**Invocation contexts:**
 
 This slash command is invoked in two distinct contexts. Both follow the same Phase 1–4 flow below; only the trigger differs.
 
@@ -16,6 +16,14 @@ When invoked in the wrapper-side repair context, DO NOT redo Steps 0–6. Their 
 **Your input**: `$ARGUMENTS` — path to a skill root (the directory containing `spec.md` or source files), or path to a compiled package directory (`<name>_mellea/`), or path to `.melleafy-partial/`.
 
 **Your output**: A health report printed to stdout, followed by resumed execution from the first incomplete or invalid step.
+
+---
+
+## Consult schemas, not examples
+
+When you need to understand the shape of any wrapper-emitted JSON artefact, consult the canonical mapping at `.claude/data/artefact-schemas.json` and read the named schema directly. Schemas are authoritative; example files (from other skills or older runs) may be stale, version-specific, or skill-specific. When an artefact's `schema` is `null`, the file format is documented in code at the `format_documented_at` pointer — read that, don't guess from examples.
+
+**This applies equally to re-emission during repair.** If you are repairing a rejected emission (descriptor, fixtures, config, etc.), READ the named schema BEFORE drafting the replacement — even if you generated the original emission earlier in the same session. The repair pass is where field-name and shape-name drift most commonly creeps in (e.g. partial-qualification of Mellea symbols like `mellea.instruct` instead of `mellea.stdlib.session.MelleaSession.instruct`; invented `callee`/`returns` field names on CallNode). The schema gate will reject the same class of mistake regardless of whether it came from the initial emission or a repair pass.
 
 ---
 
@@ -184,6 +192,28 @@ Assess body completeness of `pipeline.py`. A Step 3 skeleton has empty bodies (`
 
 ## Phase 3: Resume point determination and repair routing
 
+### Multi-error-class triage (REQUIRED)
+
+Before applying any fix, enumerate every distinct error class surfaced by Phase 2 and the lint report. An "error class" is one of:
+
+- a distinct `lint_id` with `severity == "error"` in `intermediate/step_7_report.json`
+- a wrapper-reported descriptor render failure (when present)
+- a Phase 2 step status of `partial` / `missing` / `corrupt` that the routing table below targets
+
+Produce a fix for **each** class in this session before exiting. Common failure mode this guards against: fixing only the loudest error (often the descriptor render failure or a `parseable` lint) and declaring the rest "already correct" or "out of scope". If two error classes touch different files (e.g. one in `intermediate/config_emission.json`, another in `intermediate/descriptor_emission.json`), fix both. The schema validator and renderer accept-sets are deliberately narrow — a class you do not touch this round will surface unchanged in the next round and cause the wrapper to abort the repair loop with a triage-failure classification.
+
+Concretely, before exiting:
+
+1. Re-read `intermediate/step_7_report.json` and enumerate every `lint_id` with `verdict == "fail"` AND `severity == "error"` (or `effective_severity == "error"`). Confirm your session produced an edit targeting each one.
+2. If you concluded an error class is downstream of another (e.g. `parseable` failing because `pipeline.py` is absent, which is because the descriptor renderer failed), state that explicitly in your health report and confirm the root-cause fix was applied — do not silently skip the downstream classes.
+3. If you genuinely cannot edit a class (e.g. `category-specific` requiring human review per the routing table below), say so explicitly in the health report with the per-class rationale. Do not omit the class from your output.
+
+The wrapper compares the lint surface before and after this session; an unchanged failing `lint_id` is treated as a triage failure and the repair loop stops.
+
+**Writer/renderer accept-set violations.** When a Step 7 lint failure cites `config_emission.schema.json` validation (a `[writer:config.py]` log line) or a descriptor `RendererError` (a `[writer:descriptor] render failed` log line), the actionable rule is in `mellea-fy-behaviours.md` § "Writer & renderer accept-sets" (ACCEPT-SET-1 for the config writer, ACCEPT-SET-2 for the descriptor renderer). Read that section before drafting the fix — these failures cannot be auto-repaired by re-emitting the same shape; you must change the emission target.
+
+### Routing
+
 After auditing all steps, compute the **first non-valid step** — that is the resume point.
 
 ### Resume routing table
@@ -329,6 +359,20 @@ Inspect the sub-command output above. The intermediate artifacts are preserved f
 [REPAIR COMPLETE] Pipeline resumed from Step <N>. Package at: <package_dir_path>
 Run `mellea-skills run <skill_root>` to execute, or `python -m pytest <package_dir>/fixtures/` to smoke-test.
 ```
+
+### How to use closest-match suggestions in repair
+
+When the wrapper detects a failure with a clearly identifiable near-miss (a typo on a module path, a misspelled keyword argument, a partially-qualified symbol that has a unique close neighbour in the introspected surface), it augments the repair prompt with a line of the form:
+
+```
+Did you mean '<canonical_name>'? (closest match in the surface to '<failing_name>')
+```
+
+**Adopt the suggestion verbatim unless a domain reason argues against it.** The suggestion is derived from runtime surface ground truth (`intermediate/mellea_api_ref.json` for module paths, the introspected signature for kwargs), not from the model's own guess — it represents what the runtime actually exposes. The closest-match algorithm only emits suggestions that clear an absolute confidence threshold AND dominate the next-best candidate by a margin; a `Did you mean` line that appears in the prompt is high-confidence by construction.
+
+**No `Did you mean` line means no high-confidence suggestion.** The mechanism intentionally declines to guess when no candidate clears the bar — emitting nothing is preferable to a misleading low-confidence hint. When the line is absent, the failure message alone is the repair guidance and the LLM should reason from the rule reference and the failing path directly.
+
+The mechanism is registered in the audit-coherence registry as `d2-closest-match-enrichment`; the coherence checks document its contract.
 
 ---
 

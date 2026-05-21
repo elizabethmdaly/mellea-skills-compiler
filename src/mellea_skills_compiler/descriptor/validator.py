@@ -69,6 +69,26 @@ class ValidationError:
     severity: Severity = "error"
 
 
+class DescriptorSchemaError(Exception):
+    """Raised when the pre-render descriptor schema gate rejects a descriptor.
+
+    Distinct from generic compile-time exceptions so the CLI exit-code router
+    can map this cleanly to
+    :data:`mellea_skills_compiler.exit_codes.ExitCode.DESCRIPTOR_SCHEMA_FAIL`
+    (exit code 13). Carries the underlying :class:`ValidationReport` so
+    callers (D1 auto-repair, telemetry) can extract structured errors
+    without re-parsing the message.
+
+    The ``report`` attribute is the full :class:`ValidationReport` from
+    :func:`validate`. ``str(exc)`` is a human-readable summary suitable for
+    stderr — naming the JSON path of the first failing error.
+    """
+
+    def __init__(self, message: str, *, report: "ValidationReport") -> None:
+        super().__init__(message)
+        self.report = report
+
+
 @dataclass
 class ValidationReport:
     """Structured outcome of :func:`validate`.

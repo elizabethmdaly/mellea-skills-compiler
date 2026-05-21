@@ -1071,7 +1071,7 @@ def test_build_claude_argv_byte_identical_for_legacy(tmp_path) -> None:
         "--append-system-prompt",
         "<sys-prompt>",
         "--allowed-tools",
-        "Read,Write,Edit",
+        "Read,Write,Edit,Glob",
         "--output-format",
         "stream-json",
         "--verbose",

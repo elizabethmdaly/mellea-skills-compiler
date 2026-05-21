@@ -117,6 +117,8 @@ MODEL_ID: Final[str] = 'granite4.1:8b'
 LOOP_BUDGET: Final[int] = 3
 ```
 
+> **Scalar-only constraint (Amendment K).** `config_emission.json` constants are scalar-only — each entry's `type` MUST be one of `"str" | "int" | "float" | "bool"`. Dict and list literals do NOT belong in `config_emission.json`; emit them in `pipeline.py` instead (either reconstructed from scalar constants, or inlined as a Python literal). The deterministic writer hard-fails any non-scalar entry and the schema-violation cannot be auto-repaired. **See `mellea-fy-behaviours.md` § ACCEPT-SET-1 for the full rule, the two alternative patterns, and the worked example.**
+
 **schemas.py**: One Pydantic `BaseModel` per `SCHEMA` element. Field descriptions pulled from the spec's output format description. For two-step pattern: include both the simplified raw schema and the full schema.
 
 **requirements.py**: One `Requirement` object per `VALIDATE_OUTPUT` element. Group by spec section. Structural checks use `simple_validate()`; semantic checks use bare `Requirement(description=...)`. Include `check_only=True` for negative constraints.
@@ -305,7 +307,18 @@ Step 5 fills every skeleton placeholder with real code. For `config.py`, the mod
 
 Read once; apply throughout all file generation.
 
-**1. `config.py` output is JSON, not Python source.** Emit a JSON object conforming to `.claude/schemas/config_emission.schema.json`. The deterministic writer at `.claude/melleafy/writers/config_writer.py` renders the file — do not write Python source for `config.py` directly.
+**0. Schemas are authoritative — read them BEFORE emitting.** Whenever this slash command (or any sibling step) names a schema file — `descriptor.schema.v0.3.json`, `config_emission.schema.json`, `fixtures_emission.schema.json`, `descriptor_emission` schema, etc. — open and READ that schema in full before drafting any JSON emission against it. The schema is the ground truth, not your prior knowledge of JSON IR conventions. Concretely:
+
+- Every field name in your emission MUST appear in the schema's `properties` for the relevant object (or be allowed by an `additionalProperties` value that isn't `false`).
+- Every name listed in `required` MUST be present in your emission for that object.
+- `additionalProperties: false` means LITERALLY no extra fields — regardless of how plausible an extra field looks from other JSON IRs you've seen.
+- Fields ARE case-sensitive. `callee` is not `symbol`. `fixture_id` is not `id`. `returns` is not a CallNode field at all. The schema decides what's legal; your training memory does not.
+
+**After drafting the emission, re-open the schema and self-check**: walk every top-level field and every repeated sub-shape (each pipeline node, each fixture entry, each schema entry, etc.) against the corresponding schema definition. Verify the field name, presence of all `required` siblings, absence of any field not in `properties`. Invented fields (most-common offenders: `callee` instead of `symbol`, `returns` on CallNode, `fixture_id`/`name`/`expected_output_checks` on fixtures-emission entries) are the dominant cause of descriptor / fixtures schema-gate rejection observed in real compiles 2026-05-19 / 2026-05-20.
+
+If the schema you need isn't reachable, halt and report rather than guess from convention.
+
+**1. `config.py` output is JSON, not Python source.** Emit a JSON object conforming to `.claude/schemas/config_emission.schema.json` (per invariant 0 above — read the schema before emitting). The deterministic writer at `.claude/melleafy/writers/config_writer.py` renders the file — do not write Python source for `config.py` directly.
 
 **2. All other files output Python source.** Generate one file per LLM invocation (Rule 5-3). Wait for each file's body before starting the next.
 
@@ -487,8 +500,8 @@ In descriptor mode the wrapper's post-session writer flow renders TWO ADDITIONAL
 |--------------|--------------------------------------------|----------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|
 | `config.py`  | `intermediate/config_emission.json`        | `compile/writer_renderer.py::render_writers` (always)                            | DENIED (both modes)                                                                                         |
 | `fixtures/`  | `intermediate/fixtures_emission.json`      | `compile/writer_renderer.py::render_writers` (always)                            | DENIED (both modes)                                                                                         |
-| `pipeline.py`| `intermediate/descriptor_emission.json`    | `compile/writer_renderer.py::render_descriptor_to_python` (descriptor mode only) | DENIED in descriptor mode (`_DESCRIPTOR_MODE_ADDITIONAL_PATHS`, audit §7-D2 closed 2026-05-18); allowed in legacy mode |
-| `schemas.py` | `intermediate/descriptor_emission.json`    | `compile/writer_renderer.py::render_descriptor_to_python` (descriptor mode only) | DENIED in descriptor mode (`_DESCRIPTOR_MODE_ADDITIONAL_PATHS`, audit §7-D2 closed 2026-05-18); allowed in legacy mode |
+| `pipeline.py`| `intermediate/descriptor_emission.json`    | `compile/writer_renderer.py::render_descriptor_to_python` (descriptor mode only) | DENIED in descriptor mode (`_DESCRIPTOR_MODE_ADDITIONAL_PATHS`); allowed in legacy mode |
+| `schemas.py` | `intermediate/descriptor_emission.json`    | `compile/writer_renderer.py::render_descriptor_to_python` (descriptor mode only) | DENIED in descriptor mode (`_DESCRIPTOR_MODE_ADDITIONAL_PATHS`); allowed in legacy mode |
 
 In legacy mode (no `--use-descriptor`) Claude writes `pipeline.py` and `schemas.py` directly as part of free-form Python emission, and `render_descriptor_to_python` is not invoked. In descriptor mode Claude emits `descriptor_emission.json` only — the wrapper renders the Python from the descriptor IR via `mellea_skills_compiler.renderer.render_descriptor` + `render_schemas`. The wrapper is the source of truth: the `_compile_settings.json` deny list extends to `pipeline.py` and `schemas.py` in descriptor mode, so the LLM's Write/Edit tool calls on those paths are blocked at the tool layer. The post-session `pipeline-entry-canonical` lint hard-fails when `pipeline.py` is absent — so a descriptor that the renderer rejects surfaces as a lint failure, not a silent miss.
 
@@ -501,11 +514,27 @@ This boundary is the single most-misread part of descriptor mode — read it bef
 - **Claude's role (in-session)**: emit `intermediate/descriptor_emission.json` to disk via the `Write` tool. That file must conform to the schema at `src/mellea_skills_compiler/descriptor/schemas/descriptor.schema.v0.3.json` (covering `inputs`, `outputs`, `schemas`, `state`, `pipeline` list of typed nodes, and v0.3 additions like `dependencies` and `bundled_resources`). Claude's job ENDS at writing that JSON file. Claude does NOT invoke any Python function — the only tools available in this slash command are `Read`, `Write`, `Edit`.
 - **Claude does NOT write `pipeline.py` or `schemas.py`** in descriptor mode. Those paths are in the wrapper's `_WRAPPER_RENDERED_PATHS` deny-list when `--use-descriptor` is active, so a `Write` against them would be refused; even if it were allowed, the wrapper would overwrite the file post-session.
 - **The wrapper's role (post-session, automatic — for situational awareness only, you do not invoke it)**: after the Claude session exits, `mellea_skills_compiler.compile.mellea_skills.compile()` calls `compile/writer_renderer.py::render_descriptor_to_python(package_dir, ...)`. That wrapper hook reads `intermediate/descriptor_emission.json` from disk and dispatches to the deterministic descriptor renderer at `renderer/core.py::render_descriptor` (+ `render_schemas`) to produce `pipeline.py` + `schemas.py`, which it writes to `<package_dir>/`. The wrapper then continues with the rest of the post-session flow (`config.py` + `fixtures/` writers, Step 6 finalisation, Step 7 lints, optional repair retry).
-- **Failure surface**: if `descriptor_emission.json` is missing or malformed, `render_descriptor_to_python` cannot produce `pipeline.py`, and the Step 7 `pipeline-entry-canonical` lint hard-fails (Bug 1 fix, 2026-05-17). When `--repair-on-lint-failure` is set, the wrapper schedules a repair session that gets a fresh chance to emit a correct descriptor.
+- **Failure surface**: if `descriptor_emission.json` is missing or malformed, `render_descriptor_to_python` cannot produce `pipeline.py`, and the Step 7 `pipeline-entry-canonical` lint hard-fails. When `--repair-on-lint-failure` is set, the wrapper schedules a repair session that gets a fresh chance to emit a correct descriptor.
 
 The in-Python entry points named below (`compile_via_descriptor`, `EmissionConfig`) describe the **wrapper-internal** semantics of the descriptor flow for context only. They are NOT something Claude can or should invoke from inside this slash command — Claude's only deliverable in descriptor mode is the descriptor JSON on disk.
 
 ### Algorithm (Claude-side, in-session)
+
+**0. READ the descriptor schema FIRST**, before reading intermediates or drafting anything. The canonical schema is at `src/mellea_skills_compiler/descriptor/schemas/descriptor.schema.v0.3.json` — open it via the `Read` tool and read it in full. The schema is authoritative for field names, `required` lists, and `additionalProperties: false` constraints. Specifically internalise:
+
+- **`CallNode` shape**: the symbol field is named `symbol` (NOT `callee`); there is no `returns` field on CallNode (use `id` + `bound_to` per the schema); the `args` value type is `ArgValue` (a closed `oneOf` over six exact shapes — `value`, `template`, `ref`, `schema_ref`, `env`, `symbol`, plus list — invented shapes like `{"<name>": "#/outputs/<name>"}` will be rejected).
+- **`ref` shape** *(examples mirrored from `src/mellea_skills_compiler/rules/registry.json` → `r-sem-ref.examples`)*: value-binding refs (`bound_to`, `over`, `on`, ArgValue's `{ref: ...}` variant) take a PLAIN identifier string that resolves against a declared `state[].id` / `inputs[].name` / prior-node id — `{"ref": "session"}` (✅). Two common rejections: `{"ref": "#/state/session"}` (❌, JSON Pointer syntax — rejected by the schema's `Ref.ref` pattern `^[a-z_][a-z0-9_]*$`) and `{"ref": "completely_undefined_target"}` (❌, valid pattern but the identifier isn't in scope — rejected by the semantic-rule layer). JSON Pointer is reserved for the **distinct** `SchemaRef` shape (`{"ref": "#/schemas/Foo"}`) and the output-binding form (`#/outputs/<name>`); the two ref kinds are separate `$defs` entries and must not be conflated.
+- **`ref` scope**: a `ref` resolves only against the descriptor's own `state[].id` / `inputs[].name` / prior-node `id` — NOT config constants (e.g. `LOOP_BUDGET` from config.py), NOT names from sibling sub-compositions invisible to your scope.
+- **Composition scoping (`_walk_pipeline` rule)**: ids declared INSIDE a composition body (`sequential`, `branch`, `map`, etc.) are visible only WITHIN that composition's scope and to its descendants — **NOT to sibling compositions at the same nesting level**. If your skill has phases that share data across boundaries (e.g. intake → draft → verify, where `notice_type` is collected in intake and referenced in draft and verify), you have three ways to express the dataflow legally:
+  - **Flatten the pipeline**: put the call nodes directly at the top level of `pipeline[]` rather than wrapping them in phase compositions. Every prior node's `id` is then visible to every later node via the `visible_ids` set. Loses the visual phase grouping in the descriptor structure but preserves the dataflow correctly. Simplest fix.
+  - **Promote shared values to `state[]`**: if a value persists across the whole pipeline (a session handle, a configuration object), declare it as a top-level `state[].id` with the symbol that produces it. State entries are visible everywhere.
+  - **Thread through top-level node ids**: a composition's own `id` is visible to its siblings, but its internal body's ids are not. To share a value collected mid-pipeline, declare the call node that produces it at the TOP level of `pipeline[]` (with an `id` like `notice_type_extract`), then ref that id from later phases. Wrapping the extraction inside a `phase_2_intake` composition would hide the id from `phase_3_draft`.
+
+  Symptom of getting this wrong: `R-SEM-REF: ref 'X' does not resolve to a declared state.id, input name, or prior node id` firing repeatedly across nested-composition paths like `/pipeline/0/body/2/body/0/...`. If you see that pattern, the fix is one of the three above — usually "flatten the pipeline" is the cheapest.
+- **`bound_to`**: present only when explicitly binding a method receiver. The renderer ignores it for variable assignment — assignment uses the node's own `id`. Putting `bound_to: {ref: "<name>"}` on every call is an emission anti-pattern and the validator will reject the `<name>` as out-of-scope.
+- **Required fields per node kind**: each `kind` (call / composition / etc.) has its own `required` list. Read each variant.
+
+If the schema isn't reachable via Read, halt and report rather than guessing from convention or prior JSON IR exposure.
 
 1. Read every intermediate artefact present under `<package_name>/intermediate/`. The canonical 8-artefact set is:
    - `classification.json` — 5-axis archetype (Step 0)
@@ -513,10 +542,24 @@ The in-Python entry points named below (`compile_via_descriptor`, `EmissionConfi
    - `element_mapping.json` — tag → Mellea symbol mapping (Step 2)
    - `element_mapping_amendments.json` — Step 2.5d overrides (often supersedes the initial mapping)
    - `dependency_plan.json` — 8-disposition dependency plan (Step 2.5c)
-   - `mellea_api_ref.json` — introspected Mellea surface, replaces/augments the bundled `surface_0.5.0.json` (Step 2.5e)
+   - `mellea_api_ref.json` — introspected Mellea surface (Step 2.5e). **Verification surface, NOT a primary read.** Treat it as a dictionary you consult on demand for specific symbol signatures and module paths — do NOT read end-to-end (it is ~280KB). Use the canonical example in Step 1b as your composition reference; consult this surface only when you need to look up a specific symbol's signature or verify a module path the canonical doesn't already show.
    - `mellea_doc_index.json` — per-symbol doc-page references (Step 2.5f)
    - `expected_signature.json` (P3.5.D — Step 2 always emits this artefact; the system prompt inlines it as a HARD CONSTRAINT block. The `R-SEM-SIGNATURE-MATCH` validator rule fires on any divergence between the descriptor's `inputs`/`outputs`/`schemas` and the locked signature. Absent only on legacy / pre-P3.5.D intermediate artefact sets — in that case the rule is non-firing) — locked I/O signature constraint
-2. Cross-reference the introspected Mellea surface in `mellea_api_ref.json` (falling back to `<repo>/melleafy-handoff/kickoff/spike-outputs/surface_0.5.0.json` if absent) for symbol names, signatures, and module paths when assembling pipeline nodes.
+**1b. Select and read the canonical-descriptor example for your classification triple.** Using the `classification.json` you just read, locate a worked example matching the skill's archetype × shape × modality:
+
+   - **Filename rule**: `<archetype>_<shape>_<modality>.json`, with the modality value's underscores converted to kebab-case (`synchronous_oneshot` → `synchronous-oneshot`). Example: `{archetype: "A", shape: "Sequential", modality: "synchronous_oneshot"}` → `A_Sequential_synchronous-oneshot.json`.
+   - **Read the file** from `src/mellea_skills_compiler/canonical_descriptors/<filename>` via the `Read` tool. The file is a wrapper carrying `metadata.classification`, `metadata.notes` (read these — they describe what the canonical demonstrates and what it deliberately omits), and `descriptor` (the worked example).
+   - **Degradation chain if missing**: drop modality first (try `<archetype>_<shape>.json`), then drop shape. If nothing resolves, no canonical exists for your triple — proceed without one and surface that gap in a note.
+   - **Use the canonical as a STRUCTURAL reference, not a content source.** Pattern-match on HOW it expresses `state[]`, `inputs`, the pipeline-composition shape, how `dependencies[]` flow into the pipeline, how `schemas` are declared and referenced. Do NOT copy the canonical's skill-specific symbol names, descriptions, or args — those belong to the source skill, not yours. The canonical teaches *idiom*, not *content*.
+
+> **Separation of concerns: composition reference vs verification surface.** Two distinct grounding artifacts serve two distinct cognitive roles. Use each for its intended purpose:
+>
+> - **The canonical descriptor** (read in Step 1b) is your *composition reference*. It shows how a descriptor for skills of this classification is wired together — where state goes, how the pipeline composes, how dependencies flow into inputs. Pattern-match against it for structure.
+> - **`intermediate/mellea_api_ref.json`** is your *verification surface*. It's the dictionary of what's callable in this Mellea version, with signatures. Look up specific symbols on demand. **Do NOT read it end-to-end** — the canonical example already shows you which Mellea symbols are typical for skills of this triple. The descriptor symbol gate provides automated post-emission verification, so emit confidently against the canonical's idiom and consult the surface only for targeted lookups.
+>
+> In short: canonical teaches composition; surface verifies vocabulary; symbol gate enforces correctness.
+
+2. **Consult `intermediate/mellea_api_ref.json` for targeted symbol lookups** — when the canonical example doesn't already show the symbol you want to use, or when you need a precise signature for a stdlib helper. Use the `Read` tool with line offsets to fetch only the relevant module's entries; do NOT read the file end-to-end. The descriptor symbol gate will post-emission-verify everything; you do not need to scan exhaustively to avoid being wrong.
 3. Synthesise the descriptor IR. Each of the 8 artefacts feeds specific descriptor fields:
    - `classification.json` → `metadata.modality`, `metadata.archetype`
    - `inventory.json` + `element_mapping.json` + `element_mapping_amendments.json` → `pipeline` nodes (typed by mapped Mellea symbol), `schemas` entries
@@ -524,6 +567,36 @@ The in-Python entry points named below (`compile_via_descriptor`, `EmissionConfi
    - `mellea_api_ref.json` → import paths and signatures used by node `call` fields
    - `expected_signature.json` → `inputs`, `outputs`, and top-level `schemas` (HARD CONSTRAINT — divergence fails `R-SEM-SIGNATURE-MATCH` post-session)
 4. Write the assembled JSON to `intermediate/descriptor_emission.json` using the `Write` tool. The file MUST be valid JSON matching `descriptor.schema.v0.3.json`. This is your terminal action for Step 5 in descriptor mode — do not attempt to write `pipeline.py` or `schemas.py`.
+
+### Descriptor accept-set (type expressions, signatures, symbols)
+
+The deterministic descriptor renderer at `mellea_skills_compiler.renderer.render_descriptor` accepts a narrow set of forms. Three rules cover the common rejection cases:
+
+- **Type expressions** must use PEP 585 lowercase forms (`list[str]`, `dict[str, int]`, `str | None`). Do not import from `typing`; capitalised aliases (`List`, `Dict`, `Optional`, `Union`) are rejected.
+- **Dependency signatures** are parenthesised only (`(query: str) -> str`) — no leading function name. The `id` field carries the name.
+- **Symbol references** in `state[]`, pipeline node `call` fields, and strategy args MUST use the defining-module path as recorded in `intermediate/mellea_api_ref.json`. The Python user-facing re-export form is NOT accepted. See ACCEPT-SET-2 in `mellea-fy-behaviours.md` for the lookup algorithm and rejection patterns; both bare names and `from mellea import X`-style forms are rejected.
+
+Violations produce a `RendererError` from `compile/writer_renderer.py::render_descriptor_to_python`, surfaced both as a `[writer:descriptor] render failed` log line and as a `pipeline-entry-canonical` lint failure (because `pipeline.py` is absent).
+
+**See `mellea-fy-behaviours.md` § ACCEPT-SET-2 for the full rule tables (❌/✅ pairs), where each rule applies inside the descriptor schema, and what the wrapper does on failure.**
+
+### Symbol gate: pre-render normalisation
+
+After the descriptor JSON is written and before the deterministic renderer runs, the wrapper invokes a pre-render gate at `src/mellea_skills_compiler/compile/descriptor_symbol_gate.py::run_symbol_gate`. The gate walks every `symbol` field anywhere in the descriptor IR (`state[].symbol`, pipeline `call` symbols, dependency `symbol`s) and resolves Mellea-API references against the introspected surface (`intermediate/mellea_api_ref.json`) via a deterministic 5-stage matcher:
+
+1. **Exact** — the symbol is already a valid surface path (longest module prefix splits to a known head symbol). Pass through unchanged with `method="exact"`.
+2. **Suffix unification** — the symbol is a unique dotted suffix of exactly one canonical surface path. E.g. `MelleaSession.instruct` → `mellea.stdlib.session.MelleaSession.instruct`. Silently auto-normalised with `method="suffix"`.
+3. **Module-scoped leaf match** — the symbol's leading segments form a real module key AND exactly one symbol within that module has the trailing segment as its leaf. Handles the "dropped class prefix" pattern: `mellea.stdlib.session.chat` → `mellea.stdlib.session.MelleaSession.chat`. Silently auto-normalised with `method="module-scoped-leaf"`.
+4. **Bare-name resolution** — a single-segment symbol whose leaf is unique across the surface (after re-export collapse). E.g. bare `MelleaSession` → `mellea.stdlib.session.MelleaSession`. Silently auto-normalised with `method="bare-name"`.
+5. **Fuzzy fallback** (optional, requires `rapidfuzz`) — token-set ratio. Requires best score `>= 92` AND best-vs-second dominance `>= 5`. If both hold, silently auto-normalised with `method="fuzzy"`; else fall through to failure.
+
+**Re-export aliases collapse to canonical**: when multiple surface paths point to the same Python symbol (identifiable via shared `defined_in`), the gate treats them as one canonical target — they are NOT a collision. Example: bare `start_session` resolves to `mellea.stdlib.session.start_session` even though the surface also lists it at `mellea.start_session` as a top-level re-export.
+
+**Non-Mellea symbols pass through unflagged**: symbols whose leading segment isn't a Mellea module head — `loader.SkillLoader`, `builtins.dict`, fully-qualified `<package>_mellea.X` — are skipped without validation. The renderer or downstream lints handle those.
+
+**Discipline: fail loud on ambiguity, fix silently on certainty.** Every silent rewrite is appended to `intermediate/symbol_normalisations.jsonl` as one JSON object per line — telemetry, not state — so the LLM emission accuracy stays observable as first-class signal rather than hidden behind auto-fixes.
+
+**What you should emit**: prefer the canonical surface path on the first try (Step 1 is the cheapest pass-through). When the canonical form is awkward, partial qualifications that uniquely identify the target (Stages 2-4) are auto-normalised. When the gate rejects with `[writer:descriptor] symbol gate rejected N symbol(s); first: '<symbol>' at <path>; closest candidates: <top-3>`, the failure message lists the top-3 candidate canonical paths — pick from those rather than guessing a different shape. If `closest candidates: (no candidates)` appears, the symbol isn't in the surface at all; check `intermediate/mellea_api_ref.json` for the right name.
 
 ### What the wrapper does post-session (for situational awareness)
 

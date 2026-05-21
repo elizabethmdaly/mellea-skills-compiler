@@ -58,4 +58,7 @@ includes = [
     "src/mellea_skills_compiler/mellea_surface/data/*.json",
     "src/mellea_skills_compiler/descriptor/data/*.md",
     "src/mellea_skills_compiler/compile/data/*.json",
+    "src/mellea_skills_compiler/compile/schemas/*.json",
+    "src/mellea_skills_compiler/descriptor/schemas/*.json",
+    "src/mellea_skills_compiler/rules/*.json",
 ]

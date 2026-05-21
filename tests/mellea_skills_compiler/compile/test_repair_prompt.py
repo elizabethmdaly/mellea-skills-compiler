@@ -37,7 +37,7 @@ def _make_report(*lints: dict) -> dict:
         "info_failures": 0,
         "strict": False,
         "smoke_check_mode": "never",
-        "warnings_escalated_by_smoke": False,
+        "warnings_escalated_by_smoke": [],
         "smoke_check": None,
         "lints": list(lints),
     }

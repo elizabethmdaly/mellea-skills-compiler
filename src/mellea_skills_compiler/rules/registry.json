@@ -1,0 +1,1071 @@
+{
+  "$schema": "./registry.schema.json",
+  "format_version": "0.1",
+  "rules": {
+    "stdlib-arity": {
+      "motivation": "Registered 2026-05-19 after the gpai-code-of-practice compile failed at lint with `MelleaSession(backend=...) called with 0 positional argument(s)` AND `unrecognised keyword argument 'backend'`. Both messages were false positives: the LLM emitted valid Python (POSITIONAL_OR_KEYWORD params can be passed by keyword), but the lint's grounded-signature parser treated those params as positional-only. The audit registry was built to catch this impl ↔ validation drift class explicitly — the lint MUST match Python's actual calling rules, not a stricter mental model.",
+      "about": "Calls to mellea.stdlib.* functions and methods (and any Mellea API symbol whose signature is introspected into intermediate/mellea_api_ref.json) must match the declared signature: positional argument count within the param-list bounds, keyword argument names recognised, and required parameters satisfied (positionally OR by keyword name per Python's calling rules).",
+      "category": "static-lint",
+      "directive": {
+        "doc": ".claude/commands/mellea-fy-generate.md",
+        "section": "MUST include a description argument (line ~200) + 'Known signatures' static-fallback table (line ~245).",
+        "stance": "When a Mellea callable has a POSITIONAL_OR_KEYWORD parameter, the LLM may call it using EITHER style — `m.instruct('desc')` or `m.instruct(description='desc')` are both valid. For curated stdlib functions (req, check, simple_validate) the static-fallback table is intentionally restrictive about which kwargs are accepted — that restriction is part of the directive, not a bug in the validation."
+      },
+      "implementation": {
+        "ground_truth": "Python's `inspect.signature()` semantics: a POSITIONAL_OR_KEYWORD parameter (kind == inspect.Parameter.POSITIONAL_OR_KEYWORD) accepts both positional and keyword call styles. A required parameter (no default) must be satisfied by either style. Only POSITIONAL_ONLY params (after `/`) cannot be passed by keyword.",
+        "surface_artifact": "intermediate/mellea_api_ref.json",
+        "key_invariant": "For every callable in the surface, a parameter whose signature string declares it as positional-or-keyword (the default — no `/` or `*` marker fencing it) is filled by either positional position or matching keyword name. A required positional-or-keyword param is satisfied by a kwarg of that name."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/compile/lints.py::lint_stdlib_arity",
+        "severity": "error",
+        "exit_code": "LINT_FAIL"
+      },
+      "coherence_checks": [
+        {
+          "id": "C-POSORKW-ACCEPTS-KEYWORD",
+          "description": "When the signature declares a required POSITIONAL_OR_KEYWORD parameter, the validation must accept a call that passes that parameter by keyword name. Failure means impl ↔ validation drift: the lint is over-restrictive vs Python's actual calling rules. Surfaced by MelleaSession(backend=...) failing the live lint on 2026-05-19.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_stdlib_arity.py::test_positional_or_keyword_accepts_keyword_form"
+        },
+        {
+          "id": "C-POSORKW-ACCEPTS-POSITIONAL",
+          "description": "The same parameter must also be accepted when passed positionally — paired test confirming the lint isn't silently flipped the wrong way. Failure means both forms are now rejected (the lint became broken in the OPPOSITE direction).",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_stdlib_arity.py::test_positional_or_keyword_accepts_positional_form"
+        },
+        {
+          "id": "C-REQUIRED-MISSING-FAILS",
+          "description": "A call that omits a required parameter both positionally AND by keyword must still fail the lint. Failure means validation is too lenient — drift in the safety direction. The lint must remain useful as a guard against under-supplying arguments.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_stdlib_arity.py::test_missing_required_param_fails"
+        },
+        {
+          "id": "C-UNKNOWN-KWARG-FAILS",
+          "description": "A call with a kwarg name not in the signature must fail the lint (typo guard). Failure means validation is now ignoring unknown kwargs — drift toward false negatives.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_stdlib_arity.py::test_unknown_kwarg_fails"
+        },
+        {
+          "id": "C-STATIC-TABLE-MATCHES-DIRECTIVE",
+          "description": "Each entry in _STDLIB_STATIC_SIGS must match the corresponding row of the 'Known signatures' table in the directive doc. The static fallback is curated to be more restrictive than Python's actual calling rules (it encodes call conventions for req/check/simple_validate); the registry's job here is to ensure that curated restriction matches what the doc tells the LLM. Failure means directive ↔ validation drift on the curated stdlib functions.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_stdlib_arity.py::test_static_table_matches_directive_doc"
+        },
+        {
+          "id": "C-DECLARED-SEVERITY-MATCHES",
+          "description": "The severity declared in this registry entry must match _LINT_SEVERITY[lint_id] in compile/lints.py. Failure means the registry has drifted from the central severity table.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_stdlib_arity.py::test_declared_severity_matches_central_table"
+        }
+      ]
+    },
+    "import-soundness": {
+      "motivation": "Registered 2026-05-19 after the gpai compile failed with `from mellea.backends.ollama import ...` flagged as a non-existent module — even though the module IS importable at runtime. Root cause: `compile/grounding.py::_introspect_mellea` curated a manual list (CORE_MODULES) that didn't include the user-facing backend submodules. Classic directive ↔ implementation drift: the directive promised the LLM that mellea_api_ref.json was authoritative, but the artefact was incomplete relative to what the runtime exposes. This entry guards against that artefact ever silently diverging from the importable surface again.",
+      "about": "Every `from mellea.X import Y` and `import mellea.X` statement in a compiled skill must reference a Mellea module path that actually exists in `intermediate/mellea_api_ref.json:.modules`. The directive tells the LLM to treat the surface artifact as authoritative; therefore the surface artifact must accurately enumerate what the runtime exposes.",
+      "category": "static-lint",
+      "directive": {
+        "doc": ".claude/commands/mellea-fy-generate.md",
+        "section": "Rule 5-2 — Import path grounding (line ~233)",
+        "stance": "Before writing any `from mellea.X import Y` statement, the LLM must verify the module path exists in `mellea_api_ref.json:.modules`. Any path not present is invalid and must not be generated. This makes the surface artifact the single source of truth — implying the surface must match what runtime actually exposes."
+      },
+      "implementation": {
+        "ground_truth": "Every importable submodule of the installed `mellea` package (discoverable via `pkgutil.walk_packages(mellea.__path__, prefix='mellea.')`).",
+        "surface_artifact": "intermediate/mellea_api_ref.json",
+        "key_invariant": "For every `mellea.backends.<X>` submodule that is importable at runtime, the introspected surface lists an entry under `.modules.mellea.backends.<X>`. Without this, the directive promises the LLM something the runtime contradicts: paths that work in production code are flagged as invalid by the lint."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/compile/lints.py::lint_import_soundness",
+        "severity": "error",
+        "exit_code": "LINT_FAIL"
+      },
+      "coherence_checks": [
+        {
+          "id": "C-BACKENDS-NAMESPACE-COMPLETE",
+          "description": "Every importable `mellea.backends.<X>` submodule must appear in the introspected surface. Failure means directive ↔ implementation drift: the directive tells the LLM the surface is authoritative, but the surface is missing real modules. Surfaced by `from mellea.backends.ollama import ...` failing import-soundness despite being a real module on 2026-05-19.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_import_soundness.py::test_every_mellea_backends_submodule_in_surface"
+        },
+        {
+          "id": "C-REAL-MELLEA-IMPORT-PASSES",
+          "description": "A `from mellea.backends.ollama import OllamaModelBackend` (a real, importable module) must not be flagged by the lint. Paired with the namespace-complete check above: even if the namespace is complete in principle, this verifies the lint actually accepts the imports.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_import_soundness.py::test_real_mellea_backend_import_passes_lint"
+        },
+        {
+          "id": "C-FAKE-MELLEA-IMPORT-FAILS",
+          "description": "A `from mellea.totally.fake.module import X` must still be flagged (typo guard). If this fails, the lint has become permissive — it would no longer catch LLM hallucinations of module names.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_import_soundness.py::test_nonexistent_mellea_module_import_fails_lint"
+        },
+        {
+          "id": "C-NON-MELLEA-IMPORT-IGNORED",
+          "description": "A `from collections import OrderedDict` (or any non-mellea.* import) must not be flagged. The lint is scoped to the Mellea namespace; flagging stdlib or third-party imports would be a regression.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_import_soundness.py::test_non_mellea_import_not_flagged"
+        },
+        {
+          "id": "C-DECLARED-SEVERITY-MATCHES",
+          "description": "Registry-declared severity must match `_LINT_SEVERITY` in compile/lints.py. Drift detector against the central severity table.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_import_soundness.py::test_declared_severity_matches_central_table"
+        }
+      ]
+    },
+    "r-sem-modality-approval": {
+      "motivation": "Registered 2026-05-19 after the gpai-code-of-practice compile produced a descriptor with `requires_approval_gates: true` and no `human_approval` operator. Root cause was textbook *criteria drift* (Shankar et al. 2024, EvalGen): the LLM was graded on a constraint nothing told it about — the descriptor schema field had no `description`, no slash-command doc mentioned the rule by name. The LLM kept setting the flag based on disclaimer language about end-user review rather than in-pipeline workflow. **RETIRED 2026-05-20** via the audit registry's strongest design move (per deep-research guidance): *collapse faces when you can*. The schema field was a CLAIM duplicating a FACT — the pipeline either contains a `human_approval` operator or it doesn't, which is the source of truth. We deleted the claim field; R-SEM-MODALITY-APPROVAL had nothing left to check.\n\n**Retirement criterion — narrower than 'no current consumer'**. The collapse rule applies ONLY to fields that are CLAIMS about compiler/runtime behaviour that duplicate a structural fact in the same compiler-internal artefact. It does NOT apply to fields that are METADATA describing the skill at a higher level (intended for catalogs, dashboards, documentation generators, future feature flags, operator-facing tooling, cross-skill comparisons). Such metadata fields have legitimate consumers the compiler doesn't model — the compiler simply not reading them is not grounds for retirement. Example PRESERVED via this criterion (2026-05-20 user decision): `descriptor.skill.classification.primary_axis` — schema-required but with no compiler consumer; CORRECTLY preserved because it classifies what KIND of skill this is (DSL/COMP/DOM/AGENT/PERSONA/MIXED), which is metadata for higher-level tooling, not a claim about compiler behaviour. See task #50 for the full triage rubric.\n\nHistorical context preserved here so future maintainers tempted to re-add a similar declarative flag — OR tempted to retire a metadata field by misapplying the collapse rule — understand the precise distinction.",
+      "about": "[RETIRED 2026-05-20] Tombstone for a rule that enforced consistency between `skill.classification.requires_approval_gates: true` and the presence of a `human_approval` operator in the pipeline. The field was removed from `descriptor.schema.v0.3.json` and the rule from `descriptor/semantic_rules.py` because the pipeline's structure is itself the source of truth — a redundant claim invited LLM hallucination with no upstream artefact for the LLM to consult. The audit registry retains this entry as a regression-guard so the field can't quietly come back.",
+      "category": "semantic-rule",
+      "directive": {
+        "doc": null,
+        "section": null,
+        "stance": "[Retired] There is no directive — the pipeline's structure is its own truth. If a skill needs a human-approval gate, it MUST include the `human_approval` operator in `pipeline[]`. There is no declarative flag to set; structure is the only signal."
+      },
+      "implementation": {
+        "ground_truth": "[Retired] The pipeline's `human_approval` operator presence is the signal. No schema field or validator is involved.",
+        "surface_artifact": "intermediate/descriptor_emission.json (pipeline[] only — no skill.classification.requires_approval_gates field)",
+        "key_invariant": "[Retired regression guard] The descriptor schema MUST NOT contain a `requires_approval_gates` field under any classification object. Re-introducing the field would recreate the criteria-drift class that motivated the original (now-retired) rule. If a future use case demands such a claim, the registry maintainer must extend this motivation block with the reason for re-introduction AND add a new coherence check requiring a slash-command directive that explains the rule's implication to the LLM."
+      },
+      "validation": {
+        "location": null,
+        "severity": null,
+        "exit_code": null
+      },
+      "coherence_checks": [
+        {
+          "id": "C-FIELD-STAYS-RETIRED",
+          "description": "The `requires_approval_gates` field MUST NOT exist anywhere in `descriptor.schema.v0.3.json` (or any successor schema version). Regression guard against accidental re-introduction. If the field reappears, this check fails and the registry maintainer is forced to consciously update the retirement motivation OR add the directive-coverage check that was missing the first time.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_modality_approval.py::test_field_stays_retired"
+        }
+      ]
+    },
+    "pipeline-entry-canonical": {
+      "motivation": "Registered 2026-05-19 to encode Bug 1 (2026-05-17): a package emitted `run_phase_2_gap_analysis`, `run_phase_3_roadmap`, and `run_pipeline` as public top-level functions. The pre-fix smoke-check loader picked `run_phase_2_gap_analysis` (alphabetically first under `dir()`) and crashed with TypeError. Three faces drifted independently: the loader (impl), the lint (validation), and the slash-command Rule 3-2 directive each described the canonical entry-point name slightly differently. Registering captures the contract so future loader/lint changes can't silently disagree.",
+      "about": "`<package>/pipeline.py` MUST define a top-level function named exactly `run_pipeline`, AND `<package>/melleafy.json:entry_signature` (when present) MUST start with `run_pipeline(`. Empirically observed regression (2026-05-17): a package emitted `run_phase_2_gap_analysis`, `run_phase_3_roadmap`, and `run_pipeline` as public top-level functions; the pre-fix loader picked `run_phase_2_gap_analysis` (alphabetically first under `dir()`) and crashed at smoke-check with a TypeError. The loader at `toolkit/file_utils.py:load_skill_pipeline` was patched to use the manifest as authoritative; this lint backstops the contract.",
+      "category": "static-lint",
+      "directive": {
+        "doc": ".claude/commands/mellea-fy-generate.md",
+        "section": "Rule 3-2 — `run_pipeline` is the canonical entry point name (line ~51)",
+        "stance": "The top-level entry function in `pipeline.py` MUST be named exactly `run_pipeline`. Public helper functions named `run_<phase>` are permitted alongside, but `run_pipeline` MUST be present and `melleafy.json:entry_signature` MUST name it. The smoke-check loader treats the manifest as authoritative."
+      },
+      "implementation": {
+        "ground_truth": "The smoke-check loader at `toolkit/file_utils.py:load_skill_pipeline` reads `melleafy.json:entry_signature` and invokes the named function. When the manifest is absent, it falls back to `run_pipeline` by name. Anything else either crashes or invokes the wrong function.",
+        "surface_artifact": "<package>/pipeline.py + <package>/melleafy.json",
+        "key_invariant": "Top-level `FunctionDef run_pipeline` exists in `pipeline.py`. `melleafy.json:entry_signature` (when present) starts with `run_pipeline(`. The lint hard-fails when `pipeline.py` is absent — covering descriptor-mode renderer rejections and similar pre-Step-7 omissions."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/compile/lints.py::lint_pipeline_entry_canonical",
+        "severity": "error",
+        "exit_code": "LINT_FAIL"
+      },
+      "coherence_checks": [
+        {
+          "id": "C-DIRECTIVE-DOCUMENTS-RULE-3-2",
+          "description": "The directive doc must contain a section explicitly named or referring to Rule 3-2 that tells the LLM `run_pipeline` is the canonical entry-point name. Failure means the lint is enforcing something the LLM was never told.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_pipeline_entry_canonical.py::test_directive_documents_rule_3_2"
+        },
+        {
+          "id": "C-MISSING-CANONICAL-ENTRY-FAILS",
+          "description": "A `pipeline.py` without a `run_pipeline` function MUST fail the lint. Guards the core contract.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_pipeline_entry_canonical.py::test_missing_run_pipeline_fails"
+        },
+        {
+          "id": "C-MISSING-PIPELINE-PY-FAILS",
+          "description": "An absent `pipeline.py` MUST fail the lint (not skip silently). The directive explicitly states this: descriptor-mode renderer rejections and any other pre-Step-7 omission of `pipeline.py` must surface as a lint failure.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_pipeline_entry_canonical.py::test_absent_pipeline_py_fails"
+        },
+        {
+          "id": "C-WRONG-MANIFEST-ENTRY-FAILS",
+          "description": "When `melleafy.json:entry_signature` starts with anything other than `run_pipeline(`, the lint MUST fail. Guards the manifest-side of the contract.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_pipeline_entry_canonical.py::test_wrong_manifest_entry_fails"
+        },
+        {
+          "id": "C-DECLARED-SEVERITY-MATCHES",
+          "description": "Registry severity must match _LINT_SEVERITY[pipeline-entry-canonical].",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_pipeline_entry_canonical.py::test_declared_severity_matches_central_table"
+        }
+      ]
+    },
+    "runtime-defaults-bound": {
+      "motivation": "Registered 2026-05-19 to guard the three-place wiring (CLI flag → `claude_directives.py` writer → `lints.py` validator) that injects backend/model defaults into the system prompt AND the `runtime_directive.json` artefact AND the `config.py` writer. Any one place drifting means user-facing CLI overrides silently fail to take effect — a known sensitive area. The registry entry surfaces the three faces so anyone changing one is reminded to change the others.",
+      "about": "`<package>/config.py`'s `BACKEND` and `MODEL_ID` module-level constants MUST match the values written to `<package>/intermediate/runtime_directive.json`. The compile pipeline writes the directive pre-mellea-fy from `.claude/data/runtime_defaults.json` (or CLI overrides) AND injects the same values into the LLM's system prompt; this lint verifies the LLM honoured the instruction. Three-place wiring (CLI flag → claude_directives writer → lint) makes this drift-prone.",
+      "category": "static-lint",
+      "directive": {
+        "doc": ".claude/commands/mellea-fy-generate.md",
+        "section": "C8 backend rule (line ~67)",
+        "stance": "`BACKEND` and `MODEL_ID` values are injected via the system prompt by the compile pipeline (sourced from `.claude/data/runtime_defaults.json`, with `--skill-backend` / `--skill-model` CLI overrides). The LLM MUST emit them in `config.py` exactly as instructed — divergence is a hard failure. When `config_emission.json` is absent, the wrapper synthesises it deterministically from `runtime_directive.json`."
+      },
+      "implementation": {
+        "ground_truth": "Three coordinated writers: (1) `cli.py` accepts `--skill-backend` / `--skill-model` overrides, (2) `compile/claude_directives.py` writes `intermediate/runtime_directive.json` AND embeds the same values into the system prompt, (3) the deterministic `config.py` writer emits the constants from `config_emission.json` (synthesised from the directive when LLM omits emission).",
+        "surface_artifact": "<package>/config.py + <package>/intermediate/runtime_directive.json",
+        "key_invariant": "`config.py:BACKEND` == `runtime_directive.json:backend` AND `config.py:MODEL_ID` == `runtime_directive.json:model_id`. When the directive is absent, the lint skips rather than failing."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/compile/lints.py::lint_runtime_defaults_bound",
+        "severity": "error",
+        "exit_code": "LINT_FAIL"
+      },
+      "coherence_checks": [
+        {
+          "id": "C-DIRECTIVE-COVERS-C8",
+          "description": "The directive doc explains the C8 backend rule — that BACKEND/MODEL_ID come from the system prompt and divergence is hard-failed. Failure means the lint enforces a contract the LLM was never told about.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_runtime_defaults_bound.py::test_directive_covers_c8_backend_rule"
+        },
+        {
+          "id": "C-CONFIG-MATCHES-PASSES",
+          "description": "When `config.py:BACKEND/MODEL_ID` match the directive values, the lint must pass.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_runtime_defaults_bound.py::test_matching_config_passes"
+        },
+        {
+          "id": "C-CONFIG-MISMATCH-FAILS",
+          "description": "When `config.py:BACKEND` (or `MODEL_ID`) differs from the directive, the lint must fail with a precise message naming actual vs expected.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_runtime_defaults_bound.py::test_mismatch_fails_with_clear_message"
+        },
+        {
+          "id": "C-MISSING-DIRECTIVE-SKIPS",
+          "description": "When `runtime_directive.json` is absent (older pipelines that didn't write it), the lint must skip rather than fail. The directive explicitly states this.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_runtime_defaults_bound.py::test_missing_directive_skips"
+        },
+        {
+          "id": "C-DECLARED-SEVERITY-MATCHES",
+          "description": "Registry severity must match _LINT_SEVERITY[runtime-defaults-bound].",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_runtime_defaults_bound.py::test_declared_severity_matches_central_table"
+        }
+      ]
+    },
+    "variable-safety": {
+      "motivation": "Registered 2026-05-19 from real-world recurrences: sub-check A fired on gdpr-breach-sentinel's `_safe_parse_with_fallback` (`raw` referenced in except, bound only in try). Sub-check C added 2026-05-20 from the same skill's `assemble_dashboard` UnboundLocalError — a different name-binding bug class entirely (conditional binding + unconditional return). Python's name-binding rules make these patterns easy for the LLM to emit but the runtime crashes are input-dependent (work on some fixtures, fail on others). The registry entry binds all three sub-checks (A: try/except, B: builtin-shadowing, C: conditional-binding) to a single coherent rule so any future binding-related sub-check joins the same lint.",
+      "about": "Two sub-checks: (A) no uninitialised names referenced in `except` or `finally` blocks — if the exception fires before the assignment, the handler raises `NameError`; (B) no builtins shadowed by local assignments in module-level scope (e.g., `list = ...`, `dict = ...`) — silently breaks the builtin in this and all child scopes. Sub-check A fired on gdpr-breach-sentinel-oliver-schmidt-prietz 2026-05-19 on a real LLM-emitted `_safe_parse_with_fallback` that referenced `raw` in an except block where the assignment was inside the try.",
+      "category": "static-lint",
+      "directive": {
+        "doc": ".claude/commands/mellea-fy-validate.md",
+        "section": "variable-safety: two sub-checks (line ~41)",
+        "stance": "For sub-check A: any name referenced in an `except` or `finally` block must be assigned BEFORE the enclosing `try` statement. The correct pattern is `payload = None` (or a sentinel) before `try: payload = build_payload(...)`. For sub-check B: do not assign to builtin names (`list`, `dict`, `str`, etc.) at module level."
+      },
+      "implementation": {
+        "ground_truth": "Python's name-binding rules: a name first bound inside a `try` body is unbound when an exception fires before that assignment. Python's builtin scope: assigning to a builtin name in module scope shadows the builtin in all child scopes within the module.",
+        "surface_artifact": "every `.py` file under `<package>/` except files in skipped paths",
+        "key_invariant": "(A) For every `Name` reference in an `except` or `finally` block, there's an `Assign`/`AnnAssign` to that name that strictly precedes the enclosing `try`. (B) No module-level `Assign` whose target's `id` is a Python builtin name."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/compile/lints.py::lint_variable_safety",
+        "severity": "error",
+        "exit_code": "LINT_FAIL"
+      },
+      "coherence_checks": [
+        {
+          "id": "C-VALIDATE-DOC-EXPLAINS-LINT",
+          "description": "`mellea-fy-validate.md` explains both sub-checks A and B with concrete examples. Failure means the lint enforces patterns the validate doc doesn't describe.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_variable_safety.py::test_validate_doc_explains_subchecks"
+        },
+        {
+          "id": "C-GENERATE-DOC-COVERS-PATTERN",
+          "description": "The mellea-fy-generate.md directive should preemptively tell the LLM the bind-before-try pattern, so the LLM doesn't emit the buggy code in the first place. Currently expected to fail — generate.md may not yet cover this pattern. The failure is the drift we want to surface so the doc can be improved.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_variable_safety.py::test_generate_doc_covers_bind_before_try_pattern",
+          "xfail_until": "2026-06-15"
+        },
+        {
+          "id": "C-UNINIT-IN-EXCEPT-FAILS",
+          "description": "Code that references `x` in an except block where `x` is only bound inside the try body must fail the lint. The exact pattern from the gdpr-breach-sentinel failure.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_variable_safety.py::test_uninit_in_except_fails"
+        },
+        {
+          "id": "C-BIND-BEFORE-TRY-PASSES",
+          "description": "Code that initialises `x = None` before the try block must pass — the correct pattern the directive recommends.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_variable_safety.py::test_bind_before_try_passes"
+        },
+        {
+          "id": "C-COND-BIND-UNCOND-RETURN-FAILS",
+          "description": "Sub-check C — a return statement that references a name bound only in some if/elif/else branches must fail the lint. This is the exact gdpr-breach-sentinel `assemble_dashboard` UnboundLocalError pattern from 2026-05-20: `assemble_dashboard` was bound only in branch 1 of a 4-branch if; `return assemble_dashboard` ran unconditionally and crashed on other branches.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_variable_safety.py::test_cond_bind_uncond_return_fails"
+        },
+        {
+          "id": "C-ALL-BRANCHES-BIND-PASSES",
+          "description": "Sub-check C — when every falling-through branch of an if/elif/else binds the name, the unconditional return is safe and must pass. Guards against the sub-check becoming over-eager.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_variable_safety.py::test_all_branches_bind_passes"
+        },
+        {
+          "id": "C-RAISING-BRANCH-IGNORED",
+          "description": "Sub-check C — a branch that raises rather than binds contributes nothing to post-if scope (it doesn't reach the return). So if 3 of 4 branches bind X and the 4th raises, the return-X is still safe. The actual gdpr-breach pipeline has this exact shape (the else-branch raises); the sub-check must respect that.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_variable_safety.py::test_raising_branch_ignored"
+        },
+        {
+          "id": "C-DECLARED-SEVERITY-MATCHES",
+          "description": "Registry severity must match _LINT_SEVERITY[variable-safety].",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_variable_safety.py::test_declared_severity_matches_central_table"
+        }
+      ]
+    },
+    "step-7-report-writer-schema-coherence": {
+      "motivation": "Registered 2026-05-19 after THREE separate writer-vs-schema drifts in a single week: (1) `warnings_escalated_by_smoke` was written as bool but schema typed it as `array<string>`; (2) `column` values were emitted as 0-indexed (Python `ast.col_offset`) but the schema required `minimum: 1`; (3) smoke-check `verdict` was translated from `passed/failed/skipped` (smoke_check.py canonical) into `pass/fail/skipped` (lints.py wrong direction). Each was a silent producer-vs-consumer drift the schema-validation warning surfaced, then the registry captured. This entry encodes the lesson: the writer and the schema MUST agree by construction, not by convention.",
+      "about": "The Step 7 report writer (`lints.py::run_lints`) emits `<package>/intermediate/step_7_report.json` and validates the payload against `compile/schemas/step_7_report.schema.json` at write time. The two artefacts must agree on EVERY field's name, type, and required-ness. Two real drifts were caught this session and surfaced as the schema-validation warning (`payload does not conform to its schema`): (1) `warnings_escalated_by_smoke` written as bool, schema typed it as `array<string>`; (2) `column` written as 0-indexed from `ast.col_offset`, schema requires `minimum: 1` (1-indexed). Both have been fixed; this entry guards against future regressions.",
+      "category": "schema-validation",
+      "directive": {
+        "doc": "src/mellea_skills_compiler/compile/schemas/step_7_report.schema.json",
+        "section": "(self — the schema is the directive for consumers)",
+        "stance": "Every field in the emitted Step 7 report must conform to its declared shape in the schema. Required fields must be present. Field types must match. Field-level constraints (minimum, enum, pattern) must be honoured. The schema is the contract; the writer is the implementation."
+      },
+      "implementation": {
+        "ground_truth": "`compile/lints.py::run_lints` builds the report dict from `LintRunResult` + per-lint `LintResult` entries and writes it to `<package>/intermediate/step_7_report.json`.",
+        "surface_artifact": "<package>/intermediate/step_7_report.json",
+        "key_invariant": "A real Step 7 report produced by `run_lints` validates against `compile/schemas/step_7_report.schema.json` with zero errors. Specific patches: `warnings_escalated_by_smoke` is `list[str]`, never bool; column numbers are 1-indexed (or null); every field declared `required` in the schema appears in the emission."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/compile/lints.py::run_lints",
+        "severity": null,
+        "exit_code": null
+      },
+      "coherence_checks": [
+        {
+          "id": "C-WRITER-OUTPUT-CONFORMS",
+          "description": "Take a synthetic LintRunResult, push it through `run_lints` (or the dict-build code path), validate the resulting payload against the schema with zero errors. End-to-end conformance check.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_step_7_report_writer.py::test_writer_output_validates_against_schema"
+        },
+        {
+          "id": "C-WARNINGS-ESCALATED-IS-LIST",
+          "description": "Regression pin for drift #1: `warnings_escalated_by_smoke` MUST be emitted as a list (possibly empty), never as a boolean. The schema requires array; the writer was previously emitting bool.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_step_7_report_writer.py::test_warnings_escalated_by_smoke_is_list"
+        },
+        {
+          "id": "C-COLUMN-IS-1-INDEXED",
+          "description": "Regression pin for drift #2: every emitted `LintFailure.column` value MUST be either null or >= 1 (1-indexed). Python's `ast.col_offset` is 0-indexed so this requires conversion at write time via `_col_offset_to_schema`.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_step_7_report_writer.py::test_column_values_are_one_indexed_or_null"
+        },
+        {
+          "id": "C-REQUIRED-FIELDS-PRESENT",
+          "description": "Every field declared `required` at the top level of the schema appears in the writer's emission. Catches schema-vs-writer field-name drift before it bites a consumer.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_step_7_report_writer.py::test_required_top_level_fields_present"
+        }
+      ]
+    },
+    "stdlib-arg-types": {
+      "motivation": "Registered 2026-05-20 after the tech-contract (2026-05-19) and gpai-code-of-practice (2026-05-20) compiles both crashed at smoke-check with `'X' object has no attribute 'items'`. The same Mellea-API contract (`grounding_context: dict[str, Component]`) was violated by both LLM emissions in different ways — one passing a pydantic model, the other passing through a string description. The contract IS in `mellea_api_ref.json`'s parameter annotations; nothing was using it for static validation. Registering forces the directive↔implementation↔validation triangle on a type-shape rule we know is silently violated in real emissions.",
+      "about": "Catches the runtime-AttributeError class observed in real compiles (tech-contract 2026-05-19, gpai-code-of-practice 2026-05-20): a Mellea API kwarg with a dict-family annotation receives a clearly-non-dict argument, crashing inside Mellea's instruct chain with `AttributeError: '<type>' object has no attribute 'items'`. Narrow first version: focuses on `grounding_context=` kwarg on session-method calls (`instruct`/`chat`/`act` family). Future expansion can derive the full set of dict-typed Mellea kwargs from `mellea_api_ref.json`.",
+      "category": "static-lint",
+      "directive": {
+        "doc": ".claude/commands/mellea-fy-behaviours.md",
+        "section": "KB on grounding_context shape",
+        "stance": "When calling a Mellea session method (instruct/chat/act and async variants), the `grounding_context=` kwarg MUST be a dict — Mellea iterates it with `.items()` internally. Pass `{}` when no grounding is needed, never `None` or a string or a pydantic model. Pydantic models must be converted via `.model_dump()`."
+      },
+      "implementation": {
+        "ground_truth": "Mellea's `Instruction.__init__` (mellea/stdlib/components/instruction.py) executes `for k, v in grounding_context.items()` unconditionally. A non-dict-like value raises AttributeError. The introspected `mellea_api_ref.json` declares `grounding_context: dict[str, Component]` (or equivalent) on these methods.",
+        "surface_artifact": "intermediate/mellea_api_ref.json (the parameter annotations)",
+        "key_invariant": "Every `<session>.instruct(*, grounding_context=<expr>)` (and variants) has `<expr>` either a dict literal, a `dict(...)` call, a Name with a dict-family annotation, or `None` (treated as empty). Other shapes — string literals, f-strings, names typed as concrete non-dict classes — cause runtime AttributeError."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/compile/lints.py::lint_stdlib_arg_types",
+        "severity": "error",
+        "exit_code": "LINT_FAIL"
+      },
+      "coherence_checks": [
+        {
+          "id": "C-STRING-LITERAL-GROUNDING-CONTEXT-FAILS",
+          "description": "Direct literal mismatch — `m.instruct(grounding_context='hello', ...)` must be flagged. The exact synthetic case for the runtime AttributeError class.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_stdlib_arg_types.py::test_string_literal_grounding_context_fails"
+        },
+        {
+          "id": "C-DICT-LITERAL-GROUNDING-CONTEXT-PASSES",
+          "description": "`m.instruct(grounding_context={})` and `m.instruct(grounding_context={'k': 'v'})` must pass — these are the canonical shapes. Guards the lint from becoming over-eager.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_stdlib_arg_types.py::test_dict_literal_grounding_context_passes"
+        },
+        {
+          "id": "C-NON-DICT-PARAM-GROUNDING-CONTEXT-FAILS",
+          "description": "Tech-contract failure pattern — `def f(ctx: NegotiationContext): m.instruct(grounding_context=ctx, ...)`. The parameter's annotation is a concrete class name (not dict-family), so the value is provably non-dict.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_stdlib_arg_types.py::test_non_dict_param_grounding_context_fails"
+        },
+        {
+          "id": "C-DICT-PARAM-GROUNDING-CONTEXT-PASSES",
+          "description": "`def f(ctx: dict[str, str]): m.instruct(grounding_context=ctx, ...)` must pass — the parameter annotation IS dict-family. Symmetric guard.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_stdlib_arg_types.py::test_dict_param_grounding_context_passes"
+        },
+        {
+          "id": "C-AMBIGUOUS-NAME-NOT-FLAGGED",
+          "description": "A Name reference with no annotation in the visible scope (e.g. a global variable, closure, attribute access) is AMBIGUOUS — we can't statically prove its type. The lint must NOT flag these, otherwise it false-positives on legitimate code. Guards the threshold.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_stdlib_arg_types.py::test_ambiguous_name_not_flagged"
+        },
+        {
+          "id": "C-NO-GROUNDING-CONTEXT-NOT-FLAGGED",
+          "description": "A call that omits `grounding_context=` entirely must NOT be flagged by this lint — the lint scope is when the kwarg IS passed but with the wrong type. The omitted case is the gpai class but a separate problem (Mellea's default behaviour).",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_stdlib_arg_types.py::test_no_grounding_context_not_flagged"
+        },
+        {
+          "id": "C-DECLARED-SEVERITY-MATCHES",
+          "description": "Registry severity must match _LINT_SEVERITY[stdlib-arg-types].",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_stdlib_arg_types.py::test_declared_severity_matches_central_table"
+        }
+      ]
+    },
+    "d2-closest-match-enrichment": {
+      "motivation": "Registered 2026-05-19 as the first non-rule, mechanism-flavoured entry (category `repair-enrichment`). Motivation: every gate failure observed so far names a wrong-but-close symbol (`mellea.backens.ollama`, `mellea.instruct` partial qualification, etc.). Without a `Did you mean X?` hint, the repair LLM goes in blind and often re-emits a different wrong shape (the gpai repair pass produced `mellea.instruct` after we fixed its first emission). The mechanism converts the audit registry's surface knowledge into actionable repair-prompt guidance. Registering captured the contract upfront so Phase 2 wiring lands against explicit coherence checks.",
+      "about": "When a gate (renderer, schema-gate, lint) rejects an LLM emission with an identifiable symbol/path that's close-but-wrong, the repair prompt is augmented with a 'Did you mean X?' hint pointing at the closest valid alternative drawn from the surface. The hint goes to the LLM as part of the next repair round so it can correct the specific mistake rather than re-emit from scratch. Examples: typo on a module path (`from mellea.backens.ollama` → suggest `mellea.backends.ollama`); unknown surface symbol with a near-miss in the introspected surface; unknown kwarg name with a near-miss in the function signature.",
+      "category": "repair-enrichment",
+      "directive": {
+        "doc": ".claude/commands/mellea-fy-repair.md",
+        "section": "How to use closest-match suggestions in repair (planned)",
+        "stance": "When the repair prompt includes a 'Did you mean X?' hint, the LLM treats it as a high-confidence rewrite suggestion. The LLM should adopt the suggestion verbatim unless there's a domain reason to reject it. The hint is derived from surface ground truth (e.g. mellea_api_ref.json), not from the model's own guess — so it represents what the runtime actually exposes."
+      },
+      "implementation": {
+        "ground_truth": "rapidfuzz token-set ratio against the relevant surface set (module paths from mellea_api_ref.json:.modules; kwarg names from a single function's signature; symbol paths from the descriptor IR's outputs section). Match accepted only when the top candidate's score >= a threshold AND it dominates the second-best by a margin — mirroring C1's symbol-gate fuzzy stage discipline.",
+        "surface_artifact": "intermediate/mellea_api_ref.json (modules + signatures), intermediate/descriptor_emission.json (outputs + state)",
+        "key_invariant": "Suggestions are drawn from a SPECIFIC, well-defined surface set per failure class. The closest-match algorithm does not fabricate suggestions or pull from across surfaces (e.g. a kwarg typo gets kwarg-set suggestions, not module-path suggestions). When no candidate meets the threshold/dominance bar, NO suggestion is emitted — false confidence is worse than no hint."
+      },
+      "validation": {
+        "location": null,
+        "severity": null,
+        "exit_code": null
+      },
+      "coherence_checks": [
+        {
+          "id": "C-CLOSEST-MATCH-FINDS-NEAR-MISS",
+          "description": "Given a known typo of a real surface symbol (e.g. `mellea.backens.ollama` for `mellea.backends.ollama`), the closest-match algorithm returns the real symbol as the top match. Failure means the algorithm or its thresholds are off — the mechanism would emit no hint where one is warranted, or worse, suggest something unrelated.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_d2_closest_match.py::test_known_module_typo_resolves_to_real_path"
+        },
+        {
+          "id": "C-NO-FALSE-CONFIDENCE",
+          "description": "When the failing symbol has no plausible near-miss in the surface (e.g. a totally fabricated name unlike any real module), the algorithm returns NO suggestion — not an arbitrary low-confidence match. Guards against the LLM following a misleading hint into a worse emission.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_d2_closest_match.py::test_no_near_miss_returns_no_suggestion"
+        },
+        {
+          "id": "C-PROMPT-INCLUDES-SUGGESTION",
+          "description": "When the closest-match algorithm returns a suggestion, the repair prompt actually contains the suggestion text in a form the LLM can act on (e.g. `Did you mean 'mellea.backends.ollama'?`). Failure means wiring drift — the algorithm computed the hint but the prompt-builder dropped it before sending.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_d2_closest_match.py::test_repair_prompt_carries_suggestion"
+        },
+        {
+          "id": "C-PROMPT-OMITS-WHEN-NO-MATCH",
+          "description": "When there's no plausible suggestion, the repair prompt does NOT include a 'Did you mean' line. Symmetric guard to C-NO-FALSE-CONFIDENCE — the prompt-builder must respect the algorithm's 'no match' verdict and not synthesize its own suggestion.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_d2_closest_match.py::test_repair_prompt_omits_suggestion_when_no_match"
+        },
+        {
+          "id": "C-SCOPE-MATCHES-FAILURE-CLASS",
+          "description": "The candidate set used for closest-match is scoped to the failure's class — e.g. a kwarg-typo failure searches the function's signature, not the entire module surface; a module-path failure searches `mellea_api_ref.json:.modules`, not symbol leaf names. Failure means the algorithm conflates failure classes and emits structurally-wrong suggestions.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_d2_closest_match.py::test_candidate_set_scoped_to_failure_class"
+        },
+        {
+          "id": "C-DIRECTIVE-DOC-EXISTS",
+          "description": "The directive doc the registry points at must exist and contain a section that explains how the LLM should use 'Did you mean' suggestions in repair mode. Failure means the LLM is being sent hints it has no documented stance on — undocumented mechanism.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_d2_closest_match.py::test_directive_doc_section_exists",
+          "xfail_until": "2026-06-15"
+        }
+      ]
+    },
+    "descriptor-symbol-gate": {
+      "motivation": "Registered 2026-05-20 after a descriptor-mode compile surfaced the failure class `symbol gate rejected 1 symbol(s); first: '<bare_symbol>' at state[].symbol; closest candidates: (no candidates)`. Failure shape: a bare Mellea symbol that IS present in the introspected surface — but at MULTIPLE paths, all pointing to the same Python definition via shared `defined_in` (e.g. a top-level re-export AND the canonical definition module). The gate's `by_leaf` and `by_suffix` indexes record every such path, so stages 2 (suffix unification) and 4 (bare-name) each see N>1 hits and fail their uniqueness predicate; stages 3 and 5 miss too; the candidate list ends up empty when rapidfuzz isn't installed. This is **the gate's 'fail loud on ambiguity' discipline mis-classifying re-exports as ambiguity** — multiple surface paths pointing to one Python symbol are unambiguous *as a Python target*, only ambiguous *as a surface path*. The audit registry didn't catch the bug pre-shipping because the gate had no entry — it shipped with zero coherence checks. This entry both registers the contract going forward AND xfails the re-export test until the resolver fix lands (task tracked separately).",
+      "about": "Pre-render gate that walks the descriptor IR and resolves every Mellea-API `symbol` field against the introspected Mellea surface. Recognised non-Mellea symbols (local helpers, Python type markers like `builtins.dict`, fully-qualified package paths) are skipped. Mellea references are run through a 5-stage matcher: exact, suffix unification, module-scoped leaf, bare-name, and (optional) fuzzy fallback. Unambiguous matches are silently auto-normalised in-place and telemetered to `intermediate/symbol_normalisations.jsonl`; ambiguous or unresolvable symbols are surfaced with top-K candidate suggestions for the repair pipeline.",
+      "category": "semantic-rule",
+      "directive": {
+        "doc": ".claude/commands/mellea-fy-generate.md",
+        "section": "Symbol gate: pre-render normalisation",
+        "stance": "The LLM may emit partially-qualified Mellea symbols (bare class-method shorthand like `MelleaSession.instruct`, module-without-class like `mellea.stdlib.session.chat`, or bare names like `MelleaSession`). The gate will auto-normalise these to canonical surface paths when the surface admits exactly one match. If multiple distinct symbols match, the LLM gets a structured failure with top-3 candidates to choose from. Re-exports (multiple surface paths pointing to the same underlying Python symbol, identifiable by shared `defined_in`) MUST resolve to the canonical defining path, not be reported as ambiguity."
+      },
+      "implementation": {
+        "ground_truth": "Every `symbol` field anywhere in the descriptor IR that is classified as a Mellea API reference by `_looks_like_mellea_reference` must resolve via the multi-stage matcher to a unique canonical path that itself passes `is_valid_for_renderer` (longest module-prefix split, head attribute present in that module's symbol set). Symbols classified as non-Mellea (loader helpers, type markers, package-qualified locals) are passed through unflagged — they are the renderer / lint suite's responsibility downstream.",
+        "surface_artifact": "intermediate/mellea_api_ref.json (introspected surface), intermediate/symbol_normalisations.jsonl (telemetry record per auto-rewrite)",
+        "key_invariant": "When multiple surface paths share the same `defined_in` module, they are aliases of one Python symbol — re-exports, not collisions. The gate's resolution stages MUST dedupe such aliases to the canonical path (the one whose module prefix equals `defined_in`) before applying uniqueness predicates. A `by_leaf` or `by_suffix` lookup that returns N>1 paths but only one canonical-target is an unambiguous resolution, not an ambiguity."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/compile/descriptor_symbol_gate.py::run_symbol_gate",
+        "severity": "error",
+        "exit_code": null
+      },
+      "coherence_checks": [
+        {
+          "id": "C-EXACT-CANONICAL-PASSES",
+          "description": "A fully-qualified canonical Mellea path (e.g. `mellea.stdlib.session.MelleaSession.instruct`) passes stage 1 (`is_valid_for_renderer`) unchanged with method='exact'. Failure means the head-symbols index doesn't reflect the surface — every other stage compounds from this base.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_descriptor_symbol_gate.py::test_exact_canonical_path_passes"
+        },
+        {
+          "id": "C-SUFFIX-UNIQUE-NORMALISES",
+          "description": "A unique dotted suffix of exactly one surface path (e.g. `MelleaSession.instruct` when only one such path exists) is auto-normalised to the full canonical path with method='suffix'. Failure means stage 2 is over- or under-firing.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_descriptor_symbol_gate.py::test_unique_suffix_auto_normalises"
+        },
+        {
+          "id": "C-MODULE-SCOPED-LEAF-NORMALISES",
+          "description": "The 'dropped class prefix' pattern (e.g. `mellea.stdlib.session.chat` → `mellea.stdlib.session.MelleaSession.chat`) is auto-normalised via stage 3 when exactly one symbol in the named module has that leaf. Failure means the most common LLM partial-qualification mistake regressed.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_descriptor_symbol_gate.py::test_module_scoped_leaf_auto_normalises"
+        },
+        {
+          "id": "C-REEXPORT-RESOLVES-UNIQUELY",
+          "description": "A bare symbol whose surface entries are ALL re-exports of one canonical definition (identifiable by shared `defined_in`) resolves uniquely to the canonical path. Concrete case from 2026-05-20: bare `start_session` has surface entries at `mellea.start_session` and `mellea.stdlib.session.start_session`, both with `defined_in='mellea.stdlib.session'`. The gate must dedupe these aliases and return `mellea.stdlib.session.start_session`, not fail with ambiguity. Failure means the resolver still treats re-exports as collisions — the bug this entry was originally registered to prevent.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_descriptor_symbol_gate.py::test_reexport_aliases_resolve_to_canonical"
+        },
+        {
+          "id": "C-GENUINE-COLLISION-FAILS",
+          "description": "When two DISTINCT Python symbols (different `defined_in`) share a leaf name, resolution must fail with the candidates surfaced — the gate's 'fail loud on ambiguity' discipline remains correct for real collisions. Paired guard against C-REEXPORT-RESOLVES-UNIQUELY: the fix for re-exports must not silently swallow genuine collisions in the opposite direction.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_descriptor_symbol_gate.py::test_genuine_collision_still_fails_with_candidates"
+        },
+        {
+          "id": "C-NON-MELLEA-SKIPPED",
+          "description": "Symbols that don't look like Mellea references (e.g. `loader.SkillLoader`, `builtins.dict`, fully-qualified `<package>_mellea.X`) are skipped by `_looks_like_mellea_reference` and pass through the gate without being validated against the surface. Failure means the heuristic regressed and the gate starts rejecting valid local references.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_descriptor_symbol_gate.py::test_non_mellea_symbols_are_skipped"
+        },
+        {
+          "id": "C-DIRECTIVE-DOC-EXISTS",
+          "description": "The directive doc for this gate must exist and describe the resolution stages so the LLM has a documented stance on what partial qualifications are accepted vs rejected. Currently null — no slash-command doc covers the gate. Failure post-deadline means the directive face is still missing while the validation face is live; classic Shankar et al. criteria-drift territory.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_descriptor_symbol_gate.py::test_directive_doc_section_exists"
+        }
+      ]
+    },
+    "r-sem-disposition-consistent": {
+      "motivation": "Registered 2026-05-20 after a descriptor-mode compile surfaced the failure class `dependency '<id>' with kind='tool' and disposition '<X>' is missing required field 'signature' [R-SEM-DISPOSITION-CONSISTENT]`. The rule already existed at `semantic_rules.py:_check_dispositions` (referenced 2026-05-14) but was NEVER registered — classic three-face drift: the validation face was live and rejecting LLM emissions while the directive face was undocumented and the implementation→validation contract wasn't audited. The descriptor schema's conditional-required logic also under-covered it: the schema required `path` when disposition is bundle/load_from_disk but did NOT require `signature` when kind=tool with a non-bundling disposition — so the (later) semantic-rule pass was the first thing the LLM heard about the requirement. Per discipline (structural-by-construction > pre-flight gate > directive > prompt-only; deep research 2026-05-20 — schema field naming is a ~21× lever on LLM emission accuracy): the structural fix is to extend the schema's `allOf` to require `signature` when `kind=='tool'` AND `disposition` in needs_signature. That fix is tracked by C-SCHEMA-ENFORCES-SIG-WHEN-TOOL-NEEDS (xfail until landed). The semantic rule remains needed for the parseability check (`_is_parseable_signature` — JSON Schema cannot express 'must be a valid Python signature string').",
+      "about": "Enforces that descriptor dependencies declare the supporting fields required by their (kind, disposition) pair: `path` for bundle/load_from_disk dispositions; `signature` (parseable, e.g. `(query: str) -> list[str]`) for tool-kind deps with disposition in {delegate_to_runtime, real_impl, stub, mock, external_input}; and (for tool/real_impl deps that declare a `symbol`) the symbol resolves in the introspected Mellea surface. The renderer needs these fields to scaffold the dependency correctly downstream — absent or malformed values produce silently-broken Python.",
+      "category": "semantic-rule",
+      "directive": {
+        "doc": ".claude/commands/mellea-fy-deps.md",
+        "section": "Required descriptor fields per (kind, disposition)",
+        "stance": "When emitting a `dependency` whose `kind` is `tool` and whose `disposition` is one of {delegate_to_runtime, real_impl, stub, mock, external_input}, the LLM MUST also emit a `signature` field carrying the Python call signature of the dependency (shape: `(arg: Type, ...) -> Return` or `(arg: Type, ...)`). When `disposition` is `bundle` or `load_from_disk`, the LLM MUST emit a `path` field."
+      },
+      "implementation": {
+        "ground_truth": "The renderer's dependency-handling code paths require these supporting fields to be present: `tools.py` / `constrained_slots.py` scaffolds use `signature` to declare the function shape; `bundled-asset-path-resolution` uses `path` to locate on-disk resources. When the LLM omits them, downstream rendering produces malformed or silently-incomplete Python — the dependency 'works' structurally but fails at runtime. The rule encodes the renderer's actual structural needs at the validation boundary.",
+        "surface_artifact": "intermediate/descriptor_emission.json (.dependencies[])",
+        "key_invariant": "For every dependency record, the (kind, disposition) pair selects a non-empty set of REQUIRED supporting fields. The semantic rule enforces THIS set; the JSON Schema's `allOf` block enforces a SUBSET of the same. The two must agree on what's required — drift between them means the LLM may emit a descriptor that passes schema but fails semantic, or vice versa. Closing the drift means moving as many structural requirements as JSON Schema can express into the schema (where the LLM sees them earlier and more reliably), leaving the semantic rule to enforce only the constraints JSON Schema can't express (parseability of the signature string; symbol-resolves-in-surface)."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/descriptor/semantic_rules.py::_check_dispositions",
+        "severity": "error",
+        "exit_code": "DESCRIPTOR_SCHEMA_FAIL"
+      },
+      "coherence_checks": [
+        {
+          "id": "C-TOOL-NEEDS-SIG-WITHOUT-FAILS",
+          "description": "The original failure mode: a `kind=tool` dependency with `disposition=stub` (or any other in needs_signature) and no `signature` field MUST fail the rule with R-SEM-DISPOSITION-CONSISTENT. Failure means the rule silently lets the LLM under-emit the field, regressing the 2026-05-20 incident.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_disposition_consistent.py::test_tool_needs_signature_without_signature_fails"
+        },
+        {
+          "id": "C-TOOL-NEEDS-SIG-WITH-PASSES",
+          "description": "Paired positive: same tool dependency WITH a parseable `signature` passes. Failure means the rule is over-restrictive — flagging well-formed dependencies as broken.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_disposition_consistent.py::test_tool_needs_signature_with_signature_passes"
+        },
+        {
+          "id": "C-BUNDLE-WITHOUT-PATH-FAILS",
+          "description": "A dependency with disposition `bundle` (or `load_from_disk`) and no `path` MUST fail. Paired with C-TOOL-NEEDS-SIG-WITHOUT-FAILS — both encode the same structural pattern (disposition selects required supporting field), and both branches of the rule must remain enforcing.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_disposition_consistent.py::test_bundle_without_path_fails"
+        },
+        {
+          "id": "C-UNPARSEABLE-SIG-FAILS",
+          "description": "A tool/stub dependency with `signature='not a real signature string'` (no parens, no `(args) -> return` shape) MUST fail the parseability check (semantic_rules.py:1492). This is the part of the rule that JSON Schema CANNOT express — the structural-fix pathway can move presence-requiredness into the schema but the parseability check must stay in the semantic rule.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_disposition_consistent.py::test_unparseable_signature_fails"
+        },
+        {
+          "id": "C-NON-TOOL-NO-SIG-PASSES",
+          "description": "A non-tool dependency (e.g. `kind=file`, `kind=secret`, `kind=data`) with disposition=stub and no signature MUST pass — the signature requirement is gated on `kind=='tool'`. Failure means the rule has over-generalised across kinds; would flag valid file/secret/data stubs as broken.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_disposition_consistent.py::test_non_tool_kind_without_signature_passes"
+        },
+        {
+          "id": "C-SCHEMA-ENFORCES-SIG-WHEN-TOOL-NEEDS",
+          "description": "The descriptor schema's `allOf` block MUST require `signature` when `kind=='tool'` AND `disposition` is in the needs_signature set. This is the structural-fix coherence check: the LLM sees the schema first, and a structural requirement there is a ~21× emission-accuracy lever vs catching the omission at the (later) semantic-rule pass. Currently the schema requires `path` for bundle/load_from_disk but does NOT require `signature` for tool-needs-signature — closing the asymmetry is task #4 Part B.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_disposition_consistent.py::test_schema_structurally_requires_signature_for_tool_needs_signature"
+        },
+        {
+          "id": "C-DIRECTIVE-DOC-EXISTS",
+          "description": "A slash-command directive doc MUST state the rule's contract to the LLM (which (kind, disposition) pairs require which supporting fields). Currently null — the LLM is being graded on a constraint nothing told it about, the textbook Shankar et al. criteria-drift case. When written, set directive.doc + directive.section and this check verifies they resolve.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_disposition_consistent.py::test_directive_doc_section_exists",
+          "xfail_until": "2026-06-30"
+        }
+      ]
+    },
+    "r-sem-ref": {
+      "motivation": "Registered 2026-05-20 after a descriptor-mode compile surfaced the failure class `bound_to ref '#/state/<id>' does not resolve to a declared state.id, input name, or prior node id [R-SEM-REF]` repeated across most pipeline nodes (60+ total errors from one wrong-shape pattern). Failure shape: the LLM emits **JSON Pointer syntax** (`#/state/<name>`, `#/inputs/<name>`) for value-binding refs where the resolver expects the **plain identifier string** (`<name>`). This is a predictable training-data hallucination — JSON Schema's `$ref` mechanism uses JSON Pointers, and the LLM transfers the convention. The two faces were each individually correct but mutually under-specified: the schema's `Ref.ref` field carried no pattern (just `{type: string, minLength: 1}`), so the JSON Pointer string passed structural validation and the failure surfaced only at the (later) semantic-rule resolution; the directive doc documented ref **scope** (against state/inputs/prior-nodes) but not ref **syntax**. The rule was enforced live from six call sites in `semantic_rules.py` without an audit-registry entry — third such case in two days. Per discipline (structural-by-construction; deep research ~21× field-naming lever): the structural fix is to tighten `Ref.ref` to `pattern: \"^[a-z_][a-z0-9_]*$\"` (mirroring the `state.id` pattern). The semantic rule is kept as a back-stop: it covers the case where the syntax is right but the identifier doesn't resolve (typo, out-of-scope). The two distinct ref shapes in the schema — `Ref` (plain identifier, what this rule guards) vs `SchemaRef` (JSON Pointer to descriptor schemas, intentionally `^#/schemas/`) — must remain orthogonal.",
+      "about": "Every value-binding ref in the descriptor IR (`bound_to.ref`, `over.ref`, `on.ref`, ArgValue's `{ref: ...}` variant) MUST be a plain identifier string that resolves against the descriptor's `state[].id`, `inputs[].name`, or a prior pipeline-node `id`. JSON Pointer syntax (`#/state/...`) is rejected by the schema (`Ref.ref` pattern) and by the semantic rule (visible_ids resolution). The schema's distinct `SchemaRef` shape — used for `#/schemas/<Name>` references — is unaffected and remains JSON Pointer.",
+      "category": "semantic-rule",
+      "directive": {
+        "doc": ".claude/commands/mellea-fy-generate.md",
+        "section": "`ref` shape",
+        "stance": "Refs to state/inputs/prior-node ids are PLAIN identifier strings — `{\"ref\": \"session\"}` (✅), NOT `{\"ref\": \"#/state/session\"}` (❌). JSON Pointer is reserved for the `SchemaRef` shape (`{\"ref\": \"#/schemas/Foo\"}`) and the output-binding form (`#/outputs/<name>`). The two ref shapes are distinct `$defs` entries in the descriptor schema and must not be conflated. The schema's `Ref.ref` field carries `pattern: ^[a-z_][a-z0-9_]*$` so JSON Pointer syntax is rejected structurally; the semantic rule then verifies the identifier actually resolves to a visible scope member."
+      },
+      "implementation": {
+        "ground_truth": "The resolver maintains a `visible_ids` set populated from `state[].id`, `inputs[].name`, and prior pipeline-node `id`s in the same composition scope. A ref resolves iff its value is present in that set. JSON Pointer strings can never appear in `visible_ids` because state/input/node ids are bare identifiers, so a JSON Pointer ref always fails resolution.",
+        "surface_artifact": "intermediate/descriptor_emission.json (every `ref` field in `bound_to`, `over`, `on`, and ArgValue branches)",
+        "key_invariant": "The schema's `Ref.ref` pattern and the resolver's `visible_ids` membership check enforce the same shape constraint at two layers. The structural check (schema pattern) fires first and gives a clean rejection message; the semantic check (visible_ids lookup) is the back-stop that catches scope violations the pattern cannot express (typos, references to siblings outside the current composition's scope). The two MUST agree on what counts as a syntactically-valid ref string."
+      },
+      "validation": {
+        "location": null,
+        "severity": "error",
+        "exit_code": "DESCRIPTOR_SCHEMA_FAIL"
+      },
+      "coherence_checks": [
+        {
+          "id": "C-PLAIN-ID-IN-SCOPE-RESOLVES",
+          "description": "A ref whose value is a bare identifier matching a `state[].id` / `inputs[].name` / prior-node `id` resolves cleanly — no error. Covers the rule's normative case across the three sources of visible ids.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_ref.py::test_plain_identifier_in_visible_ids_resolves"
+        },
+        {
+          "id": "C-UNKNOWN-ID-FAILS",
+          "description": "A ref whose value is a bare identifier NOT in visible_ids fails with R-SEM-REF and a message naming the source of truth (`state.id, input name, or prior node id`). Guard against the rule going too lenient.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_ref.py::test_unknown_identifier_fails"
+        },
+        {
+          "id": "C-JSON-POINTER-FAILS-AT-SCHEMA",
+          "description": "A JSON Pointer ref string like `#/state/session` is rejected by JSON Schema validation against `$defs.Ref` (the `^[a-z_][a-z0-9_]*$` pattern fails the `#` character). This is the structural-fix coherence check — closes the same asymmetry as the disposition-signature structural fix.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_ref.py::test_json_pointer_ref_fails_at_schema"
+        },
+        {
+          "id": "C-JSON-POINTER-FAILS-AT-SEMANTIC",
+          "description": "Even when bypassing the schema, a JSON Pointer ref string fails the semantic rule's visible_ids resolution — the back-stop layer. Guards against a schema regression silently re-admitting JSON Pointer syntax.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_ref.py::test_json_pointer_ref_fails_at_semantic"
+        },
+        {
+          "id": "C-SCHEMA-REF-UNAFFECTED",
+          "description": "Schema references via the distinct `SchemaRef` shape (`{ref: \"#/schemas/Foo\"}`) MUST continue to accept JSON Pointer syntax. The Ref/SchemaRef separation is a deliberate design choice; tightening Ref.ref must not accidentally break SchemaRef.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_ref.py::test_schema_ref_pointer_still_accepted"
+        },
+        {
+          "id": "C-DIRECTIVE-DOC-EXISTS",
+          "description": "The directive doc section explaining ref shape exists and contains the section anchor recorded in this entry. Closes the directive face for this rule.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_ref.py::test_directive_doc_section_exists"
+        },
+        {
+          "id": "C-POSITIVE-EXAMPLES-PASS-ALL-VALIDATORS",
+          "description": "Pilot cornerstone (added 2026-05-20 with the example face). Every descriptor in `examples.positive` MUST pass both jsonschema validation against descriptor.schema.v0.3.json AND the semantic-rule pipeline (validator.validate). If a positive example fails, either the example is stale (validator tightened legitimately and the example needs updating) or the validator regressed (newly-incorrect rejection). Either way, the maintainer must reconcile the two by-construction; the registry can't silently drift.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_ref.py::test_positive_examples_pass_all_validators"
+        },
+        {
+          "id": "C-NEGATIVE-EXAMPLES-FAIL-VALIDATORS",
+          "description": "Pilot cornerstone. Every descriptor in `examples.negative` MUST fail at least one validator AND the failure must include an error matching the example's `fails_at` attribution (schema-layer pattern mismatch vs semantic-rule visible_ids miss). If a negative example starts passing, the validator boundary moved — either correctly (rule retired) or accidentally (regression). Couples examples and validators so neither can drift without the other surfacing.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_ref.py::test_negative_examples_fail_validators"
+        },
+        {
+          "id": "C-NEAR-MISS-FAILS-WITH-ATTRIBUTION",
+          "description": "Every descriptor in `examples.near_miss` MUST fail with at least one error attributed to R-SEM-REF specifically (not some unrelated rule firing on noise). Near-misses are plausible-mistake shapes that drift detectors care about; if one starts passing, the gate boundary moved relative to the LLM's likely emission shapes.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_ref.py::test_near_miss_examples_fail_with_r_sem_ref_attribution"
+        },
+        {
+          "id": "C-DIRECTIVE-EMBEDS-REGISTRY-SNIPPETS",
+          "description": "The directive doc's `**ref shape**` bullet MUST contain the literal `descriptor.pipeline[0].bound_to` fragment from each registered positive AND negative example. Prevents the doc from drifting away from the registry's source-of-truth; if a maintainer updates a snippet in either place the test catches the asymmetry.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_ref.py::test_directive_embeds_registry_example_snippets"
+        }
+      ],
+      "examples": {
+        "positive": [
+          {
+            "id": "bare-id-resolves-to-state",
+            "rationale": "Canonical valid case: a value-binding ref takes a plain identifier matching the descriptor's state[].id. This is the shape the LLM should emit by default.",
+            "descriptor": {
+              "descriptor_version": "0.3",
+              "mellea_version": "0.5.0",
+              "skill": {"name": "example_skill", "classification": {"primary_axis": "AGENT"}},
+              "inputs": [],
+              "outputs": [],
+              "schemas": {},
+              "state": [{"id": "session", "symbol": "mellea.stdlib.session.start_session"}],
+              "pipeline": [{
+                "kind": "call",
+                "id": "step1",
+                "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+                "args": {},
+                "bound_to": {"ref": "session"}
+              }]
+            }
+          }
+        ],
+        "negative": [
+          {
+            "id": "json-pointer-fails-schema",
+            "rationale": "JSON Pointer syntax in a value-binding ref. Predictable training-data hallucination — JSON Schema's $ref uses pointers, and the LLM transfers the convention. The schema's Ref.ref pattern (^[a-z_][a-z0-9_]*$) rejects this structurally.",
+            "fails_at": "schema",
+            "descriptor": {
+              "descriptor_version": "0.3",
+              "mellea_version": "0.5.0",
+              "skill": {"name": "example_skill", "classification": {"primary_axis": "AGENT"}},
+              "inputs": [],
+              "outputs": [],
+              "schemas": {},
+              "state": [{"id": "session", "symbol": "mellea.stdlib.session.start_session"}],
+              "pipeline": [{
+                "kind": "call",
+                "id": "step1",
+                "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+                "args": {},
+                "bound_to": {"ref": "#/state/session"}
+              }]
+            }
+          },
+          {
+            "id": "valid-pattern-but-out-of-scope",
+            "rationale": "Identifier passes the schema's Ref.ref pattern (lowercase, snake_case) but does not resolve against any declared state.id / input.name / prior-node id. Demonstrates that the semantic-rule layer catches what the structural pattern cannot.",
+            "fails_at": "semantic-rule",
+            "descriptor": {
+              "descriptor_version": "0.3",
+              "mellea_version": "0.5.0",
+              "skill": {"name": "example_skill", "classification": {"primary_axis": "AGENT"}},
+              "inputs": [],
+              "outputs": [],
+              "schemas": {},
+              "state": [{"id": "session", "symbol": "mellea.stdlib.session.start_session"}],
+              "pipeline": [{
+                "kind": "call",
+                "id": "step1",
+                "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+                "args": {},
+                "bound_to": {"ref": "completely_undefined_target"}
+              }]
+            }
+          }
+        ],
+        "near_miss": [
+          {
+            "id": "plausible-pluralization-typo",
+            "rationale": "Plausible LLM emission shape: pluralised version of a real state.id. Passes the schema pattern, fails semantic resolution. Drift detector — if a future validator tweak silently accepts pluralised aliases (e.g. via some fuzzy-match heuristic), this example flips and the maintainer must explicitly acknowledge the new behaviour.",
+            "fails_at": "semantic-rule",
+            "descriptor": {
+              "descriptor_version": "0.3",
+              "mellea_version": "0.5.0",
+              "skill": {"name": "example_skill", "classification": {"primary_axis": "AGENT"}},
+              "inputs": [],
+              "outputs": [],
+              "schemas": {},
+              "state": [{"id": "session", "symbol": "mellea.stdlib.session.start_session"}],
+              "pipeline": [{
+                "kind": "call",
+                "id": "step1",
+                "symbol": "mellea.stdlib.session.MelleaSession.instruct",
+                "args": {},
+                "bound_to": {"ref": "sessions"}
+              }]
+            }
+          }
+        ]
+      }
+    },
+    "r-sem-symbol": {
+      "motivation": "Registered 2026-05-20 as part of audit-coverage Batch 1. R-SEM-SYMBOL fires whenever a `symbol` field in `state[]` or pipeline `call` nodes does not resolve to an entry in the introspected Mellea surface (`mellea_api_ref.json:.modules`). Pre-registration, the rule fired live without an audit entry — third-class drift signal: validation face active, directive face partial (the descriptor accept-set section mentions symbols but does not name R-SEM-SYMBOL), implementation face surface-driven. This entry closes that gap. The surface-driven character of the rule means it has NO Mellea-API hardcoding in its body — when Mellea updates and `mellea_api_ref.json` refreshes, the rule's verdicts shift automatically. Distinct from `descriptor-symbol-gate`: the gate is a pre-render normalisation mechanism that auto-fixes partial qualifications; R-SEM-SYMBOL is the semantic-rule layer that catches symbols that survive the gate but still fail surface resolution (e.g., local helpers, hallucinated names not in the Mellea API).",
+      "about": "Every `symbol` field in `state[].symbol` and pipeline-node `call.symbol` MUST resolve to a known entry in the introspected Mellea surface. The check uses the surface-resolution helper `_symbol_in_surface` which walks `surface.modules.<module_name>.symbols.<key>`. When the validator is called without a surface (surface=None), the rule no-ops — surface resolution is the optional grounding layer, present in real compiles via `intermediate/mellea_api_ref.json`, absent in unit tests on raw descriptors.",
+      "category": "semantic-rule",
+      "directive": {
+        "doc": ".claude/commands/mellea-fy-generate.md",
+        "section": "Descriptor accept-set (type expressions, signatures, symbols)",
+        "stance": "Every `symbol` field MUST be a fully-qualified Mellea API path that resolves in `intermediate/mellea_api_ref.json:.modules`. Partial qualifications (bare class-method shorthand, dropped class prefix) are auto-normalised by the pre-render symbol gate; local helpers and other non-Mellea references should NOT appear in `state[].symbol` or `pipeline[].call.symbol` — they belong in `dependencies[]` with appropriate disposition, or in the rendered Python files outside the descriptor. The rule is surface-driven: when Mellea ships new modules/symbols, the surface refreshes and the rule's accept-set follows automatically."
+      },
+      "implementation": {
+        "ground_truth": "`_symbol_in_surface(symbol, surface)` walks `surface.modules` and returns True iff the symbol resolves via the canonical path. The same function backs the descriptor-symbol-gate's stage-1 exact-match check, so the gate and this rule share the same source of truth.",
+        "surface_artifact": "intermediate/mellea_api_ref.json",
+        "key_invariant": "Surface introspection IS the source of truth for what symbols exist. The rule does NOT hardcode any Mellea API names; the rule's body is purely structural (walk the descriptor, call `_symbol_in_surface` on each `symbol` field). Mellea-API-coupling risk: ZERO — the rule body is version-agnostic by construction."
+      },
+      "validation": {
+        "location": null,
+        "severity": "error",
+        "exit_code": "DESCRIPTOR_SCHEMA_FAIL"
+      },
+      "coherence_checks": [
+        {
+          "id": "C-VALID-SURFACE-SYMBOL-PASSES",
+          "description": "A descriptor with a `state[].symbol` and `pipeline[].call.symbol` both resolving in the supplied surface passes the rule cleanly. Normative case.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_symbol.py::test_valid_surface_symbol_passes"
+        },
+        {
+          "id": "C-UNKNOWN-SYMBOL-FAILS",
+          "description": "A descriptor whose `pipeline[].call.symbol` is NOT in the surface fires R-SEM-SYMBOL with a message naming the offending symbol. Guard against the rule going too lenient.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_symbol.py::test_unknown_symbol_fails"
+        },
+        {
+          "id": "C-SURFACE-NONE-NO-OPS",
+          "description": "When the validator is invoked without a surface (surface=None), R-SEM-SYMBOL does NOT fire — the rule is opt-in based on the optional grounding artifact. Required because the validator is callable in unit-test contexts that don't supply a surface.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_symbol.py::test_surface_none_skips_rule"
+        },
+        {
+          "id": "C-STATE-SYMBOL-CHECKED",
+          "description": "The rule fires on `state[].symbol` (not only `pipeline[].call.symbol`). Both positions are validated, mirroring the descriptor-symbol-gate's walk.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_symbol.py::test_state_symbol_also_validated"
+        },
+        {
+          "id": "C-NO-MELLEA-NAME-IN-RULE-BODY",
+          "description": "The implementation file `semantic_rules.py` MUST NOT contain any hardcoded Mellea API symbol name in the body of `_validate_call_node` / `_symbol_in_surface` / the per-rule firing sites. Surface introspection is the only allowed source. This is the version-coupling smell test: if a maintainer adds `if symbol == 'mellea.stdlib.X.specific_name': ...` the test fails. Protects against the modality-rule-style hardcoding that the audit-coverage plan deliberately avoids.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_symbol.py::test_rule_body_has_no_hardcoded_mellea_names"
+        }
+      ]
+    },
+    "r-sem-schema-ref": {
+      "motivation": "Registered 2026-05-20 as part of audit-coverage Batch 1. R-SEM-SCHEMA-REF fires when a `schema_ref` field uses the JSON Pointer form `#/schemas/<Name>` but `<Name>` does not appear as a key in the descriptor's top-level `schemas` dict. Pre-registration: rule fired live without an audit entry. The schema has a partial structural backstop (`pattern: ^#/schemas/` on schema_ref strings) that catches non-pointer SHAPES; the semantic rule catches *unresolved targets* (the pointer is well-formed but points at nothing). Two-layer enforcement analogous to r-sem-ref: schema catches syntax, semantic rule catches resolution.",
+      "about": "Every `schema_ref` value in the descriptor IR (ArgValue's `{schema_ref}` variant, `state_schema`, `format_schema`, output `schema.ref`, etc.) MUST use the form `#/schemas/<Name>` AND `<Name>` MUST be a declared key in the descriptor's top-level `schemas` dict. The schema's `^#/schemas/` pattern enforces the syntax; this rule enforces that the target resolves.",
+      "category": "semantic-rule",
+      "directive": {
+        "doc": null,
+        "section": null,
+        "stance": "When emitting a `schema_ref` (or any field whose value is a pointer into the descriptor's schemas dict), use the form `#/schemas/<Name>` and ensure `<Name>` is also declared in the top-level `schemas` object. A schema_ref to an undeclared schema is rejected. Directive doc currently null — covered by deadline-bounded xfail on C-DIRECTIVE-DOC-EXISTS until a directive section is written (tomorrow's archetype-examples work may subsume this)."
+      },
+      "implementation": {
+        "ground_truth": "`_check_argvalue_tree` walks the descriptor's args trees; when it encounters a `schema_ref` value, it parses the JSON Pointer to extract `<Name>` and checks whether `<Name>` is in `descriptor.schemas.keys()`. Returns a ValidationError tagged R-SEM-SCHEMA-REF when the target is missing.",
+        "surface_artifact": "intermediate/descriptor_emission.json:.schemas (the dict the rule checks against)",
+        "key_invariant": "The descriptor's `schemas` dict is the source of truth for what schema_refs can target. Adding a new schema means: declare it in `schemas`, then refer to it via `#/schemas/<Name>` everywhere. The rule has no Mellea-API coupling — it operates entirely within the descriptor IR."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/descriptor/semantic_rules.py::_check_argvalue_tree",
+        "severity": "error",
+        "exit_code": "DESCRIPTOR_SCHEMA_FAIL"
+      },
+      "coherence_checks": [
+        {
+          "id": "C-DECLARED-SCHEMA-RESOLVES",
+          "description": "A `schema_ref: '#/schemas/Foo'` where the descriptor declares `schemas.Foo` passes the rule cleanly.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_schema_ref.py::test_declared_schema_resolves"
+        },
+        {
+          "id": "C-UNDECLARED-SCHEMA-FAILS",
+          "description": "A `schema_ref: '#/schemas/Missing'` where `schemas.Missing` is NOT declared fires R-SEM-SCHEMA-REF.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_schema_ref.py::test_undeclared_schema_fails"
+        },
+        {
+          "id": "C-SCHEMA-PATTERN-ENFORCES-SYNTAX",
+          "description": "The JSON Schema's `^#/schemas/` pattern on schema_ref strings rejects malformed pointers (e.g. `#/state/X`, `Foo`, empty string) at the schema layer — before the semantic rule sees them. Structural co-validation: the two layers enforce different aspects of the same contract.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_schema_ref.py::test_schema_pattern_rejects_non_schemas_pointers"
+        },
+        {
+          "id": "C-NESTED-SCHEMA-REF-CHECKED",
+          "description": "A schema_ref nested inside an ArgValue tree (e.g., `{symbol: X, args: {field: {schema_ref: '#/schemas/Y'}}}`) is checked the same way as top-level ones. _check_argvalue_tree recurses; if it stops recursing, this test catches the regression.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_schema_ref.py::test_nested_schema_ref_is_checked"
+        },
+        {
+          "id": "C-DIRECTIVE-DOC-EXISTS",
+          "description": "Directive doc explaining schema_ref shape and resolution must exist. Currently null; deadline-bounded xfail until written (likely subsumed by tomorrow's per-archetype canonical-descriptors work, which will demonstrate schema_ref usage in worked examples).",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_schema_ref.py::test_directive_doc_section_exists",
+          "xfail_until": "2026-06-30"
+        }
+      ]
+    },
+    "r-sem-operator": {
+      "motivation": "Registered 2026-05-20 as part of audit-coverage Batch 1. R-SEM-OPERATOR fires when a composition node's operator-specific required fields are missing (e.g., `sequential` without `body`, `map` without `over` or `item_id`, `branch` without `cases`). The JSON Schema enforces these via `oneOf` discriminator branches; the semantic rule is the redundant-but-defensive back-stop that runs after schema validation in case any branch admits a malformed shape. Registering the rule in the audit registry creates the coherence-test surface so any divergence between the schema's discriminator branches and the semantic rule's checks is caught.",
+      "about": "Every composition node in `pipeline[]` (`kind: 'composition'`) carries an `operator` field whose value is one of `sequential`, `branch`, `map`, `filter`, `parallel`, `loop_until`, `agent_loop`, `human_approval`, `aact`. Each operator selects a different set of required fields. The schema's `oneOf` block enforces these structurally; the semantic rule provides additional checks (e.g., termination-condition predicates for `loop_until` / `agent_loop`).",
+      "category": "semantic-rule",
+      "directive": {
+        "doc": ".claude/commands/mellea-fy-generate.md",
+        "section": "Required fields per node kind",
+        "stance": "Each pipeline node `kind` (call / composition) and each composition `operator` has its own `required` list in the descriptor schema. Read the schema before drafting; do not invent fields. The schema's oneOf discriminator catches structural omissions; the R-SEM-OPERATOR semantic rule catches what the schema doesn't (e.g., termination predicate well-formedness)."
+      },
+      "implementation": {
+        "ground_truth": "Per-operator required-field tables encoded inside `_validate_composition_node`. Each operator branch checks its required fields and emits a ValidationError tagged R-SEM-OPERATOR for omissions/malformations.",
+        "surface_artifact": "intermediate/descriptor_emission.json:.pipeline[*] (composition nodes only)",
+        "key_invariant": "The semantic rule's per-operator required-field set MUST be a SUPERSET (or equal) to the schema's oneOf branch requirements. Drift (schema requires X, semantic rule doesn't check X) is acceptable — the schema is the floor. Drift in the other direction (semantic rule requires Y, schema doesn't) is a real bug — the LLM would pass schema then fail semantic with no structural feedback."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/descriptor/semantic_rules.py::_validate_composition_node",
+        "severity": "error",
+        "exit_code": "DESCRIPTOR_SCHEMA_FAIL"
+      },
+      "coherence_checks": [
+        {
+          "id": "C-SEQUENTIAL-BODY-REQUIRED",
+          "description": "A sequential composition without `body` fails the rule. The schema also requires it; this test verifies the semantic rule agrees.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_operator.py::test_sequential_without_body_fails"
+        },
+        {
+          "id": "C-MAP-OVER-AND-ITEM-ID-REQUIRED",
+          "description": "A map composition without `over` or without `item_id` fails. Map operations need both: the iterable source and the per-iteration name binding.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_operator.py::test_map_missing_over_or_item_id_fails"
+        },
+        {
+          "id": "C-BRANCH-CASES-REQUIRED",
+          "description": "A branch composition without `cases` fails. Cases is the operator's branching dispatch table.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_operator.py::test_branch_without_cases_fails"
+        },
+        {
+          "id": "C-WELL-FORMED-OPERATOR-PASSES",
+          "description": "A well-formed composition for each operator kind passes the rule. Paired positive guard against the rule going too restrictive.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_operator.py::test_well_formed_operators_pass"
+        },
+        {
+          "id": "C-SEMANTIC-RULE-IS-SUPERSET-OF-SCHEMA",
+          "description": "For every operator kind, the semantic rule's required-field set MUST be a superset of (or equal to) the schema's oneOf branch requirements. Drift the wrong way (schema lax, rule strict) means LLM emissions can pass schema but fail semantic with no structural feedback — exactly the asymmetry our recent fixes have been closing.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_operator.py::test_semantic_rule_aligns_with_schema_required_fields"
+        }
+      ]
+    },
+    "r-sem-field-type-known": {
+      "motivation": "Registered 2026-05-20 as part of audit-coverage Batch 1. R-SEM-FIELD-TYPE-KNOWN fires when a `SchemaField.type` string is outside the closed vocabulary `{str, int, float, bool, bytes, any, Any, model_ref, enum_ref, list[T], dict[K,V], Optional[T], Literal[...], <declared-schema-name>}`. The schema's `SchemaField.type` is just `{type: string}` — any string passes JSON Schema validation — so this rule is the SOLE enforcer of the closed vocabulary. `bytes` was added 2026-05-20 to accommodate binary outputs (docx, PDF, image-producing skills); the rule's vocabulary list is maintained in the rule body, not the surface, because the vocabulary describes the DESCRIPTOR IR's expressive range, not Mellea's API. Version-coupling risk: low — this is a descriptor-IR shape rule, not a Mellea-API rule.",
+      "about": "Every `SchemaField.type` value (every field of every declared schema in `descriptor.schemas`) MUST be a token from the closed vocabulary. The vocabulary is defined in `semantic_rules.py:_KNOWN_FIELD_TYPE_TOKENS` (primitives + sentinels) plus `_KNOWN_FIELD_TYPE_PARAMETERISED` (parameterised constructors). Schema-name identifiers from the descriptor's own `schemas` dict are also accepted. Anything else is rejected.",
+      "category": "semantic-rule",
+      "directive": {
+        "doc": null,
+        "section": null,
+        "stance": "Schema field types use a closed vocabulary: primitives `str`, `int`, `float`, `bool`, `bytes`, `any`/`Any`; parameterised `list[T]`, `dict[K,V]`, `Optional[T]`, `Literal[X,Y,...]`, `Union[...]`; sentinel `model_ref`, `enum_ref`; or a declared schema-name identifier from the descriptor's `schemas` dict. Anything outside this set is rejected. Common LLM hallucinations to avoid: `Decimal`, `datetime`, `complex`, `tuple`, `set`, `frozenset`, Python type-class names from `typing` (`List`, `Dict`, `Optional` uppercase — use PEP 585 lowercase forms). Directive doc currently null; deadline-bounded xfail until written."
+      },
+      "implementation": {
+        "ground_truth": "`_check_field_type_known` walks `descriptor.schemas`, tokenises each field's `type` string via `_parse_field_type_token` (handles parameterised forms recursively), and rejects any token outside the union of `_KNOWN_FIELD_TYPE_TOKENS`, `_KNOWN_FIELD_TYPE_PARAMETERISED`, and the descriptor's own schema names.",
+        "surface_artifact": "intermediate/descriptor_emission.json:.schemas[*].fields[*].type",
+        "key_invariant": "The closed vocabulary is curated to match what the renderer's `lower_type` can produce as a Python annotation. Adding a new accepted token here REQUIRES a corresponding case in `renderer/nodes.py::lower_type` so the descriptor and the rendered Python stay coherent. Today's `bytes` addition is paired with renderer/nodes.py:122 which already supports it."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/descriptor/semantic_rules.py::_check_field_type_known",
+        "severity": "error",
+        "exit_code": "DESCRIPTOR_SCHEMA_FAIL"
+      },
+      "coherence_checks": [
+        {
+          "id": "C-PRIMITIVE-TYPES-PASS",
+          "description": "Every primitive in the vocabulary (`str`, `int`, `float`, `bool`, `bytes`) passes the rule on a schema-field declaration.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_field_type_known.py::test_primitive_types_pass"
+        },
+        {
+          "id": "C-PARAMETERISED-TYPES-PASS",
+          "description": "Parameterised constructors (`list[str]`, `dict[str, int]`, `Optional[float]`, `Literal['a', 'b']`) pass when their inner tokens are also in the vocabulary.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_field_type_known.py::test_parameterised_types_pass"
+        },
+        {
+          "id": "C-UNKNOWN-TYPE-FAILS",
+          "description": "Tokens outside the vocabulary (`Decimal`, `datetime`, `complex`) fire R-SEM-FIELD-TYPE-KNOWN. Common LLM hallucinations get caught.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_field_type_known.py::test_unknown_type_fails"
+        },
+        {
+          "id": "C-DECLARED-SCHEMA-NAME-PASSES",
+          "description": "A field type that names another schema declared in the same descriptor (`Foo` where `descriptor.schemas.Foo` exists) is accepted via the dynamic vocabulary extension.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_field_type_known.py::test_declared_schema_name_passes"
+        },
+        {
+          "id": "C-RENDERER-LOWER-TYPE-AGREES",
+          "description": "Every token in `_KNOWN_FIELD_TYPE_TOKENS` MUST be lowerable by the renderer's `lower_type`. Adding a token here without a renderer case creates a descriptor that passes validation but fails to render — exactly the kind of asymmetry the registry exists to catch. This test enumerates the vocabulary and asserts each lowers cleanly.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_field_type_known.py::test_renderer_lower_type_agrees_with_vocabulary"
+        }
+      ]
+    },
+    "r-sem-signature-match": {
+      "motivation": "Registered 2026-05-20 as part of audit-coverage Batch 2. R-SEM-SIGNATURE-MATCH fires when the descriptor's emitted `inputs` / `outputs` / referenced `schemas` diverge from the locked signature produced by Step 2's `expected_signature.json` (P3.5.D). The locked signature is the canonical I/O contract derived from element-mapping + classification BEFORE descriptor emission; Step 4 (fixtures) and Step 5 (descriptor) both consume it. The rule is the post-emission enforcement that catches drift between what the LLM emitted and what the upstream analytical phases decided. Fires only when `expected_signature` is supplied to `validate()`; absent on validator calls without the optional intermediate artefact.",
+      "about": "Cross-artefact rule: compares `descriptor.inputs[]` and `descriptor.outputs[]` (and the schemas they reference) against `intermediate/expected_signature.json`. Catches missing required inputs, extra unexpected inputs, output-name mismatches, type mismatches between the locked and emitted forms, and schema-shape divergences. The locked signature is the source of truth — the descriptor must conform.",
+      "category": "semantic-rule",
+      "directive": {
+        "doc": ".claude/commands/mellea-fy-generate.md",
+        "section": "expected_signature.json",
+        "stance": "When `intermediate/expected_signature.json` is present (always, post P3.5.D), the LLM MUST emit `descriptor.inputs` / `descriptor.outputs` / `descriptor.schemas` that conform exactly to the locked signature. The signature is a HARD CONSTRAINT block in the descriptor-emission system prompt. R-SEM-SIGNATURE-MATCH catches any post-emission divergence as a repair-loop trigger."
+      },
+      "implementation": {
+        "ground_truth": "`_check_expected_signature` compares descriptor I/O field-by-field against the supplied `expected_signature` dict. Required inputs/outputs missing from the descriptor are errors; explicitly-optional inputs may be omitted; schema shapes compared structurally.",
+        "surface_artifact": "intermediate/expected_signature.json (locked) + intermediate/descriptor_emission.json (emitted)",
+        "key_invariant": "The locked signature precedes the descriptor in the compile timeline. Every entry in `expected_signature.inputs` that is not marked optional MUST appear in `descriptor.inputs` with the same name (and compatible type). Same for outputs. Type-string equality is the comparison mode — both faces should use the same closed vocabulary (R-SEM-FIELD-TYPE-KNOWN)."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/descriptor/semantic_rules.py::_check_expected_signature",
+        "severity": "error",
+        "exit_code": "DESCRIPTOR_SCHEMA_FAIL"
+      },
+      "coherence_checks": [
+        {
+          "id": "C-LOCKED-INPUTS-DESCRIBED",
+          "description": "When `expected_signature.inputs` declares a required input and the descriptor declares it too with the same name, the rule passes.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_signature_match.py::test_matching_inputs_pass"
+        },
+        {
+          "id": "C-MISSING-REQUIRED-INPUT-FAILS",
+          "description": "A required input present in the locked signature but missing from the descriptor fires R-SEM-SIGNATURE-MATCH.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_signature_match.py::test_missing_required_input_fails"
+        },
+        {
+          "id": "C-OPTIONAL-INPUT-MAY-BE-OMITTED",
+          "description": "An input marked `optional: true` in the locked signature may be absent from the descriptor without firing the rule.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_signature_match.py::test_optional_input_may_be_omitted"
+        },
+        {
+          "id": "C-NO-EXPECTED-SIG-NOOPS",
+          "description": "When `expected_signature` is not supplied to `validate()`, R-SEM-SIGNATURE-MATCH does not fire (degrades to non-op so unit tests on raw descriptors still work).",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_signature_match.py::test_no_expected_signature_skips_rule"
+        }
+      ]
+    },
+    "r-sem-call-args-match-sig": {
+      "motivation": "Registered 2026-05-20 as part of audit-coverage Batch 2. R-SEM-CALL-ARGS-MATCH-SIG fires when a pipeline call node's `args` dict diverges from the function's signature (introspected from `mellea_api_ref.json` or curated in the static-fallback table). Three classes of violation: unknown-keyword (args has a name the signature doesn't declare), missing-required (signature requires a param not in args), too-few-positional (static-table arity floor not met). This is the EARLY-BIND counterpart to the post-render `stdlib-arity` lint — catching arity errors at descriptor-validate time means the LLM gets immediate feedback rather than waiting until pipeline.py renders. Surface-driven: no Mellea-API names hardcoded; the rule walks signatures from the introspected surface plus the curated static table.",
+      "about": "For every pipeline call node, resolve the call's `symbol` against the surface, fetch its signature record, and verify the `args` dict's keys / count match. Static-table records (for stdlib symbols whose grounded signatures are opaque `(*args, **kwargs)`) override with explicit min/max positional counts.",
+      "category": "semantic-rule",
+      "directive": {
+        "doc": ".claude/commands/mellea-fy-generate.md",
+        "section": "Descriptor accept-set (type expressions, signatures, symbols)",
+        "stance": "When emitting a pipeline call node's `args`, ensure every key matches a parameter name in the introspected signature, every required parameter is satisfied (positionally or by keyword), and the total arg count is within the signature's accepted range. The pre-render check (R-SEM-CALL-ARGS-MATCH-SIG) fires at descriptor-validate; the post-render `stdlib-arity` lint catches the same class on the rendered Python — they enforce the same contract at two different stages so the LLM gets feedback as early as possible."
+      },
+      "implementation": {
+        "ground_truth": "`_check_call_args_match_sig` resolves each call's signature via `_resolve_signature_record(symbol, surface)` (which checks the introspected surface AND a curated static table for stdlib helpers). For each call, compares `node.args.keys()` against the signature's accepted parameter set.",
+        "surface_artifact": "intermediate/mellea_api_ref.json + curated _STDLIB_STATIC_SIGS in compile/lints.py",
+        "key_invariant": "The semantic rule and the post-render `stdlib-arity` lint MUST enforce the same contract — both consume the same signature records. Drift would mean the LLM passes one and fails the other, with no clear repair signal."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/descriptor/semantic_rules.py::_check_call_args_match_sig",
+        "severity": "error",
+        "exit_code": "DESCRIPTOR_SCHEMA_FAIL"
+      },
+      "coherence_checks": [
+        {
+          "id": "C-MATCHING-ARGS-PASS",
+          "description": "A call whose args.keys() are a subset of the signature's accepted parameter names passes.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_call_args_match_sig.py::test_matching_args_pass"
+        },
+        {
+          "id": "C-UNKNOWN-KWARG-FAILS",
+          "description": "A call with an arg name not in the signature fires the rule.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_call_args_match_sig.py::test_unknown_kwarg_fails"
+        },
+        {
+          "id": "C-SURFACE-NONE-NO-OPS",
+          "description": "Without a surface, the rule degrades to non-op (consistent with R-SEM-SYMBOL's surface-optional semantics).",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_call_args_match_sig.py::test_surface_none_skips_rule"
+        },
+        {
+          "id": "C-STATIC-TABLE-ARITY-FLOOR",
+          "description": "For a stdlib symbol whose static-table record sets `min_pos`, supplying fewer args fires the rule with a message naming the required parameters.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_call_args_match_sig.py::test_static_table_arity_floor_enforced"
+        }
+      ]
+    },
+    "r-sem-ref-select-resolves": {
+      "motivation": "Registered 2026-05-20 as part of audit-coverage Batch 2. R-SEM-REF-SELECT-RESOLVES (WARNING severity) fires when a ref carries a `select` dotted path that doesn't resolve to a declared field on the ref's target schema. Best-effort: only fires when the ref's target has a discoverable schema; absent that, the rule is silent. Warning-not-error because the discovery is heuristic — a strict pass would emit too many false positives in cases where the schema isn't statically inferable. Telemetry-grade signal: when this fires it's almost always a real bug, but the rule is permissive about cases it can't reason about.",
+      "about": "When a ref appears in the shape `{ref: <id>, select: <dotted.path>}`, this rule walks the ref's resolved type (state.id symbol's return type, input.type, or prior-node's bound schema) and checks each segment of the dotted path against the type's declared fields. Best-effort traversal; emits warnings only when the type IS resolvable and the path doesn't match.",
+      "category": "semantic-rule",
+      "directive": {
+        "doc": null,
+        "section": null,
+        "stance": "When emitting a ref with a `select` field, ensure the dotted path traverses real fields on the ref's target schema. R-SEM-REF-SELECT-RESOLVES emits warnings (not errors) for mismatches because the rule's traversal is best-effort. Directive doc currently null — coverage subsumed by per-archetype canonical-descriptor examples planned for tomorrow."
+      },
+      "implementation": {
+        "ground_truth": "`_check_ref_select_resolves` walks ref+select shapes, attempts to resolve the ref's target type, then traverses the select path against the target's declared fields. Emits warning-severity entries for resolvable types with non-matching paths.",
+        "surface_artifact": "intermediate/descriptor_emission.json (refs with select fields)",
+        "key_invariant": "Warning severity is intentional. The rule's traversal is incomplete by design — schemas can have dynamic shapes the rule can't infer. False negatives (missed real bugs) are acceptable; false positives would erode trust in the rule's signal."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/descriptor/semantic_rules.py::_check_ref_select_resolves",
+        "severity": "warning",
+        "exit_code": null
+      },
+      "coherence_checks": [
+        {
+          "id": "C-VALID-SELECT-PASSES",
+          "description": "A `{ref, select}` whose select path matches a declared field on the target type passes without warning.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_ref_select_resolves.py::test_valid_select_passes"
+        },
+        {
+          "id": "C-RULE-EMITS-WARNING-SEVERITY",
+          "description": "When the rule fires, the emitted ValidationError carries `severity='warning'`, not `'error'`. Guard against the rule being accidentally promoted to error-severity (which would create false positives the design deliberately avoids).",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_ref_select_resolves.py::test_rule_severity_is_warning"
+        },
+        {
+          "id": "C-UNRESOLVABLE-TARGET-NO-OPS",
+          "description": "When the rule cannot resolve the ref's target type (e.g., ref to an input with no schema), the rule does NOT fire spuriously. The best-effort discipline keeps false positives down.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_ref_select_resolves.py::test_unresolvable_target_skips"
+        }
+      ]
+    },
+    "r-sem-bundled-path-exists": {
+      "motivation": "Registered 2026-05-20 as part of audit-coverage Batch 2. R-SEM-BUNDLED-PATH-EXISTS validates `bundled_resources[].source_dir` paths in the descriptor — relative, non-traversing, and (when `skill_root` is supplied to the validator) actually present on disk. Severity degrades gracefully: error when `skill_root` is provided (so on-disk verification is possible); warning when absent (rule can only check path shape). Cross-artefact: couples descriptor IR to filesystem state at compile time.",
+      "about": "For every entry in `descriptor.bundled_resources[]`, verify the `source_dir` is a relative path (no leading `/`), does not contain `..` traversal segments, and (when skill_root is supplied) exists on disk under the skill root. Implements Rule OUT-6: bundled assets MUST be co-located under the skill's directory tree so the rendered package can find them post-install.",
+      "category": "semantic-rule",
+      "directive": {
+        "doc": null,
+        "section": null,
+        "stance": "When emitting `bundled_resources[]`, each entry's `source_dir` must be a relative path under the skill root (no leading `/`, no `..` segments). Paths that don't exist on disk are flagged. The companion-dir mirror established by Step 3a-pre is the canonical place to put bundled assets. Directive doc currently null; covered by Rule OUT-6 elsewhere but not summarised in a single audit-pointed section."
+      },
+      "implementation": {
+        "ground_truth": "`_check_bundled_resources` walks `descriptor.bundled_resources[]`, validates each `source_dir` for shape (relative, non-traversing), and (when skill_root is supplied) checks `Path(skill_root) / source_dir` exists.",
+        "surface_artifact": "intermediate/descriptor_emission.json:.bundled_resources[]",
+        "key_invariant": "Severity degrades: with skill_root, on-disk-existence is error-severity; without, shape-only checks are warning-severity. The dual mode keeps unit tests on raw descriptors working while production compiles get the strict check."
+      },
+      "validation": {
+        "location": "src/mellea_skills_compiler/descriptor/semantic_rules.py::_check_bundled_resources",
+        "severity": "error",
+        "exit_code": "DESCRIPTOR_SCHEMA_FAIL"
+      },
+      "coherence_checks": [
+        {
+          "id": "C-RELATIVE-PATH-PASSES",
+          "description": "A bundled_resources entry with a relative source_dir passes the shape check (without skill_root). Normative shape.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_bundled_path_exists.py::test_relative_path_passes_shape_check"
+        },
+        {
+          "id": "C-ABSOLUTE-PATH-FAILS",
+          "description": "An absolute source_dir (starts with `/`) fires the rule. Bundled paths must be relative to the skill root.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_bundled_path_exists.py::test_absolute_path_fails"
+        },
+        {
+          "id": "C-TRAVERSAL-PATH-FAILS",
+          "description": "A source_dir containing `..` segments fires the rule. Traversal out of the skill root is rejected.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_bundled_path_exists.py::test_traversal_path_fails"
+        },
+        {
+          "id": "C-MISSING-ON-DISK-FAILS-WITH-SKILL-ROOT",
+          "description": "When skill_root is supplied and the source_dir does not exist on disk, the rule fires at error severity. Validates the on-disk check fires only when the supporting artifact is available.",
+          "test": "tests/mellea_skills_compiler/rules/test_rule_coherence_r_sem_bundled_path_exists.py::test_missing_path_fails_with_skill_root"
+        }
+      ]
+    }
+  }
+}

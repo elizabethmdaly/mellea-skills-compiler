@@ -2,7 +2,7 @@
 
 The writers (`config_writer.py`, `fixtures_writer.py`, ...) were originally
 documented as "the LLM follows them" — but the slash command runs with
-`--allowed-tools Read,Write,Edit` and cannot execute Python. So in practice
+`--allowed-tools Read,Write,Edit,Glob` and cannot execute Python. So in practice
 the LLM was mentally rendering the writer's output, which is unreliable for
 anything more complex than `config.py`.
 
@@ -1004,6 +1004,82 @@ def render_descriptor_to_python(
             "reason": "no surface JSON available (could not load bundled default)",
         }
 
+    # Pre-render descriptor schema gate. The descriptor IR has a strict
+    # JSON Schema (``descriptor.schema.v0.3.json`` and prior versions);
+    # ``descriptor.validator.validate`` is the single source of truth for
+    # "is this descriptor legal". Historically the validator was only
+    # invoked from the repair loop, so the main compile path reached the
+    # renderer with structurally-illegal descriptors and surfaced them
+    # via generic ``RendererError: unknown ... shape`` messages.
+    #
+    # Failing at the schema gate (rather than the renderer) gives:
+    #   * A precise JSON path naming the violation location (e.g.
+    #     ``$.pipeline[3].args.foo`` instead of "unknown shape").
+    #   * Structured error records the future D1 auto-repair can feed
+    #     directly back to the LLM as the repair prompt.
+    #
+    # Discipline: any descriptor that satisfies the schema is renderable
+    # by definition; any descriptor that violates the schema fails here.
+    # The renderer never sees a schema-invalid descriptor.
+    try:
+        from mellea_skills_compiler.descriptor.validator import (
+            resolve_schema_version,
+            validate,
+        )
+
+        schema_version = resolve_schema_version(descriptor)
+        validation_report = validate(
+            descriptor,
+            schema_version=schema_version,
+            # surface is intentionally NOT passed — semantic rules
+            # overlap with C1's symbol gate downstream. Schema gate
+            # validates *structure only*; symbol resolution remains
+            # C1's responsibility so failures stay attributable.
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        # The schema gate must never crash the compile. If the validator
+        # itself fails, fall through to the renderer with a logged warning.
+        LOGGER.warning(
+            "[writer:descriptor] schema gate crashed; falling through to "
+            "renderer: %s",
+            exc,
+        )
+    else:
+        if not validation_report.valid:
+            errors = [e for e in validation_report.errors if e.severity == "error"]
+            first = errors[0]
+            head = (
+                f"  at {first.path or '$'}: {first.message} "
+                f"[{first.rule}]"
+            )
+            extra_count = len(errors) - 1
+            extra = (
+                f"\n  …and {extra_count} more schema error(s)"
+                if extra_count > 0
+                else ""
+            )
+            reason = (
+                f"descriptor_emission.json violates "
+                f"descriptor.schema.v{validation_report.schema_version}.json:\n"
+                f"{head}{extra}"
+            )
+            LOGGER.error("[writer:descriptor] %s", reason)
+            return {
+                "verdict": "failed",
+                "files_written": [],
+                "reason": reason,
+                "schema_errors": [
+                    {
+                        "path": e.path,
+                        "rule": e.rule,
+                        "message": e.message,
+                        "severity": e.severity,
+                    }
+                    for e in errors
+                ],
+                "schema_version": validation_report.schema_version,
+            }
+
     # Local imports keep this module importable without dragging the
     # renderer / schemas modules into every compile invocation.
     try:
@@ -1015,6 +1091,69 @@ def render_descriptor_to_python(
             "files_written": [],
             "reason": f"renderer modules unavailable: {exc}",
         }
+
+    # C1 — Pre-render symbol-resolution gate. Walks the descriptor and
+    # attempts to resolve every `symbol` field against the surface
+    # before the renderer is invoked. Auto-normalises unambiguous
+    # partial qualifications (e.g. `MelleaSession.instruct` →
+    # `mellea.stdlib.session.MelleaSession.instruct`) and surfaces
+    # structured failures with top-K candidate suggestions for any
+    # symbol the multi-stage matcher cannot resolve uniquely.
+    #
+    # Discipline: fail loud on ambiguity, fix silently on certainty.
+    # Every silent rewrite is logged to
+    # `intermediate/symbol_normalisations.jsonl` so the underlying LLM
+    # emission failure rate stays observable as first-class telemetry.
+    try:
+        from mellea_skills_compiler.compile.descriptor_symbol_gate import (
+            run_symbol_gate,
+        )
+
+        gate_result = run_symbol_gate(
+            descriptor,
+            surface,
+            intermediate_dir=package_dir / "intermediate",
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        # The gate must never crash the compile. Log and fall through;
+        # the renderer's own strict resolution will catch any genuine
+        # failures with the original error shape.
+        LOGGER.warning(
+            "[symbol-gate] crashed; falling back to renderer-level "
+            "resolution: %s",
+            exc,
+        )
+    else:
+        if not gate_result.ok:
+            first = gate_result.unresolvable[0]
+            top = ", ".join(
+                f"{p} ({s:.0f})" for p, s in first.candidates[:3]
+            ) or "(no candidates)"
+            reason = (
+                f"symbol gate rejected {len(gate_result.unresolvable)} "
+                f"symbol(s); first: '{first.original}' at "
+                f"{first.descriptor_path}; closest candidates: {top}"
+            )
+            LOGGER.error("[writer:descriptor] %s", reason)
+            return {
+                "verdict": "failed",
+                "files_written": [],
+                "reason": reason,
+                "unresolvable_symbols": [
+                    {
+                        "original": m.original,
+                        "descriptor_path": m.descriptor_path,
+                        "candidates": m.candidates[:3],
+                    }
+                    for m in gate_result.unresolvable
+                ],
+            }
+        if gate_result.normalisations:
+            LOGGER.info(
+                "[writer:descriptor] symbol gate auto-normalised %d "
+                "symbol(s) before render",
+                len(gate_result.normalisations),
+            )
 
     try:
         render_result = render_descriptor(descriptor, surface, skill_root=skill_root)

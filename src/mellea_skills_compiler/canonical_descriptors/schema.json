@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "canonical-descriptor.schema.v0.1",
+  "title": "Canonical Descriptor Wrapper",
+  "description": "Wraps a harvested-or-authored descriptor with provenance + classification metadata so the descriptor-emission prompt can select a triple-matching reference at compile time. The inner `descriptor` field is a full v0.3 descriptor that MUST validate against `descriptor.schema.v0.3.json` + the semantic rules — enforced by the canonical_descriptors coherence test. Mirrors the audit-registry's `examples` face cornerstone (positive examples pass all validators), scaled from per-rule fragments to per-archetype whole descriptors.",
+  "type": "object",
+  "required": ["format_version", "metadata", "descriptor"],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {
+      "type": "string",
+      "const": "0.1",
+      "description": "Canonical-descriptor wrapper version. Bump when the wrapper shape changes incompatibly."
+    },
+    "metadata": {
+      "type": "object",
+      "required": ["classification", "source", "harvested_at"],
+      "additionalProperties": false,
+      "properties": {
+        "classification": {
+          "type": "object",
+          "required": ["archetype", "shape", "modality"],
+          "additionalProperties": false,
+          "description": "The classification triple this canonical exemplifies. The selector matches incoming Step-0 classifications against this triple. Three axes (archetype, shape, modality) chosen as the most behavior-relevant; tool_involvement and source_runtime tracked separately if useful.",
+          "properties": {
+            "archetype": {
+              "type": "string",
+              "enum": ["A", "B", "C", "D1", "D2", "E"]
+            },
+            "shape": {
+              "type": "string",
+              "enum": ["Sequential", "One-shot"]
+            },
+            "modality": {
+              "type": "string"
+            },
+            "tool_involvement_variant": {
+              "type": ["string", "null"],
+              "description": "Optional fourth axis — recorded for selector secondary-scoring but not required for match."
+            },
+            "source_runtime": {
+              "type": ["string", "null"],
+              "description": "Optional fifth axis — recorded for selector tertiary-scoring."
+            }
+          }
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Where this canonical came from — either a skill name harvested from a clean compile, or `hand-authored` when the canonical was written from scratch to fill a coverage gap."
+        },
+        "harvested_at": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "description": "ISO date when the canonical was harvested or authored. Provenance only; not used by the selector."
+        },
+        "notes": {
+          "type": ["string", "null"],
+          "description": "Free-text notes about why this canonical is useful, what patterns it demonstrates, and any known limitations the LLM should NOT pattern-match on. Audience: a maintainer triaging a canonical that has started failing the coherence check."
+        }
+      }
+    },
+    "descriptor": {
+      "type": "object",
+      "description": "The actual descriptor — a full v0.3 descriptor that MUST validate cleanly against the current schema + semantic rules (enforced by coherence test). When schemas tighten, broken canonicals fail loudly and a maintainer updates them."
+    }
+  }
+}

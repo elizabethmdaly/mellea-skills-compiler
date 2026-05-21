@@ -1,0 +1,481 @@
+{
+  "format_version": "0.1",
+  "metadata": {
+    "classification": {
+      "archetype": "A",
+      "shape": "Sequential",
+      "modality": "conversational_session",
+      "tool_involvement_variant": "P3",
+      "source_runtime": "agent_skills_std"
+    },
+    "source": "gdpr-breach-sentinel-oliver-schmidt-prietz",
+    "harvested_at": "2026-05-21",
+    "notes": "Conversational session skill with branch dispatch on classification. Demonstrates the A / Sequential / conversational_session pattern: state[].id for the session binding, branch composition for case dispatch, tool dependencies for web search and document generation. Source for the dispatch-on-classification + tool-using pattern."
+  },
+  "descriptor": {
+    "descriptor_version": "0.3",
+    "mellea_version": "0.5.0",
+    "notes": [
+      "Conversational session modality: each run_pipeline call handles one user turn.",
+      "Session phase tracking delegated to host runtime via session_id (C4 delegate_to_runtime).",
+      "ENISA scoring tables (DPC_BASE_SCORES, EI_SCORE_LEVELS, CB_COMPONENT_SCORES, SEVERITY_THRESHOLDS) emitted as Python literals in pipeline.py alongside main instruct call. Not in config_emission.json (Amendment K: no dict/list in config constants).",
+      "Web research stubs (run_web_research) called after assess_turn parse when assessment_output is present and flags.is_emergency is False.",
+      "assess_encryption_status is a deterministic pure-Python function in tools.py (ENISA encryption logic tree).",
+      "Renderer: inject model_options={ModelOption.SYSTEM_PROMPT: PREFIX_TEXT} on all session.instruct() call sites per KB7."
+    ],
+    "skill": {
+      "name": "gdpr-breach-sentinel-oliver-schmidt-prietz",
+      "classification": {
+        "primary_axis": "PERSONA",
+        "interaction_style": "multi_turn",
+        "input_modality": [
+          "text",
+          "conversation"
+        ],
+        "output_modality": "structured",
+        "state_persistence": "session_scoped"
+      }
+    },
+    "dependencies": [
+      {
+        "id": "edpb_cases_file",
+        "kind": "file",
+        "disposition": "load_from_disk",
+        "path": "references/edpb-cases.md",
+        "rationale": "EDPB Guidelines 01/2021 cases 01-18 for breach scenario matching"
+      },
+      {
+        "id": "templates_file",
+        "kind": "file",
+        "disposition": "load_from_disk",
+        "path": "references/templates.md",
+        "rationale": "9 audit-ready document templates for breach notification outputs"
+      },
+      {
+        "id": "run_web_research",
+        "kind": "tool",
+        "disposition": "stub",
+        "signature": "(query: str) -> str",
+        "rationale": "Web search for SA enforcement decisions, GDPR precedents \u2014 abstract capability requiring user implementation. See SETUP.md \u00a78.",
+        "notes": [
+          "Aggregated from 8 web_search TOOL_TEMPLATE elements: SA enforcement search, SA-specific guidance, sector precedent, EDPB updates, AI Act incidents, damages precedent, cross-border SA contact lookup, current SA notification portal.",
+          "dep_010 in dependency_plan.json"
+        ]
+      },
+      {
+        "id": "invoke_docx_skill",
+        "kind": "tool",
+        "disposition": "stub",
+        "signature": "(template_name: str, content: str) -> str",
+        "rationale": "Document generation via docx skill \u2014 abstract capability, host docx skill required. Fallback: .md output.",
+        "notes": [
+          "dep_011 in dependency_plan.json"
+        ]
+      },
+      {
+        "id": "assess_encryption_status_fn",
+        "kind": "script",
+        "disposition": "real_impl",
+        "symbol": "assess_encryption_status",
+        "rationale": "ENISA encryption logic tree deterministic function \u2014 pure Python, no external deps (dep_006)"
+      }
+    ],
+    "bundled_resources": [
+      {
+        "source_dir": "references",
+        "package_dir": "references",
+        "is_package_data": true,
+        "include_glob": "*.md",
+        "notes": [
+          "Rule OUT-6: mirrored by compile pipeline; code resolves via Path(__file__).parent / 'references/<file>'"
+        ]
+      }
+    ],
+    "inputs": [
+      {
+        "name": "session_id",
+        "schema": {
+          "kind": "str"
+        },
+        "description": "Unique session identifier for conversational state tracking across turns"
+      },
+      {
+        "name": "user_message",
+        "schema": {
+          "kind": "str"
+        },
+        "description": "User's current message in the GDPR breach response session"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "assessment_response",
+        "schema": {
+          "kind": "pydantic_model",
+          "ref": "#/schemas/AssessmentResponse"
+        },
+        "description": "Structured assessment response for this conversational turn"
+      }
+    ],
+    "schemas": {
+      "AssessmentResponse": {
+        "kind": "model",
+        "fields": {
+          "reply_text": {
+            "type": "str",
+            "description": "Natural language reply text to display to the user"
+          },
+          "session_phase": {
+            "type": "str",
+            "description": "Current session phase: INIT, DISCLAIMER_PENDING, INTAKE_GUIDED, INTAKE_FAST, EMERGENCY, ASSESSMENT, COMPLETE"
+          },
+          "assessment_output": {
+            "type": "AssessmentOutput",
+            "optional": true,
+            "ref": "#/schemas/AssessmentOutput",
+            "description": "Full structured assessment \u2014 present when phase is ASSESSMENT or COMPLETE"
+          },
+          "awaiting_input": {
+            "type": "bool",
+            "description": "True if more user input is required before assessment can proceed"
+          },
+          "next_question": {
+            "type": "str",
+            "optional": true,
+            "description": "Next guided intake question when awaiting_input=True"
+          }
+        }
+      },
+      "AssessmentOutput": {
+        "kind": "model",
+        "fields": {
+          "incident_data": {
+            "type": "IncidentIntakeData",
+            "ref": "#/schemas/IncidentIntakeData",
+            "description": "Extracted and validated incident intake data"
+          },
+          "enisa_score": {
+            "type": "ENISAScore",
+            "ref": "#/schemas/ENISAScore",
+            "description": "ENISA severity methodology score breakdown"
+          },
+          "severity_verdict": {
+            "type": "str",
+            "description": "LOW, MEDIUM, HIGH, or VERY HIGH per ENISA SE threshold"
+          },
+          "notification_obligation": {
+            "type": "str",
+            "description": "Full notification obligation narrative including SA, data subjects, Art.33(5) log"
+          },
+          "t0_deadline": {
+            "type": "str",
+            "description": "72h deadline from T0 \u2014 ISO 8601 datetime or descriptive if T0 unknown"
+          },
+          "edpb_cases": {
+            "type": "list[str]",
+            "description": "Matching EDPB Guidelines 01/2021 case identifiers and similarity notes"
+          },
+          "mitigation_playbook": {
+            "type": "list[str]",
+            "description": "Ordered immediate and short-term mitigation steps"
+          },
+          "strategic_advisory": {
+            "type": "str",
+            "description": "Strategic risk advisory including enforcement context, DPO recommendations, borderline warnings"
+          },
+          "flags": {
+            "type": "BreachFlags",
+            "ref": "#/schemas/BreachFlags",
+            "description": "Boolean flags for emergency, cross-border, high-risk subjects, special category data, processor involvement"
+          },
+          "compliance_track": {
+            "type": "ComplianceTrack",
+            "ref": "#/schemas/ComplianceTrack",
+            "description": "Compliance track status: SA notification, data subject notification, Art.33(5) log, documents generated"
+          }
+        }
+      },
+      "IncidentIntakeData": {
+        "kind": "model",
+        "fields": {
+          "breach_type": {
+            "type": "str",
+            "description": "Confidentiality / Integrity / Availability / Multiple / Under Investigation"
+          },
+          "data_categories": {
+            "type": "list[str]",
+            "description": "List of personal data categories involved"
+          },
+          "data_subjects_count": {
+            "type": "int",
+            "description": "Estimated number of affected data subjects"
+          },
+          "discovery_datetime": {
+            "type": "str",
+            "description": "T0: ISO 8601 datetime of reasonable certainty of breach"
+          },
+          "controller_role": {
+            "type": "str",
+            "description": "Controller, Processor, or Both (Track A / B / A+B)"
+          },
+          "encryption_status": {
+            "type": "str",
+            "description": "Encrypted-key-secure / Encrypted-key-compromised / Unencrypted / Unknown"
+          },
+          "containment_status": {
+            "type": "str",
+            "description": "Contained / Ongoing / Unknown"
+          },
+          "supervisory_authority": {
+            "type": "str",
+            "optional": true,
+            "description": "Identified SA name and country"
+          },
+          "cross_border": {
+            "type": "bool",
+            "description": "True if data subjects span multiple EU Member States"
+          },
+          "lead_sa": {
+            "type": "str",
+            "optional": true,
+            "description": "Lead SA under one-stop-shop mechanism (main establishment jurisdiction)"
+          },
+          "prior_notified": {
+            "type": "bool",
+            "description": "True if SA has already been notified"
+          }
+        }
+      },
+      "ENISAScore": {
+        "kind": "model",
+        "fields": {
+          "dpc": {
+            "type": "float",
+            "description": "Data Processing Context score (1.0\u20134.0 after cap/floor)"
+          },
+          "ei": {
+            "type": "float",
+            "description": "Ease of Identification score (0.25 / 0.50 / 0.75 / 1.00)"
+          },
+          "cb": {
+            "type": "float",
+            "description": "Circumstances of the Breach score (0\u20132, additive)"
+          },
+          "se": {
+            "type": "float",
+            "description": "Severity score: SE = (DPC \u00d7 EI) + CB"
+          },
+          "dpc_rationale": {
+            "type": "str",
+            "description": "Narrative justification for DPC score including base category and adjustments"
+          },
+          "ei_rationale": {
+            "type": "str",
+            "description": "Narrative justification for EI level based on identifier types"
+          },
+          "cb_rationale": {
+            "type": "str",
+            "description": "Narrative justification for CB components (confidentiality/integrity/availability/malicious intent)"
+          }
+        }
+      },
+      "BreachFlags": {
+        "kind": "model",
+        "fields": {
+          "is_emergency": {
+            "type": "bool",
+            "description": "True if <12h remain on notification clock"
+          },
+          "cross_border_trigger": {
+            "type": "bool",
+            "description": "True if multiple EU Member States affected \u2014 triggers one-stop-shop determination"
+          },
+          "high_risk_subjects": {
+            "type": "bool",
+            "description": "True if vulnerable subjects (minors, patients) \u2014 consider notification upgrade"
+          },
+          "special_category_data": {
+            "type": "bool",
+            "description": "True if Art. 9 special category data (health, biometric, genetic, racial/ethnic, etc.)"
+          },
+          "processor_involvement": {
+            "type": "bool",
+            "description": "True if organisation is acting as processor (Track B obligations)"
+          }
+        }
+      },
+      "ComplianceTrack": {
+        "kind": "model",
+        "fields": {
+          "sa_notified": {
+            "type": "bool",
+            "description": "True if SA notification has been filed"
+          },
+          "notification_datetime": {
+            "type": "str",
+            "optional": true,
+            "description": "ISO 8601 datetime of SA notification filing"
+          },
+          "subject_notified": {
+            "type": "bool",
+            "description": "True if data subjects have been notified per Art. 34"
+          },
+          "art33_log_entry": {
+            "type": "str",
+            "optional": true,
+            "description": "Draft Art. 33(5) internal log entry text"
+          },
+          "documents_generated": {
+            "type": "list[str]",
+            "description": "List of document names generated in this session"
+          }
+        }
+      }
+    },
+    "state": [
+      {
+        "id": "session",
+        "symbol": "mellea.stdlib.session.start_session",
+        "scope": "function",
+        "args": {
+          "backend": {
+            "symbol": "BACKEND"
+          },
+          "model_id": {
+            "symbol": "MODEL_ID"
+          }
+        }
+      }
+    ],
+    "pipeline": [
+      {
+        "id": "root",
+        "kind": "composition",
+        "operator": "sequential",
+        "source_elements": [
+          "E3",
+          "E4",
+          "E5",
+          "E6",
+          "E7",
+          "E8",
+          "E9",
+          "E10",
+          "E11",
+          "E12",
+          "E13",
+          "E14",
+          "E15",
+          "E16",
+          "E17",
+          "E18",
+          "E19",
+          "E20",
+          "E21",
+          "E22",
+          "E25",
+          "E45",
+          "E80",
+          "E81"
+        ],
+        "body": [
+          {
+            "id": "load_edpb_cases_step",
+            "kind": "call",
+            "symbol": "load_edpb_cases",
+            "args": {},
+            "source_elements": [
+              "E80"
+            ],
+            "notes": [
+              "Loads EDPB Guidelines 01/2021 cases 01-18 from references/edpb-cases.md via loader.py"
+            ]
+          },
+          {
+            "id": "load_templates_step",
+            "kind": "call",
+            "symbol": "load_document_templates",
+            "args": {},
+            "source_elements": [
+              "E81"
+            ],
+            "notes": [
+              "Loads 9 audit-ready document templates from references/templates.md via loader.py"
+            ]
+          },
+          {
+            "id": "assess_turn",
+            "kind": "call",
+            "symbol": "instruct",
+            "bound_to": {
+              "ref": "session"
+            },
+            "args": {
+              "description": {
+                "template": "You are the GDPR Breach Response Sentinel. Process this conversational turn for session '{session_id}'. The user's message is: {user_message}. Apply all operating rules from PREFIX_TEXT including: (1) disclaimer gate on first turn, (2) emergency mode detection if <12h remain, (3) guided or fast-path intake, (4) ENISA SE = (DPC x EI) + CB calculation using the scoring tables in grounding_context, (5) EDPB case matching against edpb_cases_text, (6) cross-border one-stop-shop determination, (7) AI Act Art.62 check if AI system involved, (8) Track A (controller) vs Track B (processor) compliance routing. Return a complete AssessmentResponse reflecting the current session state."
+              },
+              "format": {
+                "schema_ref": "#/schemas/AssessmentResponse"
+              },
+              "grounding_context": {
+                "symbol": "dict",
+                "args": {
+                  "session_id": {
+                    "ref": "session_id"
+                  },
+                  "user_message": {
+                    "ref": "user_message"
+                  },
+                  "edpb_cases_text": {
+                    "ref": "load_edpb_cases_step"
+                  },
+                  "document_templates_text": {
+                    "ref": "load_templates_step"
+                  }
+                }
+              }
+            },
+            "captures": {
+              "result": "#/outputs/assessment_response"
+            },
+            "source_elements": [
+              "E3",
+              "E4",
+              "E5",
+              "E6",
+              "E7",
+              "E8",
+              "E9",
+              "E10",
+              "E11",
+              "E12",
+              "E13",
+              "E14",
+              "E15",
+              "E16",
+              "E17",
+              "E18",
+              "E19",
+              "E20",
+              "E21",
+              "E22",
+              "E25",
+              "E26",
+              "E27",
+              "E28",
+              "E45"
+            ],
+            "notes": [
+              "Main conversational turn processor. Renderer must inject model_options={ModelOption.SYSTEM_PROMPT: PREFIX_TEXT} per KB7.",
+              "ENISA scoring tables (DPC_BASE_SCORES, EI_SCORE_LEVELS, CB_COMPONENT_SCORES, SEVERITY_THRESHOLDS) defined as Python literals in pipeline.py and referenced in grounding_context.",
+              "SESSION_PHASES constant defined in pipeline.py: INIT / DISCLAIMER_PENDING / INTAKE_GUIDED / INTAKE_FAST / EMERGENCY / ASSESSMENT / COMPLETE.",
+              "After parsing result: if assessment_output is not None and not flags.is_emergency, call run_web_research for Regulatory Intelligence section per dynamic web research module (elem_039\u2013elem_044).",
+              "Thunk parse: call _parse_instruct_result(assess_turn_thunk, AssessmentResponse) with _safe_parse_with_fallback fallback.",
+              "RepairTemplateStrategy(loop_budget=LOOP_BUDGET) should wrap this call when requirements include structural validation_fn checks."
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

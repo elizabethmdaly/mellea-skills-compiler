@@ -1,0 +1,178 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mellea-skills-compiler/schemas/step_7_report.schema.json",
+  "title": "Step 7 static-validation report",
+  "description": "Structured report written by mellea_skills_compiler.compile.lints.run_lints() after the Step 7 lint suite runs. Persisted at <package>/intermediate/step_7_report.json. Consumed by the repair loop (compile/mellea_skills.py::_lint_repair_retry_loop), the F1 prescription builder (compile/repair_prompt.py::build_repair_prompt_lint_section), and any CI tooling that gates on lint outcomes. The writer currently emits a flat `lints` array with no tier nesting; tier membership is recoverable from `_LINT_TIER` in compile/lints.py.",
+  "type": "object",
+  "required": [
+    "format_version",
+    "checked_at",
+    "package_path",
+    "overall_verdict",
+    "blocking_failures",
+    "warnings",
+    "info_failures",
+    "strict",
+    "lints"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {
+      "const": "1.1",
+      "description": "Frozen at 1.1 (the format that introduced per-lint severity). Bump when the report shape changes in a way consumers must adapt to."
+    },
+    "checked_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp recorded when run_lints() finished."
+    },
+    "package_path": {
+      "type": "string",
+      "description": "Path string identifying the package the lints ran against. Typically a directory name relative to the skill root (e.g. 'ticket_triage_mellea/'); the writer does not normalise it."
+    },
+    "overall_verdict": {
+      "enum": ["pass", "fail"],
+      "description": "'fail' iff at least one entry in `lints` has `verdict == \"fail\"` AND its effective severity is `error`. WARNING-severity and INFO-severity failures are surfaced in this report but do NOT flip the verdict (unless strict mode escalated them — see `effective_severity` on individual entries)."
+    },
+    "blocking_failures": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Count of `lints` entries with `verdict == \"fail\"` whose `effective_severity == \"error\"`."
+    },
+    "warnings": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Count of `lints` entries with `verdict == \"fail\"` AND `severity == \"warning\"`. Independent of whether `--strict` promoted them; the raw count is what's reported."
+    },
+    "info_failures": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Count of `lints` entries with `verdict == \"fail\"` AND `severity == \"info\"`. Strict mode does NOT promote these."
+    },
+    "strict": {
+      "type": "boolean",
+      "description": "True when run_lints() was invoked with strict=True (`mellea-skills compile|validate --strict`). When true, WARNING-severity failures are promoted to blocking — observable via `effective_severity` on the affected entries."
+    },
+    "smoke_check_mode": {
+      "type": "string",
+      "enum": ["auto", "always", "never"],
+      "description": "The --smoke-check mode the run was invoked with. Recorded for replay. Optional in the writer's emitted shape if the run never reached smoke-check (e.g. early lint halt)."
+    },
+    "warnings_escalated_by_smoke": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Lint ids whose WARNING-severity failures were promoted to blocking *for this run* because the smoke-check independently confirmed the failure path (e.g. a `complex-schema-needs-strategy-or-fallback` warning whose fixture hit the missing-strategy crash). Each affected entry in `lints` will carry `effective_severity == \"error\"`."
+    },
+    "smoke_check": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["verdict"],
+          "additionalProperties": false,
+          "properties": {
+            "verdict": {
+              "enum": ["passed", "failed", "skipped"],
+              "description": "Outcome of the Step 7b fixture smoke-check. `passed` = ran to completion; `failed` = raised a real exception; `skipped` = backend unreachable (ConnectionError/TimeoutError/auth failure) — does NOT flip overall_verdict."
+            },
+            "fixture_used": {
+              "type": ["string", "null"],
+              "description": "ID of the fixture from `<package>/fixtures/__init__.py:ALL_FIXTURES` that was exercised. `null` when verdict is `skipped` before any fixture loaded."
+            },
+            "duration_seconds": {
+              "type": ["number", "null"],
+              "minimum": 0,
+              "description": "Wall-clock seconds for the fixture run, or null when the run never started."
+            },
+            "backend_available": {
+              "type": "boolean",
+              "description": "True if the LLM backend responded before timeout. False on `skipped`-due-to-unreachable verdicts."
+            },
+            "skipped_reason": {
+              "type": ["string", "null"],
+              "description": "Short reason string when verdict is `skipped`; null otherwise. Examples: 'backend unreachable', 'authentication failed (check API key or env vars)'."
+            },
+            "error": {
+              "type": ["string", "null"],
+              "description": "Short error class + message when verdict is `failed`; null on pass/skip. Full traceback lives in intermediate/step_7b_report.json (sibling artifact)."
+            }
+          }
+        }
+      ],
+      "description": "Smoke-check sub-report. Null when smoke-check did not run for this invocation (e.g. --no-run, or static lints failed before smoke-check would have been reached)."
+    },
+    "lints": {
+      "type": "array",
+      "description": "One entry per lint that ran. The writer emits a flat array — no tier nesting. Consumers that want to group by tier should join against `_LINT_TIER` in compile/lints.py.",
+      "items": {"$ref": "#/definitions/LintReportEntry"}
+    }
+  },
+  "definitions": {
+    "LintReportEntry": {
+      "type": "object",
+      "required": ["lint_id", "verdict", "severity", "files_checked", "failures"],
+      "additionalProperties": false,
+      "properties": {
+        "lint_id": {
+          "type": "string",
+          "description": "Stable identifier; matches a key in `_LINT_SEVERITY` / `_LINT_TIER` in compile/lints.py."
+        },
+        "verdict": {
+          "enum": ["pass", "fail", "warning", "skipped"],
+          "description": "Per-lint outcome. `pass` = no failures; `fail` = failures collected; `warning` = lint flagged a non-blocking issue (rare — most warnings come via severity, not verdict); `skipped` = lint declined to run (missing inputs, not-applicable to this package shape, etc.). See `skipped_reason` for the explanation."
+        },
+        "severity": {
+          "enum": ["error", "warning", "info"],
+          "description": "Declared severity from `_LINT_SEVERITY` in compile/lints.py."
+        },
+        "effective_severity": {
+          "enum": ["error", "warning", "info"],
+          "description": "Severity *as applied to overall_verdict for this run*. Equal to `severity` in normal mode. Equal to `error` when (a) the run was strict and `severity == warning`, or (b) the lint id is in `warnings_escalated_by_smoke`. Optional — older writers may omit it; consumers should fall back to `severity` when absent."
+        },
+        "files_checked": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of source files the lint inspected. Zero is valid (e.g. when the lint scope was vacuous on this package)."
+        },
+        "skipped_reason": {
+          "type": ["string", "null"],
+          "description": "Human-readable reason when `verdict == \"skipped\"`. Null when the lint actually ran."
+        },
+        "failures": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/LintFailure"},
+          "description": "Per-failure details. Empty when `verdict != \"fail\"`."
+        }
+      }
+    },
+    "LintFailure": {
+      "type": "object",
+      "required": ["file", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "type": "string",
+          "description": "Relative path from the package root (e.g. 'pipeline.py', 'fixtures/test_happy_path.py')."
+        },
+        "line": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "1-indexed line number; null when the failure is whole-file (e.g. missing file, top-level config drift)."
+        },
+        "column": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "1-indexed column number; null when the failure has no precise column position."
+        },
+        "message": {
+          "type": "string",
+          "description": "What's wrong and what to do about it. Should be self-contained — operators may read it without opening the source."
+        },
+        "rule_ref": {
+          "type": ["string", "null"],
+          "description": "Optional pointer to the rule being enforced. Format is free-form today: KB ids (`KB 5`), spec rules (`R-SEM-SIGNATURE-MATCH`), document references (`mellea-fy-validate.md § Tier 2 — session-boundary`)."
+        }
+      }
+    }
+  }
+}

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -28,6 +29,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
+
+LOGGER = logging.getLogger(__name__)
 
 _BUNDLED_DIRS = ("scripts", "references", "assets")
 _ENTRY_SIGNATURE_NAME_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
@@ -49,6 +52,25 @@ class LintSeverity(str, Enum):
     ERROR = "error"
     WARNING = "warning"
     INFO = "info"
+
+
+class LintFailureError(Exception):
+    """Raised when Step 7 lints fail with at least one ERROR-severity entry.
+
+    Distinct from ``SmokeCheckFailure`` (smoke_check.py) and from generic
+    compile-time exceptions so the CLI exit-code router can map this
+    cleanly to :data:`mellea_skills_compiler.exit_codes.ExitCode.LINT_FAIL`
+    (exit code 11). Carries the underlying step_7_report path so callers
+    can refer the operator to the structured details.
+
+    The ``report_path`` attribute is the absolute path to
+    ``<package>/intermediate/step_7_report.json``; ``str(exc)`` is a
+    human-readable summary suitable for stderr.
+    """
+
+    def __init__(self, message: str, *, report_path: Optional[Path] = None) -> None:
+        super().__init__(message)
+        self.report_path = report_path
 
 
 @dataclass
@@ -86,13 +108,27 @@ _ADVISORY_VERDICTS = frozenset({"warning"})
 # consults. Adding a new lint requires adding an entry here — see the
 # ``test_each_lint_has_declared_severity`` regression test.
 #
-# Classification rationale lives in `.claude/commands/mellea-fy-validate.md`
-# (severity table). Briefly:
+# This module — specifically ``_LINT_SEVERITY``, ``_LINT_TIER``, and
+# ``_LINT_HALTS_IMMEDIATELY`` below — is the canonical source of truth for
+# every lint's gate classification. ``mellea-fy-validate.md`` documents the
+# tier and severity *semantics* (what each level means, how the gate uses
+# them) but does NOT re-declare per-lint values; it points back here.
+# Update this module when adding or changing a lint and the doc tracks
+# naturally.
+#
+# Severity controls the gate verdict (whether ``verdict=fail`` blocks):
 #   - ERROR:   wrong code → runtime crash on first execution (always blocks).
 #   - WARNING: defensive heuristic; Mellea/runtime may be resilient, or the
 #              check is project-style rather than runtime-correctness.
-#   - INFO:    drift/telemetry; never blocks even in strict mode? — yes,
-#              strict mode promotes only WARNING (project policy), not INFO.
+#   - INFO:    drift/telemetry; never blocks even in strict mode (strict
+#              mode promotes only WARNING to blocking, not INFO).
+#
+# Tier controls execution order in ``run_lints``:
+#   - Tier 1: hard-fail loudly; runs first; halts the gate if it fails.
+#   - Tier 2: structural lints; collect all failures; trigger repair before
+#             halting (with the exception of entries in
+#             ``_LINT_HALTS_IMMEDIATELY``, which bypass repair).
+#   - Tier 3: cross-artifact lints; run only when Tier 2 is entirely clean.
 _LINT_SEVERITY: Dict[str, LintSeverity] = {
     # ── ERROR: always-breaks-runtime (14) ───────────────────────────────
     # ``parseable`` is the Tier 1 hard-fail (every .py file parses + the
@@ -112,6 +148,12 @@ _LINT_SEVERITY: Dict[str, LintSeverity] = {
     "format-annotation": LintSeverity.ERROR,
     "variable-safety": LintSeverity.ERROR,
     "session-boundary": LintSeverity.ERROR,
+    # Catches type-mismatched arguments to Mellea API kwargs that crash
+    # the runtime with AttributeError (e.g. ``grounding_context=<str>``
+    # → ``'str' object has no attribute 'items'`` at instruct() time).
+    # Narrow scope: focuses on dict-typed kwargs receiving non-dict
+    # expressions, where the non-dict-ness is statically provable.
+    "stdlib-arg-types": LintSeverity.ERROR,
     # ── ERROR: deployment-context-sensitive (4) ─────────────────────────
     "bundled-asset-path-resolution": LintSeverity.ERROR,
     "runtime-defaults-bound": LintSeverity.ERROR,
@@ -147,6 +189,58 @@ _LINT_SEVERITY: Dict[str, LintSeverity] = {
 }
 
 
+# Tier membership. Every lint id in ``_LINT_SEVERITY`` MUST have a matching
+# entry here — the ``test_each_lint_has_declared_tier`` regression test
+# enforces this. Tier 1 is the parseability gate (single lint); Tier 2 is
+# the bulk of structural / behavioural checks; Tier 3 runs only on cross-
+# artifact consistency once Tier 2 is clean. See the header comment above
+# ``_LINT_SEVERITY`` for the semantics each tier implies.
+_LINT_TIER: Dict[str, int] = {
+    # ── Tier 1: parseability gate ───────────────────────────────────────
+    "parseable": 1,
+    # ── Tier 2: structural / behavioural ────────────────────────────────
+    "import-soundness": 2,
+    "stdlib-arity": 2,
+    "pipeline-entry-canonical": 2,
+    "fixture-signature-bound": 2,
+    "instruct-has-description": 2,
+    "instruct-result-parse-before-access": 2,
+    "generative-forbidden-params": 2,
+    "generative-call-passes-session": 2,
+    "validator-soundness": 2,
+    "grounding-context-types": 2,
+    "format-annotation": 2,
+    "variable-safety": 2,
+    "session-boundary": 2,
+    "stdlib-arg-types": 2,
+    "bundled-asset-path-resolution": 2,
+    "runtime-defaults-bound": 2,
+    "import-side-effects": 2,
+    "pyproject-package-data-bound": 2,
+    "fixtures-loader-contract": 2,
+    "complex-schema-needs-strategy-or-fallback": 2,
+    "optional-extraction-guidance": 2,
+    "prefix-persona": 2,
+    "no-watsonx": 2,
+    "run-pipeline-params-typed": 2,
+    # ── Tier 3: cross-artifact consistency ──────────────────────────────
+    "melleafy-json-consistency": 3,
+}
+
+
+# Lints that, when failing, bypass the top-level repair loop and halt the
+# gate immediately. By default a Tier-2 failure triggers a repair attempt
+# before halting; entries here opt out — repair cannot meaningfully fix
+# them (e.g. KB5 multi-schema priming is a structural mistake the LLM
+# repeats on retry), so failing fast is more useful than burning budget.
+# Tier 1 (``parseable``) and Tier 3 (``melleafy-json-consistency``) do not
+# go through the repair loop in the first place, so they're not listed
+# here.
+_LINT_HALTS_IMMEDIATELY: frozenset = frozenset({
+    "session-boundary",
+})
+
+
 def _apply_severity(result: LintResult) -> LintResult:
     """Stamp ``result.severity`` from the central table.
 
@@ -155,6 +249,21 @@ def _apply_severity(result: LintResult) -> LintResult:
     """
     result.severity = _LINT_SEVERITY.get(result.lint_id, LintSeverity.ERROR)
     return result
+
+
+def _col_offset_to_schema(node: Any) -> Optional[int]:
+    """Convert an AST node's 0-indexed ``col_offset`` to the schema's
+    1-indexed column number, or ``None`` when the node lacks the attribute.
+
+    The step_7_report schema declares ``column`` as 1-indexed with
+    ``minimum: 1`` (LSP/IDE convention). Python's ``ast.AST.col_offset``
+    is 0-indexed, so a failure on the first character of a line would
+    otherwise be emitted as ``column=0`` and violate the schema.
+    """
+    col = getattr(node, "col_offset", None)
+    if col is None:
+        return None
+    return col + 1
 
 
 @dataclass
@@ -654,7 +763,7 @@ def lint_instruct_has_description(package_dir: Path) -> LintResult:
                 LintFailure(
                     file=rel,
                     line=getattr(node, "lineno", None),
-                    column=getattr(node, "col_offset", None),
+                    column=_col_offset_to_schema(node),
                     message=(
                         "m.instruct(...) call is missing a description. "
                         "Mellea 0.5+ requires `description` as the first "
@@ -800,7 +909,7 @@ def lint_generative_forbidden_params(package_dir: Path) -> LintResult:
                 LintFailure(
                     file=rel,
                     line=getattr(node, "lineno", None),
-                    column=getattr(node, "col_offset", None),
+                    column=_col_offset_to_schema(node),
                     message=(
                         f"@generative function `{node.name}` declares forbidden "
                         f"parameter name(s): {', '.join(offenders)}. Mellea's "
@@ -924,7 +1033,7 @@ def lint_generative_call_passes_session(package_dir: Path) -> LintResult:
                 LintFailure(
                     file=rel,
                     line=getattr(node, "lineno", None),
-                    column=getattr(node, "col_offset", None),
+                    column=_col_offset_to_schema(node),
                     message=(
                         f"Call to @generative function `{callee}(...)` does "
                         f"not pass a MelleaSession. Mellea's generative stub "
@@ -1240,7 +1349,7 @@ def lint_fixture_signature_bound(package_dir: Path) -> LintResult:
                         LintFailure(
                             file=rel,
                             line=getattr(node, "lineno", None),
-                            column=getattr(node, "col_offset", None),
+                            column=_col_offset_to_schema(node),
                             message=(
                                 f"Fixture `{node.name}` returns `inputs` with "
                                 f"key '{key}', but `{_CANONICAL_ENTRY_NAME}` "
@@ -1350,7 +1459,7 @@ def lint_validator_soundness(package_dir: Path) -> LintResult:
                     continue
                 value = kw.value
                 line = getattr(node, "lineno", None)
-                col = getattr(node, "col_offset", None)
+                col = _col_offset_to_schema(node)
 
                 if isinstance(value, ast.Lambda):
                     result.failures.append(
@@ -1529,7 +1638,7 @@ def lint_session_boundary(package_dir: Path) -> LintResult:
                 LintFailure(
                     file=rel,
                     line=getattr(node, "lineno", None),
-                    column=getattr(node, "col_offset", None),
+                    column=_col_offset_to_schema(node),
                     message=(
                         f"start_session() block uses {len(format_types)} "
                         f"distinct format types: "
@@ -1657,7 +1766,7 @@ def lint_prefix_persona(package_dir: Path) -> LintResult:
                         LintFailure(
                             file=rel,
                             line=getattr(node, "lineno", None),
-                            column=getattr(node, "col_offset", None),
+                            column=_col_offset_to_schema(node),
                             message=(
                                 f"`.instruct(prefix={name})`{provenance} uses "
                                 f"the `prefix=` parameter to inject persona / "
@@ -1871,7 +1980,7 @@ def lint_optional_extraction_guidance(package_dir: Path) -> LintResult:
                     LintFailure(
                         file="schemas.py",
                         line=getattr(stmt, "lineno", None),
-                        column=getattr(stmt, "col_offset", None),
+                        column=_col_offset_to_schema(stmt),
                         message=(
                             f"Optional field `{field_name}` on `{cls.name}` "
                             f"has no `Field(description=...)` with extraction "
@@ -1894,7 +2003,7 @@ def lint_optional_extraction_guidance(package_dir: Path) -> LintResult:
                     LintFailure(
                         file="schemas.py",
                         line=getattr(stmt, "lineno", None),
-                        column=getattr(stmt, "col_offset", None),
+                        column=_col_offset_to_schema(stmt),
                         message=(
                             f"Optional field `{field_name}` on `{cls.name}` "
                             f"has a non-Field default. KB11 requires "
@@ -1921,7 +2030,7 @@ def lint_optional_extraction_guidance(package_dir: Path) -> LintResult:
                     LintFailure(
                         file="schemas.py",
                         line=getattr(stmt, "lineno", None),
-                        column=getattr(stmt, "col_offset", None),
+                        column=_col_offset_to_schema(stmt),
                         message=(
                             f"Optional field `{field_name}` on `{cls.name}`: "
                             f"`Field(...)` is missing a string `description=` "
@@ -1939,7 +2048,7 @@ def lint_optional_extraction_guidance(package_dir: Path) -> LintResult:
                     LintFailure(
                         file="schemas.py",
                         line=getattr(stmt, "lineno", None),
-                        column=getattr(stmt, "col_offset", None),
+                        column=_col_offset_to_schema(stmt),
                         message=(
                             f"Optional field `{field_name}` on `{cls.name}`: "
                             f"`Field(description=...)` lacks extraction "
@@ -2042,7 +2151,7 @@ def lint_run_pipeline_params_typed(package_dir: Path) -> LintResult:
             LintFailure(
                 file="pipeline.py",
                 line=getattr(a, "lineno", getattr(run_pipeline_node, "lineno", None)),
-                column=getattr(a, "col_offset", None),
+                column=_col_offset_to_schema(a),
                 message=(
                     f"`{_CANONICAL_ENTRY_NAME}` parameter `{a.arg}` has no "
                     f"type annotation. Rule 3-1 requires every parameter of "
@@ -2126,7 +2235,7 @@ def lint_import_soundness(package_dir: Path) -> LintResult:
                     LintFailure(
                         file=rel,
                         line=getattr(node, "lineno", None),
-                        column=getattr(node, "col_offset", None),
+                        column=_col_offset_to_schema(node),
                         message=(
                             f"`from {module} import ...` references a Mellea "
                             f"module path that does not exist in "
@@ -2149,7 +2258,7 @@ def lint_import_soundness(package_dir: Path) -> LintResult:
                         LintFailure(
                             file=rel,
                             line=getattr(node, "lineno", None),
-                            column=getattr(node, "col_offset", None),
+                            column=_col_offset_to_schema(node),
                             message=(
                                 f"`import {name}` references a Mellea module "
                                 f"path that does not exist in "
@@ -2167,21 +2276,47 @@ def lint_import_soundness(package_dir: Path) -> LintResult:
 # ─── Lint: stdlib-arity (Rule 4-4) ───
 
 
+# Static signature overlay for ``req`` / ``check`` / ``simple_validate``.
+# These are intentionally restrictive vs the underlying Python signatures
+# (req and check are literal ``*args, **kwargs`` wrappers around
+# ``Requirement.__init__``); the table encodes the *curated* call
+# conventions documented in ``mellea-fy-generate.md``'s 'Known signatures'
+# table — what the LLM is told to do, not the maximally-permissive
+# Python truth.
+#
+# Shape contract (see :func:`_parse_signature_string` for the same shape
+# derived from grounded signature strings):
+#   * ``max_pos``: cap on positional args.
+#   * ``valid_kwargs``: frozenset of all keyword-acceptable param names.
+#     Includes POSITIONAL_OR_KEYWORD params (Python accepts those by
+#     name too — see the C-POSORKW-ACCEPTS-KEYWORD coherence check).
+#   * ``required_param_names``: names of required params (no default).
+#     Satisfied either positionally OR by matching kwarg name.
+#   * ``positional_param_names``: param names in positional order, used
+#     to compute "which params got filled by the call's positional args".
 _STDLIB_STATIC_SIGS: dict = {
     "simple_validate": {
-        "min_pos": 1,
+        # simple_validate(fn, *, reason=None)
         "max_pos": 1,
-        "valid_kwargs": frozenset({"reason"}),
+        "valid_kwargs": frozenset({"fn", "reason"}),
+        "required_param_names": frozenset({"fn"}),
+        "positional_param_names": ("fn",),
     },
     "req": {
-        "min_pos": 1,
+        # Curated shape: req(description, *, validation_fn=None) per
+        # mellea-fy-generate.md 'Known signatures' table (line ~246).
         "max_pos": 1,
-        "valid_kwargs": frozenset({"validation_fn"}),
+        "valid_kwargs": frozenset({"description", "validation_fn"}),
+        "required_param_names": frozenset({"description"}),
+        "positional_param_names": ("description",),
     },
     "check": {
-        "min_pos": 2,
+        # Curated shape: check(requirement, output) per
+        # mellea-fy-generate.md 'Known signatures' table (line ~247).
         "max_pos": 2,
-        "valid_kwargs": frozenset(),
+        "valid_kwargs": frozenset({"requirement", "output"}),
+        "required_param_names": frozenset({"requirement", "output"}),
+        "positional_param_names": ("requirement", "output"),
     },
 }
 
@@ -2237,18 +2372,48 @@ def _split_params_bracket_aware(inner: str) -> List[str]:
 
 
 def _parse_signature_string(sig_str: str) -> Optional[dict]:
-    """Parse a Python signature string into (min_pos, max_pos, valid_kwargs).
+    """Parse a Python signature string into a slot-fillable sig dict.
 
     Bracket-aware splitting so complex annotations
-    (`Literal[...]`, `Optional[X]`, `Union[...]`, etc.) don't break the
-    parameter parse.
+    (``Literal[...]``, ``Optional[X]``, ``Union[...]``, etc.) don't break
+    the parameter parse.
+
+    Honours Python's actual calling rules per :mod:`inspect`:
+
+      * Params before ``/`` are positional-only — accepted positionally
+        but NOT by keyword name.
+      * Params between ``/`` and ``*`` (or before ``*`` if no ``/``) are
+        positional-or-keyword — accepted EITHER way. This is the most
+        common kind and the one stdlib-arity previously mishandled
+        (treating them as positional-only, which produced the
+        ``MelleaSession(backend=...)`` false-positive observed
+        2026-05-19).
+      * Params after ``*`` are keyword-only.
+
+    Returns a dict with the shape contract documented at
+    :data:`_STDLIB_STATIC_SIGS`:
+
+      * ``max_pos``: cap on positional args.
+      * ``valid_kwargs``: every kwarg-acceptable name (positional-or-
+        keyword + keyword-only).
+      * ``required_param_names``: names of required params (no default).
+      * ``positional_param_names``: param names in positional order
+        (positional-only + positional-or-keyword), for slot-filling.
+
+    Returns ``None`` if the signature contains ``*args`` or ``**kwargs``
+    — those signatures can't be statically reasoned about.
     """
     inner = _extract_signature_param_block(sig_str)
     if inner is None:
         return None
     inner = inner.strip()
     if not inner:
-        return {"min_pos": 0, "max_pos": 0, "valid_kwargs": frozenset()}
+        return {
+            "max_pos": 0,
+            "valid_kwargs": frozenset(),
+            "required_param_names": frozenset(),
+            "positional_param_names": (),
+        }
     params_raw = _split_params_bracket_aware(inner)
     has_var = any(
         p.startswith("**") or (p.startswith("*") and p != "*")
@@ -2256,29 +2421,44 @@ def _parse_signature_string(sig_str: str) -> Optional[dict]:
     )
     if has_var:
         return None
-    min_pos = max_pos = 0
-    valid_kwargs: set = set()
-    after_kw_marker = False
+
+    # Two-pass parse:
+    #   * collect each param's (name, has_default) in order.
+    #   * track kind via the ``/`` and ``*`` markers.
+    # We retroactively reclassify everything before a ``/`` as positional-
+    # only when we encounter it, since the marker comes AFTER the params
+    # it applies to.
+    parsed: list[tuple[str, str, bool]] = []  # (name, kind, has_default)
+    seen_star = False
     for p in params_raw:
         if p == "/":
+            for i in range(len(parsed)):
+                n, _, d = parsed[i]
+                parsed[i] = (n, "positional_only", d)
             continue
         if p == "*":
-            after_kw_marker = True
+            seen_star = True
             continue
         name = p.split(":", 1)[0].split("=", 1)[0].strip()
         has_default = "=" in p
-        if after_kw_marker:
-            valid_kwargs.add(name)
-        else:
-            max_pos += 1
-            if not has_default:
-                min_pos += 1
-            else:
-                valid_kwargs.add(name)
+        kind = "keyword_only" if seen_star else "positional_or_keyword"
+        parsed.append((name, kind, has_default))
+
+    positional_param_names = tuple(
+        n for n, k, _ in parsed
+        if k in ("positional_only", "positional_or_keyword")
+    )
+    valid_kwargs = frozenset(
+        n for n, k, _ in parsed
+        if k in ("positional_or_keyword", "keyword_only")
+    )
+    required_param_names = frozenset(n for n, _, d in parsed if not d)
+
     return {
-        "min_pos": min_pos,
-        "max_pos": max_pos,
-        "valid_kwargs": frozenset(valid_kwargs),
+        "max_pos": len(positional_param_names),
+        "valid_kwargs": valid_kwargs,
+        "required_param_names": required_param_names,
+        "positional_param_names": positional_param_names,
     }
 
 
@@ -2361,41 +2541,74 @@ def lint_stdlib_arity(package_dir: Path) -> LintResult:
                 continue
             sig = combined[name]
             n_pos = len(node.args)
-            if not (sig["min_pos"] <= n_pos <= sig["max_pos"]):
+            call_kw_names = {
+                kw.arg for kw in node.keywords if kw.arg is not None
+            }
+
+            # Check 1: too many positional args.
+            if n_pos > sig["max_pos"]:
                 result.failures.append(
                     LintFailure(
                         file=rel,
                         line=getattr(node, "lineno", None),
-                        column=getattr(node, "col_offset", None),
+                        column=_col_offset_to_schema(node),
                         message=(
                             f"`{name}(...)` called with {n_pos} positional "
-                            f"argument(s); signature requires between "
-                            f"{sig['min_pos']} and {sig['max_pos']} positional"
-                            f" arg(s). Consult intermediate/"
-                            f"mellea_api_ref.json:.modules."
+                            f"argument(s); signature accepts at most "
+                            f"{sig['max_pos']} positional. Consult "
+                            f"intermediate/mellea_api_ref.json:.modules."
                         ),
                         rule_ref="Rule 4-4 (stdlib-arity)",
                     )
                 )
+
+            # Check 2: unknown kwarg names. Positional-or-keyword params
+            # appear in ``valid_kwargs``; positional-only params do not.
             for kw in node.keywords:
                 if kw.arg is None:
                     continue
                 if kw.arg not in sig["valid_kwargs"]:
+                    valid_list = sorted(sig["valid_kwargs"]) or "(none)"
                     result.failures.append(
                         LintFailure(
                             file=rel,
                             line=getattr(node, "lineno", None),
-                            column=getattr(node, "col_offset", None),
+                            column=_col_offset_to_schema(node),
                             message=(
                                 f"`{name}(...)` has unrecognised keyword "
                                 f"argument '{kw.arg}'. Valid keyword args: "
-                                f"{sorted(sig['valid_kwargs']) or '(none)'}. "
-                                f"Common typo: `validator=` instead of "
-                                f"`validation_fn=` for `req()`."
+                                f"{valid_list}. Consult intermediate/"
+                                f"mellea_api_ref.json:.modules."
                             ),
                             rule_ref="Rule 4-4 (stdlib-arity)",
                         )
                     )
+
+            # Check 3: missing required params (filled either by
+            # position or by keyword). The first ``n_pos`` positional
+            # arg slots are filled by the call's positional args, in
+            # order — see ``positional_param_names``. Remaining slots
+            # need to be filled by name via kwargs.
+            positional_filled = set(
+                sig.get("positional_param_names", ())[:n_pos]
+            )
+            filled = positional_filled | call_kw_names
+            missing = sig.get("required_param_names", frozenset()) - filled
+            if missing:
+                result.failures.append(
+                    LintFailure(
+                        file=rel,
+                        line=getattr(node, "lineno", None),
+                        column=_col_offset_to_schema(node),
+                        message=(
+                            f"`{name}(...)` missing required parameter(s): "
+                            f"{sorted(missing)}. Pass each one either "
+                            f"positionally or by keyword name. Consult "
+                            f"intermediate/mellea_api_ref.json:.modules."
+                        ),
+                        rule_ref="Rule 4-4 (stdlib-arity)",
+                    )
+                )
 
     if result.failures:
         result.verdict = "fail"
@@ -2692,7 +2905,7 @@ def _scan_scope_for_kb1(
                         LintFailure(
                             file=rel,
                             line=getattr(sub, "lineno", None),
-                            column=getattr(sub, "col_offset", None),
+                            column=_col_offset_to_schema(sub),
                             message=(
                                 f"`{base.id}` is the result of "
                                 f"`m.instruct(..., format=Model)` and is a "
@@ -3018,7 +3231,7 @@ def lint_complex_schema_needs_strategy_or_fallback(
                     LintFailure(
                         file=rel,
                         line=getattr(instruct_call, "lineno", None),
-                        column=getattr(instruct_call, "col_offset", None),
+                        column=_col_offset_to_schema(instruct_call),
                         message=(
                             f"`m.instruct(..., format={model_name})` targets "
                             f"a complex schema ({reason_str}) but neither "
@@ -3175,7 +3388,7 @@ def lint_grounding_context_types(package_dir: Path) -> LintResult:
                     line = getattr(value_node, "lineno", None) or getattr(
                         node, "lineno", None
                     )
-                    column = getattr(value_node, "col_offset", None)
+                    column = _col_offset_to_schema(value_node)
                     if kind == "definite":
                         has_definite = True
                         result.failures.append(
@@ -3329,7 +3542,7 @@ def lint_format_annotation(package_dir: Path) -> LintResult:
                         LintFailure(
                             file=rel,
                             line=getattr(instruct_call, "lineno", None),
-                            column=getattr(instruct_call, "col_offset", None),
+                            column=_col_offset_to_schema(instruct_call),
                             message=(
                                 f"m.instruct() result `{thunk_name}` is "
                                 f"parsed via `<Model>.model_validate_json"
@@ -3370,7 +3583,7 @@ def lint_format_annotation(package_dir: Path) -> LintResult:
                     LintFailure(
                         file=rel,
                         line=getattr(instruct_call, "lineno", None),
-                        column=getattr(instruct_call, "col_offset", None),
+                        column=_col_offset_to_schema(instruct_call),
                         message=(
                             f"m.instruct() result `{first.id}` is parsed "
                             f"via `{callee}({first.id}, ...)` but the "
@@ -3502,8 +3715,141 @@ def _names_referenced_in_block(stmts: list) -> set:
     return refs
 
 
+def _block_falls_through(stmts: List[ast.stmt]) -> bool:
+    """True if executing the given block of statements possibly falls
+    through to the next statement (doesn't unconditionally raise / return /
+    break / continue).
+
+    Used by sub-check C to decide whether the code AFTER an ``if`` is
+    reachable from a given branch — and therefore whether a name bound
+    only in that branch can be relied on past the branch.
+    """
+    for stmt in stmts:
+        if isinstance(stmt, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+            return False
+        if isinstance(stmt, ast.If):
+            body_falls = _block_falls_through(stmt.body)
+            else_falls = (
+                _block_falls_through(stmt.orelse) if stmt.orelse else True
+            )
+            if not body_falls and not else_falls:
+                return False
+    return True
+
+
+def _stmt_adds_bindings(stmt: ast.stmt) -> set:
+    """Names this single statement adds to the guaranteed-bound set when
+    control falls through to the next statement. Conservative: only
+    counts names whose binding is unconditional within the statement.
+
+    For ``If`` statements, intersects names bound in all *falling-through*
+    branches (a raising branch contributes nothing to what's reachable
+    after the if). For loops, bindings inside the body are not counted
+    (the body may not execute). For try, the try-body bindings are
+    counted (if the try didn't fall through, we don't reach the next
+    statement at all).
+    """
+    if isinstance(stmt, ast.Assign):
+        added = set()
+        for target in stmt.targets:
+            if isinstance(target, ast.Name):
+                added.add(target.id)
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                for elt in target.elts:
+                    if isinstance(elt, ast.Name):
+                        added.add(elt.id)
+        return added
+    if isinstance(stmt, ast.AnnAssign):
+        if isinstance(stmt.target, ast.Name) and stmt.value is not None:
+            return {stmt.target.id}
+        return set()
+    if isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
+        return {stmt.target.id}
+    if isinstance(stmt, ast.NamedExpr) and isinstance(stmt.target, ast.Name):
+        return {stmt.target.id}
+    if isinstance(stmt, ast.With):
+        added = set()
+        for item in stmt.items:
+            if isinstance(item.optional_vars, ast.Name):
+                added.add(item.optional_vars.id)
+        if _block_falls_through(stmt.body):
+            added |= _block_adds_bindings(stmt.body)
+        return added
+    if isinstance(stmt, ast.If):
+        body_falls = _block_falls_through(stmt.body)
+        else_falls = (
+            _block_falls_through(stmt.orelse) if stmt.orelse else True
+        )
+        body_adds = _block_adds_bindings(stmt.body) if body_falls else None
+        else_adds = (
+            _block_adds_bindings(stmt.orelse) if stmt.orelse else set()
+        ) if else_falls else None
+        if body_adds is not None and else_adds is not None:
+            return body_adds & else_adds
+        if body_adds is not None:
+            return body_adds  # only body falls through
+        if else_adds is not None:
+            return else_adds  # only orelse falls through
+        return set()  # neither branch falls through
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {stmt.name}
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        added = set()
+        for alias in stmt.names:
+            added.add(alias.asname or alias.name.split(".")[0])
+        return added
+    if isinstance(stmt, ast.Try):
+        # Try-body bindings count for post-try scope: if the try didn't
+        # complete, we raised and won't reach the next statement.
+        # Except-handler bindings vary across handlers; conservatively
+        # ignore them (a name bound only in an except handler isn't
+        # guaranteed for post-try code).
+        if _block_falls_through(stmt.body):
+            adds = _block_adds_bindings(stmt.body)
+        else:
+            adds = set()
+        # The finally block runs regardless and can bind names; if
+        # present, count its bindings too (it's the only path through).
+        if stmt.finalbody and _block_falls_through(stmt.finalbody):
+            adds |= _block_adds_bindings(stmt.finalbody)
+        return adds
+    if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+        # Loop body may not run; conservatively, no guarantee.
+        return set()
+    return set()
+
+
+def _block_adds_bindings(stmts: List[ast.stmt]) -> set:
+    """Names guaranteed bound after executing the full block (assuming
+    the block falls through). Composes per-statement adds in order.
+    """
+    bound = set()
+    for stmt in stmts:
+        bound |= _stmt_adds_bindings(stmt)
+    return bound
+
+
+def _function_parameter_names(func: ast.FunctionDef) -> set:
+    """Set of parameter names for the function — always considered bound
+    inside its scope (excluding the function-name itself)."""
+    args = func.args
+    out: set = set()
+    for arg in (
+        *args.posonlyargs,
+        *args.args,
+        *args.kwonlyargs,
+    ):
+        out.add(arg.arg)
+    if args.vararg:
+        out.add(args.vararg.arg)
+    if args.kwarg:
+        out.add(args.kwarg.arg)
+    return out
+
+
 def lint_variable_safety(package_dir: Path) -> LintResult:
-    """Two sub-checks: uninit-in-except (A) and builtin-shadowing args (B).
+    """Three sub-checks: uninit-in-except (A), builtin-shadowing args (B),
+    and conditional-bind / unconditional-use (C).
 
     Sub-check A: every Name referenced in an `except` or `finally` block of a
     `try` must have been bound either (i) by an Assign/AnnAssign in the
@@ -3516,6 +3862,19 @@ def lint_variable_safety(package_dir: Path) -> LintResult:
     Sub-check B: function argument names that shadow Python builtins
     (e.g. `def f(dict, list)`) — produces subtle bugs because the shadowed
     function can no longer be called inside the function body.
+
+    Sub-check C (added 2026-05-20 from the gdpr-breach-sentinel
+    ``assemble_dashboard`` UnboundLocalError): inside a function, a
+    ``return`` statement's bare-Name reference must be a name
+    GUARANTEED bound at that point. A name bound only on some branches
+    of an ``if/elif/else`` (without an ``else`` binding, or in a branch
+    that raises rather than binds) is conditionally bound; returning it
+    unconditionally raises UnboundLocalError on the branches that
+    didn't bind. The check uses a small structural flow analysis:
+    statements compose left-to-right; for an ``if``, names guaranteed
+    bound afterwards are the intersection over *falling-through*
+    branches (a branch that raises contributes nothing). Loops and
+    except-only bindings are excluded conservatively.
 
     Scope: all .py files in the compiled package's top-level directory.
     """
@@ -3549,7 +3908,7 @@ def lint_variable_safety(package_dir: Path) -> LintResult:
                         LintFailure(
                             file=rel,
                             line=getattr(arg, "lineno", getattr(node, "lineno", None)),
-                            column=getattr(arg, "col_offset", None),
+                            column=_col_offset_to_schema(arg),
                             message=(
                                 f"function `{node.name}` argument `{arg.arg}` "
                                 f"shadows the Python builtin `{arg.arg}`. "
@@ -3604,7 +3963,7 @@ def lint_variable_safety(package_dir: Path) -> LintResult:
                             LintFailure(
                                 file=rel,
                                 line=getattr(handler, "lineno", None),
-                                column=getattr(handler, "col_offset", None),
+                                column=_col_offset_to_schema(handler),
                                 message=(
                                     f"name `{name}` is referenced in an "
                                     f"`except` block but only bound inside "
@@ -3641,6 +4000,374 @@ def lint_variable_safety(package_dir: Path) -> LintResult:
                                 rule_ref="variable-safety[A] (uninit-in-finally)",
                             )
                         )
+
+        # Sub-check C: conditional-bind / unconditional-use at Return.
+        # For each function, walk its top-level body. Track the set of
+        # names guaranteed bound at each statement boundary. For every
+        # `return` whose value contains Name Loads, verify each loaded
+        # name is in the guaranteed-bound set OR is a parameter / known
+        # module-level binding / Python builtin. Otherwise flag.
+        import builtins as _py_builtins  # local import — small, leaf-cost
+
+        # Module-scope guaranteed bindings (imports + top-level defs).
+        # Computed once per file.
+        module_bound = _block_adds_bindings(tree.body)
+
+        for func in ast.walk(tree):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            # Collect all names ASSIGNED anywhere inside this function —
+            # used to filter the flagging logic to local-ish names only,
+            # so we don't flag closures / globals / module-level refs.
+            all_func_locals: set = set(_function_parameter_names(func))
+            for f_node in ast.walk(func):
+                if isinstance(f_node, ast.Assign):
+                    for t in f_node.targets:
+                        if isinstance(t, ast.Name):
+                            all_func_locals.add(t.id)
+                        elif isinstance(t, (ast.Tuple, ast.List)):
+                            for elt in t.elts:
+                                if isinstance(elt, ast.Name):
+                                    all_func_locals.add(elt.id)
+                elif isinstance(f_node, ast.AnnAssign) and isinstance(
+                    f_node.target, ast.Name
+                ):
+                    all_func_locals.add(f_node.target.id)
+                elif isinstance(f_node, ast.AugAssign) and isinstance(
+                    f_node.target, ast.Name
+                ):
+                    all_func_locals.add(f_node.target.id)
+
+            bound: set = set(_function_parameter_names(func))
+            for stmt in func.body:
+                if isinstance(stmt, ast.Return) and stmt.value is not None:
+                    for sub in ast.walk(stmt.value):
+                        if not isinstance(sub, ast.Name):
+                            continue
+                        if not isinstance(sub.ctx, ast.Load):
+                            continue
+                        nm = sub.id
+                        # Already bound at this point in flow → safe.
+                        if nm in bound:
+                            continue
+                        # Module-level / builtin → safe.
+                        if nm in module_bound or hasattr(_py_builtins, nm):
+                            continue
+                        # If the name isn't assigned anywhere in the
+                        # function, it's a closure/global; not our
+                        # concern.
+                        if nm not in all_func_locals:
+                            continue
+                        result.failures.append(
+                            LintFailure(
+                                file=rel,
+                                line=getattr(stmt, "lineno", None),
+                                column=_col_offset_to_schema(stmt),
+                                message=(
+                                    f"name `{nm}` is referenced in a "
+                                    f"`return` statement of function "
+                                    f"`{func.name}` but is only bound "
+                                    f"on some control-flow paths — at "
+                                    f"least one branch reaches this "
+                                    f"return without binding `{nm}`. "
+                                    f"Calling `{func.name}` along that "
+                                    f"path raises UnboundLocalError. "
+                                    f"Fix: either bind `{nm} = <default>` "
+                                    f"at the top of the function, or "
+                                    f"ensure every branch that falls "
+                                    f"through to this return binds "
+                                    f"`{nm}`. (Tip: if you introduced a "
+                                    f"unifying name like "
+                                    f"`assessment_branch = ...` in each "
+                                    f"branch, the return statement "
+                                    f"likely wants THAT name, not the "
+                                    f"branch-specific one.)"
+                                ),
+                                rule_ref="variable-safety[C] (cond-bind / uncond-use)",
+                            )
+                        )
+                bound |= _stmt_adds_bindings(stmt)
+
+    if result.failures:
+        result.verdict = "fail"
+    return result
+
+
+# ─── Lint: stdlib-arg-types ───
+#
+# Catches the failure class observed in tech-contract (2026-05-19) and gpai
+# (2026-05-20): a Mellea API kwarg with a dict annotation receives a
+# clearly-non-dict argument, crashing at runtime with
+# ``AttributeError: '<TypeName>' object has no attribute 'items'``.
+#
+# Narrow first version: focuses on ``grounding_context=`` kwarg on the
+# Mellea-session ``instruct`` / ``chat`` / ``act`` family — that's the
+# parameter where the observed runtime crashes happen. Expansion to other
+# dict-typed Mellea kwargs is a follow-up.
+#
+# Detection strategy:
+#   * Walk pipeline.py / slots.py / requirements.py / other top-level
+#     package .py files.
+#   * Find function definitions; record each parameter's name + annotation.
+#   * Find all ``ast.Call`` nodes whose ``.func.attr`` is in the family
+#     ``{instruct, chat, achat, ainstruct, act, aact, instruct_async}``.
+#   * For each such call, check the ``grounding_context=`` kwarg (if any).
+#   * Classify the argument expression:
+#       - ``ast.Dict`` literal / ``dict(...)`` call    → OK (definite dict).
+#       - ``ast.Constant`` of non-dict type (str/int/  → FAIL (definite
+#         float/bool/None) or ``ast.JoinedStr`` (f-      non-dict).
+#         string)
+#       - ``ast.Name`` whose annotation in the enclosing→ FAIL (definite
+#         function's params is NOT a dict-family type    non-dict via
+#                                                       annotation).
+#       - Anything else                                 → SKIP (ambiguous).
+#
+# False-positive avoidance: only flag when the non-dict-ness is statically
+# *provable*. Names with unknown annotations, attribute accesses, calls,
+# arithmetic expressions etc. are skipped. The lint surfaces the
+# observed-in-the-wild patterns, not every possible misuse.
+
+
+_STDLIB_ARG_TYPES_FILES: Tuple[str, ...] = (
+    "pipeline.py",
+    "slots.py",
+    "requirements.py",
+    "constrained_slots.py",
+    "tools.py",
+)
+
+# Mellea session-method names whose ``grounding_context=`` kwarg is
+# dict-typed (per the introspected mellea_api_ref.json). Hard-coded for
+# the narrow MVP; future expansion can derive this from the surface.
+_GROUNDING_CONTEXT_METHODS: frozenset = frozenset({
+    "instruct",
+    "chat",
+    "act",
+    "ainstruct",
+    "achat",
+    "aact",
+})
+
+# Annotation forms that count as dict-family at the lint level.
+_DICT_FAMILY_BASES: frozenset = frozenset({
+    "dict",
+    "Dict",
+    "Mapping",
+    "MutableMapping",
+    "OrderedDict",
+    "DefaultDict",
+})
+
+
+def _annotation_is_dict_family(node: Optional[ast.expr]) -> Optional[bool]:
+    """Classify a parameter annotation expression.
+
+    Returns:
+      * ``True``  — annotation IS dict-family (``dict``, ``dict[str, X]``,
+        ``Mapping``, etc.).
+      * ``False`` — annotation is provably NOT dict-family (a concrete
+        non-dict class name, ``str``, ``list[...]``, ``Optional[str]``
+        without a dict branch, etc.).
+      * ``None``  — annotation is missing / ambiguous (``Any``, unions
+        containing dict, generic ``object``, no annotation at all).
+        The lint must NOT flag arguments whose annotations are ``None``
+        here — that's the ambiguous case where we can't statically prove
+        the type.
+    """
+    if node is None:
+        return None
+    # Bare Name: e.g. ``dict``, ``str``, ``NegotiationContext``.
+    if isinstance(node, ast.Name):
+        if node.id in _DICT_FAMILY_BASES:
+            return True
+        if node.id == "Any" or node.id == "object":
+            return None
+        # Any other bare class name is treated as a concrete non-dict
+        # type (this is the case that catches `context: NegotiationContext`).
+        return False
+    # Subscripted generic: ``dict[str, int]``, ``Mapping[str, X]``,
+    # ``Optional[str]``, ``list[int]``, etc.
+    if isinstance(node, ast.Subscript):
+        base = node.value
+        if isinstance(base, ast.Name):
+            if base.id in _DICT_FAMILY_BASES:
+                return True
+            if base.id in {"Optional", "Union"}:
+                # Conservative: an Optional/Union that doesn't OBVIOUSLY
+                # contain dict is ambiguous (it could be str | dict, etc.).
+                return None
+            # Concrete generic non-dict (list[...], tuple[...], set[...],
+            # etc.).
+            return False
+        return None
+    # ``str | dict`` etc. (PEP 604). Treat as ambiguous unless we can
+    # walk the union and confirm one side is dict-family — for now,
+    # ambiguous to avoid false positives.
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return None
+    # ``Constant`` like ``"NegotiationContext"`` (forward ref) — treat
+    # as concrete class name → non-dict.
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        if node.value in _DICT_FAMILY_BASES:
+            return True
+        # Otherwise treat as a class-name forward-ref (non-dict).
+        return False
+    return None
+
+
+def _classify_grounding_context_arg(
+    value: ast.expr, param_annotations: Dict[str, ast.expr]
+) -> Optional[str]:
+    """Classify a single ``grounding_context=<expr>`` argument value.
+
+    Returns:
+      * ``"non_dict_literal"`` — the value is a non-dict Constant or
+        f-string literal.
+      * ``"non_dict_param"``   — the value is a Name pointing to a
+        function parameter whose annotation is provably non-dict.
+      * ``None`` — the value is dict-shape (Dict literal, ``dict()`` call,
+        Name with dict annotation) OR is ambiguous (we can't statically
+        prove the type).
+    """
+    # Dict literal `{...}` → OK.
+    if isinstance(value, ast.Dict):
+        return None
+    # `dict()` / `dict(...)` call → OK.
+    if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "dict":
+        return None
+    # `OrderedDict()` etc. → OK.
+    if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id in _DICT_FAMILY_BASES:
+        return None
+    # Non-dict literal: string, int, float, bool, None.
+    if isinstance(value, ast.Constant) and not isinstance(value.value, dict):
+        if value.value is None:
+            # `grounding_context=None` is a Mellea idiom (treated as empty
+            # dict by some versions). Don't flag; ambiguous wrt API.
+            return None
+        return "non_dict_literal"
+    # f-string is always a str at runtime.
+    if isinstance(value, ast.JoinedStr):
+        return "non_dict_literal"
+    # Name pointing to a function parameter with a provably-non-dict
+    # annotation.
+    if isinstance(value, ast.Name):
+        annotation = param_annotations.get(value.id)
+        if annotation is not None:
+            classification = _annotation_is_dict_family(annotation)
+            if classification is False:  # provably non-dict
+                return "non_dict_param"
+    return None
+
+
+def _collect_function_param_annotations(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> Dict[str, ast.expr]:
+    """Map each parameter name → its annotation AST node (or skip if
+    no annotation)."""
+    out: Dict[str, ast.expr] = {}
+    args = func.args
+    for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+        if arg.annotation is not None:
+            out[arg.arg] = arg.annotation
+    if args.vararg and args.vararg.annotation is not None:
+        out[args.vararg.arg] = args.vararg.annotation
+    if args.kwarg and args.kwarg.annotation is not None:
+        out[args.kwarg.arg] = args.kwarg.annotation
+    return out
+
+
+def lint_stdlib_arg_types(package_dir: Path) -> LintResult:
+    """Flag clearly-non-dict arguments passed to Mellea API ``grounding_context=`` kwargs.
+
+    Narrow MVP scope: only checks ``grounding_context=`` on session-method
+    calls in the ``instruct``/``chat``/``act`` family. Future expansion
+    can read the full set of dict-typed Mellea parameters from
+    ``mellea_api_ref.json``.
+
+    See the section comment above for the full classification matrix.
+    """
+    result = LintResult(lint_id="stdlib-arg-types", verdict="pass")
+
+    files_to_check: List[Path] = []
+    for fname in _STDLIB_ARG_TYPES_FILES:
+        p = package_dir / fname
+        if p.exists():
+            files_to_check.append(p)
+    result.files_checked = len(files_to_check)
+
+    for py_file in files_to_check:
+        rel = py_file.relative_to(package_dir).as_posix()
+        try:
+            tree = ast.parse(py_file.read_text(), filename=str(py_file))
+        except SyntaxError:
+            continue
+
+        # Walk each function; collect its parameter annotations, then
+        # walk Call nodes inside it for grounding_context= kwargs.
+        for func in ast.walk(tree):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            annotations = _collect_function_param_annotations(func)
+
+            for node in ast.walk(func):
+                if not isinstance(node, ast.Call):
+                    continue
+                if not isinstance(node.func, ast.Attribute):
+                    continue
+                method_name = node.func.attr
+                if method_name not in _GROUNDING_CONTEXT_METHODS:
+                    continue
+                for kw in node.keywords:
+                    if kw.arg != "grounding_context":
+                        continue
+                    classification = _classify_grounding_context_arg(
+                        kw.value, annotations
+                    )
+                    if classification is None:
+                        continue
+                    if classification == "non_dict_literal":
+                        msg = (
+                            f"`{method_name}(...)` call passes a "
+                            f"non-dict literal as `grounding_context=`. "
+                            f"Mellea iterates this argument with "
+                            f"`.items()` — a string/int/list/bool "
+                            f"argument crashes at runtime with "
+                            f"`AttributeError: '<type>' object has no "
+                            f"attribute 'items'`. Pass an actual dict, "
+                            f"e.g. `grounding_context={{}}` or "
+                            f"`grounding_context={{...}}`."
+                        )
+                    else:  # non_dict_param
+                        param_ref = (
+                            ast.unparse(kw.value)
+                            if hasattr(ast, "unparse")
+                            else getattr(kw.value, "id", "<expr>")
+                        )
+                        msg = (
+                            f"`{method_name}(...)` call passes "
+                            f"`grounding_context={param_ref}` where "
+                            f"`{param_ref}` is a function parameter "
+                            f"annotated with a non-dict type. Mellea "
+                            f"iterates the argument with `.items()` and "
+                            f"crashes with `AttributeError: '<type>' "
+                            f"object has no attribute 'items'` at "
+                            f"runtime. Either change the parameter "
+                            f"annotation to a dict-family type, OR "
+                            f"convert the value at the call site (e.g. "
+                            f"`grounding_context={param_ref}.model_dump()`"
+                            f" for a Pydantic model, or "
+                            f"`grounding_context={{'key': str({param_ref})}}`"
+                            f")."
+                        )
+                    result.failures.append(
+                        LintFailure(
+                            file=rel,
+                            line=getattr(node, "lineno", None),
+                            column=_col_offset_to_schema(node),
+                            message=msg,
+                            rule_ref="stdlib-arg-types",
+                        )
+                    )
 
     if result.failures:
         result.verdict = "fail"
@@ -3754,7 +4481,7 @@ def lint_import_side_effects(package_dir: Path) -> LintResult:
                     LintFailure(
                         file=rel,
                         line=getattr(stmt, "lineno", None),
-                        column=getattr(stmt, "col_offset", None),
+                        column=_col_offset_to_schema(stmt),
                         message=(
                             f"module-level call `{chain}(...)` executes at "
                             f"import time. Outside the allowlist (logging."
@@ -3785,7 +4512,7 @@ def lint_import_side_effects(package_dir: Path) -> LintResult:
                         LintFailure(
                             file=rel,
                             line=getattr(stmt, "lineno", None),
-                            column=getattr(stmt, "col_offset", None),
+                            column=_col_offset_to_schema(stmt),
                             message=(
                                 f"module-level assignment `<var> = {chain}"
                                 f"(...)` executes the callee at import. "
@@ -4225,6 +4952,7 @@ ALL_LINTS: Tuple[Callable[[Path], LintResult], ...] = (
     lint_grounding_context_types,
     lint_format_annotation,
     lint_variable_safety,
+    lint_stdlib_arg_types,
     lint_import_side_effects,
 )
 
@@ -4350,8 +5078,14 @@ def _run_smoke_check_inline(
 
     first = run_result.fixtures[0]
     if first.verdict == "passed":
+        # Schema for step_7_report.smoke_check.verdict requires
+        # past-tense values ("passed"/"failed"/"skipped"). Earlier this
+        # translator inverted to present-tense ("pass"/"fail") which
+        # tripped the writer-vs-schema validator at every smoke compile
+        # — drift #3 in the lints↔schema saga, caught 2026-05-20 on the
+        # gpai-code-of-practice smoke-check report.
         return SmokeCheckOutcome(
-            verdict="pass",
+            verdict="passed",
             fixture_used=first.fixture_id,
             duration_seconds=first.duration_seconds,
             backend_available=backend_available,
@@ -4364,9 +5098,10 @@ def _run_smoke_check_inline(
             backend_available=backend_available,
             skipped_reason=first.skipped_reason or "fixture skipped",
         )
-    # failed
+    # failed — schema requires past-tense "failed"; see the matching
+    # comment on the "passed" branch above for context.
     return SmokeCheckOutcome(
-        verdict="fail",
+        verdict="failed",
         fixture_used=first.fixture_id,
         duration_seconds=first.duration_seconds,
         backend_available=backend_available,
@@ -4457,7 +5192,7 @@ def run_lints(
                 # Caller demanded smoke; treat unavailability as a failure.
                 overall = "fail"
             elif (
-                smoke_outcome.verdict == "fail"
+                smoke_outcome.verdict == "failed"
                 and warnings > 0
                 and blocking_failures == 0
                 and not strict
@@ -4481,6 +5216,20 @@ def run_lints(
 
     intermediate = package_dir / "intermediate"
     intermediate.mkdir(parents=True, exist_ok=True)
+    # Per the step_7_report schema, this is the LIST of lint ids whose
+    # WARNING-severity failures were promoted to blocking for this run.
+    # We derive it from ``results`` rather than tracking it separately;
+    # the boolean ``escalated_warnings`` flag above gates whether the
+    # list is populated at all.
+    escalated_lint_ids: list[str] = (
+        [
+            r.lint_id
+            for r in results
+            if r.verdict == "fail" and r.severity == LintSeverity.WARNING
+        ]
+        if escalated_warnings
+        else []
+    )
     report = {
         "format_version": "1.1",
         "checked_at": run_result.checked_at,
@@ -4491,7 +5240,7 @@ def run_lints(
         "info_failures": info_failures,
         "strict": strict,
         "smoke_check_mode": smoke_mode,
-        "warnings_escalated_by_smoke": escalated_warnings,
+        "warnings_escalated_by_smoke": escalated_lint_ids,
         "smoke_check": (
             {
                 "verdict": smoke_outcome.verdict,
@@ -4529,6 +5278,58 @@ def run_lints(
             for r in results
         ],
     }
+    _validate_step_7_report(report)
     (intermediate / "step_7_report.json").write_text(json.dumps(report, indent=2))
 
     return run_result
+
+
+def _validate_step_7_report(report: dict) -> None:
+    """Validate the report payload against ``step_7_report.schema.json``.
+
+    Best-effort: a schema-validation failure logs a loud warning but does
+    NOT raise. The report still gets written so consumers (the repair
+    loop, CI tooling) see what the run actually produced. The warning is
+    the regression signal — schema drift is something we want surfaced
+    immediately, not hidden behind a silently-mismatched payload.
+
+    Resolved by importlib.resources so the schema is found regardless of
+    how the package is installed (editable, wheel, or zipapp).
+    """
+    try:
+        import jsonschema
+        from importlib.resources import files
+    except ImportError:
+        # jsonschema is a hard dep of the project; this branch only
+        # triggers in stripped environments. Skip validation silently
+        # there — the report on disk is still useful.
+        return
+    try:
+        schema_path = (
+            files("mellea_skills_compiler.compile.schemas")
+            / "step_7_report.schema.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        jsonschema.validate(report, schema)
+    except FileNotFoundError:
+        # Schema file missing from the install — warn but proceed.
+        LOGGER.warning(
+            "step_7_report schema not found at "
+            "mellea_skills_compiler.compile.schemas/step_7_report.schema.json; "
+            "skipping payload validation. Reinstall the package to restore."
+        )
+    except jsonschema.ValidationError as exc:
+        LOGGER.warning(
+            "step_7_report payload does not conform to its schema: %s. "
+            "The report has still been written to disk; consider this a "
+            "drift warning — the writer and the schema disagree and one "
+            "of them needs updating.",
+            exc.message,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        # Validation should never crash report emission. Log and move on.
+        LOGGER.warning(
+            "step_7_report schema validation crashed unexpectedly: %s. "
+            "The report has still been written to disk.",
+            exc,
+        )

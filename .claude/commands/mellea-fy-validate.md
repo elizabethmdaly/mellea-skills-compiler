@@ -67,7 +67,7 @@ For `mellea.stdlib.*` calls to functions **not** in the table above: if `interme
 
 **`instruct-has-description`** (KB12, Mellea 0.5+ invariant): every `m.instruct(...)` call in `pipeline.py`, `slots.py`, and `constrained_slots.py` must supply a `description` argument — either as the first positional argument or as a `description=` keyword. Mellea 0.5's `MelleaSession.instruct(description, *, ...)` makes `description` positional-required; calls without it crash at runtime with `TypeError: instruct() missing 1 required positional argument: 'description'`. Detection: parse the three files with `ast`; for every `Call` whose func is `Attribute(value=Name('m'), attr='instruct')`, assert `args` is non-empty OR `keywords` contains `description=`. Hard failure naming filename + line of the offending call. Scope: generated `.py` files only; only `m.instruct` is in scope (other `*.instruct` callsites are ignored).
 
-**`pipeline-entry-canonical`** (canonical entry-point contract): `<package_name>/pipeline.py` MUST define a top-level `run_pipeline` function, and `<package_name>/melleafy.json:entry_signature` (when present) MUST start with `run_pipeline(`. Empirically observed regression: a package with `run_phase_2_gap_analysis`, `run_phase_3_roadmap`, and `run_pipeline` as public top-level functions caused the smoke-check loader to pick `run_phase_2_gap_analysis` (alphabetically first under `dir()`) and crash with `TypeError` when invoked with entry-point kwargs. The loader at `toolkit/file_utils.py:load_skill_pipeline` was patched to use `melleafy.json:entry_signature` as authoritative; this lint backstops the contract so misalignment is caught at compile time. Detection: AST-parse `pipeline.py`; collect names of all top-level `FunctionDef`/`AsyncFunctionDef` starting with `run_`; (a) hard-fail if `run_pipeline` is not among them, naming the helpers that were found instead; (b) parse `melleafy.json:entry_signature` with regex `^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(`; if the captured name is not `run_pipeline`, hard-fail. Public helper functions named `run_*` are PERMITTED alongside `run_pipeline` — the loader uses the manifest, so naming collisions don't matter. **Hard-fails when `pipeline.py` is absent (Bug 1 fix, 2026-05-17)** — descriptor-mode renderer rejection or any other pre-Step-7 omission of `pipeline.py` surfaces as a lint failure rather than a silent miss. Previously skipped in that case, which masked three real overnight-batch failures.
+**`pipeline-entry-canonical`** (canonical entry-point contract): `<package_name>/pipeline.py` MUST define a top-level `run_pipeline` function, and `<package_name>/melleafy.json:entry_signature` (when present) MUST start with `run_pipeline(`. Empirically observed regression: a package with `run_phase_2_gap_analysis`, `run_phase_3_roadmap`, and `run_pipeline` as public top-level functions caused the smoke-check loader to pick `run_phase_2_gap_analysis` (alphabetically first under `dir()`) and crash with `TypeError` when invoked with entry-point kwargs. The loader at `toolkit/file_utils.py:load_skill_pipeline` was patched to use `melleafy.json:entry_signature` as authoritative; this lint backstops the contract so misalignment is caught at compile time. Detection: AST-parse `pipeline.py`; collect names of all top-level `FunctionDef`/`AsyncFunctionDef` starting with `run_`; (a) hard-fail if `run_pipeline` is not among them, naming the helpers that were found instead; (b) parse `melleafy.json:entry_signature` with regex `^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(`; if the captured name is not `run_pipeline`, hard-fail. Public helper functions named `run_*` are PERMITTED alongside `run_pipeline` — the loader uses the manifest, so naming collisions don't matter. **Hard-fails when `pipeline.py` is absent** — descriptor-mode renderer rejection or any other pre-Step-7 omission of `pipeline.py` surfaces as a lint failure rather than a silent miss. Previously skipped in that case, which masked three real overnight-batch failures.
 
 **`fixture-signature-bound`** (R16 mechanical enforcement): every `make_<id>()` factory in `<package_name>/fixtures/*.py` whose body contains an `inputs = {…}` literal MUST have only string-literal keys, and each key MUST be a parameter name of `run_pipeline` in `pipeline.py` (unless the signature includes `**kwargs`). The smoke-check invokes `run_pipeline(**inputs)`; any extra key raises `TypeError: got an unexpected keyword argument '<key>'` at fixture-run time. The prose contract already lives in `mellea-fy-fixtures.md` ("The keys in every fixture's `inputs` object MUST be identical to the parameter names of the `run_pipeline` function") — this lint enforces it mechanically. Detection: AST-parse `pipeline.py`, locate `def run_pipeline(...)`, collect parameter names (positional, kw-only, and the presence of `**kwargs`); for each `fixtures/*.py` file (excluding `__init__.py`), AST-parse and find every `FunctionDef` whose name starts with `make_`; walk its body for an `Assign` to `inputs` with a `Dict` value; report any key not in the entry parameter set. Skip-fixture (silent, not a failure) when `inputs` is constructed dynamically (non-`Dict` RHS) or uses non-string-literal keys — the lint cannot statically verify these and defers to runtime. Skipped (verdict=`skipped`) when `pipeline.py` is absent, when `run_pipeline` is absent from `pipeline.py` (owned by `pipeline-entry-canonical`), when the signature includes `**kwargs`, or when `fixtures/` is absent (owned by `fixtures-loader-contract`).
 
@@ -120,144 +120,61 @@ For `mellea.stdlib.*` calls to functions **not** in the table above: if `interme
 
 **Within a tier**: collect all lint failures; don't halt on the first one.
 
-**Between tiers**: Tier 1 and structural Tier 2 failures (`cross-reference`, `validator-soundness`, `variable-safety`, `import-side-effects`, `import-soundness`, `stdlib-arity`, `grounding-context-types`, `format-annotation`, `instruct-has-description`, `pipeline-entry-canonical`, `fixture-signature-bound`, `generative-forbidden-params`, `generative-call-passes-session`, `known-behaviours`, `doc-citation`, `bundled-asset-path-resolution`, `pyproject-package-data-bound`, `fixtures-loader-contract`, `runtime-defaults-bound`) trigger the top-level repair loop (see `mellea-fy.md`) before halting. `session-boundary` and `category-specific` failures always halt immediately — no repair is attempted. Tier 3 runs only when Tier 2 is entirely clean.
-
-**Timeout**: any lint exceeding 60 seconds of wall-clock time is recorded as `timed_out` (distinct from `failed`). The lint does not count as passed.
-
-**Not configurable in v1**: no `--skip-lint=<id>` flag. All lints run unconditionally. The only exception: `melleafy lint --lint-version=<v>` runs only the lint set as of version `<v>` (for validating packages generated by an older melleafy).
+**Between tiers**: Tier-1 and structural Tier-2 failures trigger the top-level repair loop (see `mellea-fy.md`) before halting. Lints in `_LINT_HALTS_IMMEDIATELY` bypass repair and halt the gate immediately. Tier 3 runs only when Tier 2 is entirely clean.
 
 ---
 
-## Severity model (format_version 1.1+)
+## Severity model
 
-Each lint declares one of three severities. The severity controls whether a `verdict=fail` from that lint blocks the compile gate or merely surfaces as a finding.
+Each lint declares one of three severities. The gate uses the severity to decide whether a `verdict=fail` blocks the compile or is surfaced as a finding only.
 
-| Severity  | Gate behaviour                                                                                 | Triggers repair? |
-| --------- | ---------------------------------------------------------------------------------------------- | ---------------- |
-| `error`   | Always blocks compile (`overall_verdict = fail`).                                              | Yes              |
-| `warning` | Surfaces in the report and stdout; does NOT block compile. `--strict` promotes to `error`.     | No               |
-| `info`    | Telemetry only. Surfaces in the report; never blocks (not even under `--strict`).              | No               |
+| Severity  | Gate behaviour                                                                                                       |
+| --------- | -------------------------------------------------------------------------------------------------------------------- |
+| `error`   | Blocks compile (`overall_verdict = fail`). Triggers the repair loop unless the lint is in `_LINT_HALTS_IMMEDIATELY`. |
+| `warning` | Surfaces in the report and stdout; does NOT block. `--strict` promotes warnings to blocking.                          |
+| `info`    | Telemetry only. Never blocks, not even under `--strict`.                                                              |
 
-### Per-lint severity classification
-
-| Lint id                                          | Severity  | Rationale                                                                                                           |
-| ------------------------------------------------ | --------- | ------------------------------------------------------------------------------------------------------------------- |
-| `parseable`                                      | `error`   | Tier 1 — every `.py` file parses + `<package_name>.pipeline` imports cleanly in a subprocess. Wrapper-enforced.     |
-| `import-soundness`                               | `error`   | Wrong module paths → `ImportError` at first import.                                                                 |
-| `stdlib-arity`                                   | `error`   | Wrong arity/keyword → `TypeError` on first call.                                                                    |
-| `pipeline-entry-canonical`                       | `error`   | Wrong entry name → smoke-check loader cannot find `run_pipeline`.                                                   |
-| `fixture-signature-bound`                        | `error`   | Fixture inputs don't match params → smoke-check crashes.                                                            |
-| `instruct-has-description`                       | `error`   | Missing description → `TypeError` from Mellea 0.5+.                                                                 |
-| `instruct-result-parse-before-access`            | `error`   | Accessing attrs on unparsed thunk → `AttributeError`.                                                               |
-| `generative-forbidden-params`                    | `error`   | Reserved param names → `@generative` decorator raises.                                                              |
-| `generative-call-passes-session`                 | `error`   | Missing session → `TypeError` at call time.                                                                         |
-| `validator-soundness`                            | `error`   | Malformed validators → Mellea eval fails.                                                                           |
-| `grounding-context-types`                        | `error`   | Wrong types → backend rejects.                                                                                      |
-| `format-annotation`                              | `error`   | Wrong annotation → Mellea parser fails.                                                                             |
-| `variable-safety`                                | `error`   | Undefined variable → `NameError`.                                                                                   |
-| `session-boundary`                               | `error`   | KB5 documented bug — multi-schema priming.                                                                          |
-| `bundled-asset-path-resolution`                  | `error`   | Wrong path → `FileNotFoundError` when pip-installed.                                                                |
-| `pyproject-package-data-bound`                   | `error`   | Companion dir mirrored into package but absent from `[tool.setuptools.package-data]` → wheel ships without assets.  |
-| `runtime-defaults-bound`                         | `error`   | Config drift → wrong model/backend at runtime.                                                                      |
-| `import-side-effects`                            | `error`   | Module-level side effects break headless import.                                                                    |
-| `fixtures-loader-contract`                       | `error`   | Missing `fixtures/__init__.py` → smoke-check loader cannot find fixtures.                                           |
-| `complex-schema-needs-strategy-or-fallback`      | `warning` | Defensive heuristic — Mellea ships a default `RejectionSamplingStrategy`; code often still works without explicit strategy. |
-| `optional-extraction-guidance`                   | `warning` | Pattern advice for extraction quality, not a runtime correctness invariant.                                         |
-| `prefix-persona`                                 | `warning` | Style guidance for persona text content.                                                                            |
-| `no-watsonx`                                     | `warning` | Project policy — not a runtime correctness issue.                                                                   |
-| `run-pipeline-params-typed`                      | `warning` | Style — requires explicit type annotations on `run_pipeline` parameters.                                            |
-| `melleafy-json-consistency`                      | `info`    | Drift detection between descriptor and rendered package — useful telemetry but the package still runs when divergent. |
-
-### Blocking failures
-
-`overall_verdict = fail` iff at least one lint has `verdict == "fail"` AND `severity == "error"`. WARNING-severity and INFO-severity `verdict=fail` entries are surfaced in the report but do NOT block. Use `--strict` to restore the pre-graduated-severity behaviour (warnings promote to blocking; info remains telemetry-only).
-
-### Escape hatch
-
-`melleafy compile <spec> --strict` and `melleafy validate <pkg> --strict` make any lint failure blocking, regardless of severity. Use this when running against a strict-compliance gate (e.g. release validation) or when you want the historical "every lint is a gate" behaviour.
+Per-lint severity, tier, and halt-immediately membership are data, not prose — they live in `src/mellea_skills_compiler/compile/lints.py` (`_LINT_SEVERITY`, `_LINT_TIER`, `_LINT_HALTS_IMMEDIATELY`). Each entry carries an inline rationale comment; `test_each_lint_has_declared_severity` and `test_each_lint_has_declared_tier` guard against drift.
 
 ---
 
 ## Failure report: `intermediate/step_7_report.json`
 
+The report's shape is a contract, not an example. The authoritative definition is the JSON Schema at `src/mellea_skills_compiler/compile/schemas/step_7_report.schema.json` (Draft-07). The writer (`compile/lints.py::run_lints`) validates every emitted report against the schema and logs a drift warning if they disagree.
+
+Minimal valid instance:
+
 ```json
 {
   "format_version": "1.1",
-  "checked_at": "2026-04-22T15:30:00Z",
+  "checked_at": "2026-05-18T12:00:00Z",
   "package_path": "ticket_triage_mellea/",
-  "overall_verdict": "fail",
-  "blocking_failures": 1,
+  "overall_verdict": "pass",
+  "blocking_failures": 0,
   "warnings": 0,
   "info_failures": 0,
   "strict": false,
-
-  "lints": [
-    {
-      "lint_id": "session-boundary",
-      "verdict": "fail",
-      "severity": "error",
-      "files_checked": 1,
-      "skipped_reason": null,
-      "failures": [
-        {
-          "file": "pipeline.py",
-          "line": 45,
-          "column": 5,
-          "message": "start_session() block contains m.instruct calls with 2 distinct format types: TriageVerdict and ClaimList. Split into separate sessions (Known Behaviour 5).",
-          "rule_ref": "KB 5"
-        }
-      ]
-    },
-    {
-      "lint_id": "no-watsonx",
-      "verdict": "pass",
-      "severity": "warning",
-      "files_checked": 4,
-      "skipped_reason": null,
-      "failures": []
-    }
-  ]
+  "lints": []
 }
 ```
 
-When the Python `run_lints` orchestrator emits the report it currently uses a flat `lints` array (no tier nesting) — the slash command merges its Tier 1/3 results into the same flat structure when it consumes the file. The per-lint `severity` field is normative.
-
-Every failure entry has: `file` (relative path), `line` (1-indexed), `column` (1-indexed or null), `message` (what's wrong and what to do), and optionally `kb_ref`, `spec_ref`, `suggestion`.
+For the full field definitions (including per-lint `effective_severity`, the optional `smoke_check` sub-report, `warnings_escalated_by_smoke`, and the `LintFailure` shape), open the schema file directly or run `jsonschema -i intermediate/step_7_report.json src/mellea_skills_compiler/compile/schemas/step_7_report.schema.json` to validate a real report.
 
 ---
 
 ## Stdout on failure
 
-```
-[FAIL] Step 7 static validation
-Tier 2 failed with 1 lint failure across 1 check.
-
-session-boundary (FAIL):
-  pipeline.py:45:5
-    start_session() block contains m.instruct calls with 2 distinct format types:
-    TriageVerdict and ClaimList. Split into separate sessions.
-    [Known Behaviour 5]
-
-Package preserved at .melleafy-partial/ for investigation.
-Run `melleafy lint <path>` after fixing to re-check.
-```
-
----
-
-## `melleafy lint` subcommand
-
-`melleafy lint <package_path>` runs the full lint suite against an existing package without regenerating. Exit code 0 on pass, **11** on fail (distinct from Step 2.5's strict-halt code 10 and generated package exit codes 0–4).
-
-Requires an intact `intermediate/` directory in the target package. If `melleafy.json`, `dependency_plan.json`, or other intermediate artifacts are missing, the lints that need them report "not validatable" rather than false-pass.
+There is no custom formatter for failure output — the actual stdout is whatever `compile/lints.py::run_lints` and the surrounding CLI layer print today (`rich`-formatted logger output plus the JSON report path). The structured contract for downstream tooling is `intermediate/step_7_report.json` (see schema above), not the human-readable stdout. If you need to grep CI logs, key on `overall_verdict: "fail"` in the JSON report rather than on stdout strings; the stdout wording is not API-stable.
 
 ---
 
 ## What lints do NOT check
 
-- Semantic correctness: lints catch structure, not "does this produce the right answer?"
-- Style or formatting: PEP 8 conformance is out of scope
-- Dependency resolution: `pip install -e .` is a separate user-run check (R15)
-- Style or formatting beyond what the lints above cover
+The lint suite is deliberately scoped to mechanical, structural properties. Out of scope by design:
+
+- **Semantic correctness** — lints check structure, not "does this produce the right answer?". Behavioural correctness is the job of fixtures plus the smoke-check (below).
+- **Style and formatting** — PEP 8, line length, import order, and similar style concerns. Run your formatter of choice as a separate step.
+- **Dependency resolution** — whether `pip install -e .` succeeds is verified separately; see R15 in `mellea-fy.md`.
 
 ---
 
@@ -267,9 +184,11 @@ After all three static tiers pass, `melleafy validate` executes a single fixture
 
 The smoke check produces one of three verdicts:
 
-- **`passed`** — fixture executed to completion without exception. Exit code **0**. `step_7b_report.json` records the fixture id, duration, and output schema type.
-- **`failed`** — fixture raised an exception or violated an assertion the runner can detect. Exit code **12** (distinct from **11** for static lint failure). `step_7b_report.json` records the traceback and fixture context. Does **not** trigger the repair loop — a fixture failure requires human review, not automated re-generation.
-- **`skipped`** — LLM backend unreachable (e.g. Ollama not running, API endpoint timing out, missing API key). Exit code **0** with a stderr warning: _"Fixture smoke-check skipped — LLM backend unreachable: <reason>. Re-run `mellea-skills validate <pkg> --run` once the backend is up to verify runtime behaviour."_ `step_7b_report.json` records the verdict as `skipped` with the underlying error. This keeps CI green for environments without an LLM while still nudging local users.
+- **`passed`** — fixture executed to completion without exception. Exit code `ExitCode.SUCCESS`. `step_7b_report.json` records the fixture id, duration, and output schema type.
+- **`failed`** — fixture raised an exception or violated an assertion the runner can detect. Exit code `ExitCode.SMOKE_CHECK_FAIL` (distinct from `ExitCode.LINT_FAIL` for static lint failure). `step_7b_report.json` records the traceback and fixture context. Does **not** trigger the repair loop — a fixture failure requires human review, not automated re-generation.
+- **`skipped`** — LLM backend unreachable (e.g. Ollama not running, API endpoint timing out, missing API key). Exit code `ExitCode.SUCCESS` with a stderr warning: _"Fixture smoke-check skipped — LLM backend unreachable: <reason>. Re-run `mellea-skills validate <pkg> --run` once the backend is up to verify runtime behaviour."_ `step_7b_report.json` records the verdict as `skipped` with the underlying error. This keeps CI green for environments without an LLM while still nudging local users.
+
+Exit codes are defined in `src/mellea_skills_compiler/exit_codes.py` (`ExitCode` IntEnum); CI scripts should import that module rather than hardcoding integer literals.
 
 Detection of "backend unreachable" vs "fixture genuinely failed":
 
