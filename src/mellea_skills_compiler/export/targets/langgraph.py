@@ -679,7 +679,9 @@ def _render_pyproject_toml(
     modality: str,
     has_policy_manifest: bool = False,
 ) -> str:
-    deps = ['    "langgraph>=0.2.0",\n', '    "mellea[hooks]>=0.3.2",\n']
+    from mellea_skills_compiler.constants import MELLEA_PIN
+
+    deps = ['    "langgraph>=0.2.0",\n', f'    "{MELLEA_PIN}",\n']
     if has_policy_manifest:
         deps.append(
             '    "mellea-skills-compiler@git+https://github.com/generative-computing/mellea-skills-compiler.git",\n'
