@@ -221,13 +221,18 @@ def _run_guardian_post_checks(
     # fire for any reason, still catch Requirement-driven generations.
     action = _get_thunk_action(model_output)
     if isinstance(action, Requirement):
-        LOGGER.warning(
-            "Guardian post-check: Requirement action reached the post-call hook "
-            "without a matching pre-call tag (generation_id=%s). Falling back to "
-            "the thunk-action inspection path; a future mellea hook-ordering "
-            "change may be masking this. Investigate if this recurs.",
-            generation_id,
-        )
+        # Only WARN when generation_id is populated — that's the real
+        # regression signal (hook ordering changed on a supported mellea
+        # version). generation_id is None is the expected pre-0.7 shape
+        # and does not indicate any bug.
+        if generation_id is not None:
+            LOGGER.warning(
+                "Guardian post-check: Requirement action reached the post-call hook "
+                "without a matching pre-call tag (generation_id=%s). Falling back to "
+                "the thunk-action inspection path; a future mellea hook-ordering "
+                "change may be masking this. Investigate if this recurs.",
+                generation_id,
+            )
         return []
 
     assistant_text = getattr(model_output, "value", None) or ""
