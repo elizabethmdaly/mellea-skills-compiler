@@ -52,6 +52,62 @@ class TestCompatibilityYaml:
             "the LLM compile phase."
         )
 
+    def test_path_resolves_from_any_cwd(self, tmp_path, monkeypatch):
+        """Regression for review finding 6: the file must be findable when
+        the compiler is invoked from outside the repo root."""
+        # ``_resolve_compatibility_yaml_path`` should return the package-anchored
+        # path regardless of CWD, because it walks up from __file__.
+        monkeypatch.chdir(tmp_path)
+        resolved = grounding._resolve_compatibility_yaml_path()
+        assert resolved.exists(), (
+            f"compatibility.yaml resolution broke from a foreign CWD: {resolved}"
+        )
+        assert resolved.samefile(REPO_ROOT / ".claude/data/compatibility.yaml")
+
+    def test_env_override_wins(self, tmp_path, monkeypatch):
+        """MELLEA_SKILLS_COMPILER_COMPATIBILITY_YAML lets tests / callers
+        redirect to an alternate file."""
+        alternate = tmp_path / "alt-compat.yaml"
+        alternate.write_text("format_version: '1.0'\nentries: []\n")
+        monkeypatch.setenv(
+            "MELLEA_SKILLS_COMPILER_COMPATIBILITY_YAML", str(alternate)
+        )
+        assert grounding._resolve_compatibility_yaml_path() == alternate
+
+    def test_load_warns_when_file_missing(self, tmp_path, monkeypatch, caplog):
+        """Silent-degradation was the failure mode this finding fixed. A
+        missing file must produce a visible WARNING, not empty output."""
+        monkeypatch.setenv(
+            "MELLEA_SKILLS_COMPILER_COMPATIBILITY_YAML",
+            str(tmp_path / "does-not-exist.yaml"),
+        )
+        import logging
+        with caplog.at_level(logging.WARNING):
+            entries = grounding._load_compatibility_entries("0.7.0")
+        assert entries == []
+        assert any(
+            "compatibility.yaml not found" in rec.getMessage()
+            for rec in caplog.records
+        ), (
+            f"expected a WARNING for missing compatibility.yaml, got: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+
+    def test_load_warns_when_yaml_is_malformed(self, tmp_path, monkeypatch, caplog):
+        bad = tmp_path / "bad.yaml"
+        bad.write_text(":: this: is: not [valid yaml\n")
+        monkeypatch.setenv(
+            "MELLEA_SKILLS_COMPILER_COMPATIBILITY_YAML", str(bad)
+        )
+        import logging
+        with caplog.at_level(logging.WARNING):
+            entries = grounding._load_compatibility_entries("0.7.0")
+        assert entries == []
+        assert any(
+            "Failed to parse compatibility.yaml" in rec.getMessage()
+            for rec in caplog.records
+        )
+
     def test_yaml_is_well_formed_and_has_entries(self):
         import yaml
         path = REPO_ROOT / ".claude/data/compatibility.yaml"

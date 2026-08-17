@@ -234,21 +234,66 @@ def _extract_forbidden_param_names() -> list[str]:
         return list(_FORBIDDEN_PARAM_NAMES_FALLBACK)
 
 
+_COMPATIBILITY_YAML_ENV = "MELLEA_SKILLS_COMPILER_COMPATIBILITY_YAML"
+
+
+def _resolve_compatibility_yaml_path() -> Path:
+    """Locate ``.claude/data/compatibility.yaml`` regardless of CWD.
+
+    Resolution order (first hit wins):
+
+    1. ``MELLEA_SKILLS_COMPILER_COMPATIBILITY_YAML`` env override (used by tests
+       and callers that want to supply an alternate compat file).
+    2. Package-anchored path: ``<repo>/.claude/data/compatibility.yaml``, where
+       ``<repo>`` is ``Path(__file__).resolve().parents[3]``. This is the
+       correctness-critical case — the file ships in the repo alongside the
+       package and must not be missed just because the compiler is invoked
+       from a subdirectory.
+    3. CWD-relative ``Path(".claude/data/compatibility.yaml")``, matching the
+       existing ``claude_directives._RUNTIME_DEFAULTS_PATH`` convention.
+    """
+    override = os.environ.get(_COMPATIBILITY_YAML_ENV)
+    if override:
+        return Path(override)
+    package_relative = (
+        Path(__file__).resolve().parents[3] / ".claude" / "data" / "compatibility.yaml"
+    )
+    if package_relative.exists():
+        return package_relative
+    return Path(".claude/data/compatibility.yaml")
+
+
 def _load_compatibility_entries(mellea_version: str) -> list[dict[str, Any]]:
     """Load `.claude/data/compatibility.yaml` and filter to applicable entries.
 
     Filtering uses `packaging.specifiers.SpecifierSet` against the installed
     mellea version. An `applies_when` of "*" or missing means "always applies".
-    Returns an empty list if the file is missing or unparseable.
+    Returns an empty list if the file is missing or unparseable — but WARNs
+    loudly, because missing / broken compatibility data means the LLM compile
+    phase silently reverts to hallucinating pre-0.7 shape.
     """
-    compat_path = Path(".claude/data/compatibility.yaml")
+    compat_path = _resolve_compatibility_yaml_path()
     if not compat_path.exists():
+        LOGGER.warning(
+            "compatibility.yaml not found at %s. The LLM compile phase will "
+            "ground against the installed mellea's raw introspection surface "
+            "only — version-conditional guidance (genslot→genstub, telemetry "
+            "renames, etc.) will not be surfaced. Set %s to override the path.",
+            compat_path,
+            _COMPATIBILITY_YAML_ENV,
+        )
         return []
     try:
         import yaml  # type: ignore
 
         compat = yaml.safe_load(compat_path.read_text()) or {}
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning(
+            "Failed to parse compatibility.yaml at %s: %s. Falling back to "
+            "empty compatibility data.",
+            compat_path,
+            exc,
+        )
         return []
     try:
         from packaging.specifiers import SpecifierSet  # type: ignore
@@ -264,8 +309,17 @@ def _load_compatibility_entries(mellea_version: str) -> list[dict[str, Any]]:
         try:
             if mellea_version in SpecifierSet(applies):
                 entries.append(entry)
-        except Exception:
-            # If the specifier is malformed, include the entry rather than drop it.
+        except Exception as exc:
+            # If the specifier is malformed, include the entry rather than drop it
+            # (bias toward surfacing guidance over hiding it), but log so the
+            # malformed file gets fixed.
+            LOGGER.warning(
+                "Malformed applies_when %r on compatibility entry %r: %s. "
+                "Including the entry anyway.",
+                applies,
+                entry.get("id", "<unnamed>"),
+                exc,
+            )
             entries.append(entry)
     return entries
 

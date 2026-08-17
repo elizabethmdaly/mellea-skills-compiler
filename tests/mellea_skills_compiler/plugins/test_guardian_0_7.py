@@ -164,6 +164,47 @@ class TestConcurrency:
         assert len(audit_plugin.all_verdicts) == n_threads * per_thread
         assert len(audit_plugin.verdicts_by_generation_id) == n_threads * per_thread
 
+    def test_parallel_requirement_id_tracking_is_lock_guarded(self, audit_plugin):
+        """Regression for review finding 2.
+
+        ``_requirement_generation_ids`` is now under ``_verdict_lock``.
+        Concurrent add() / discard() calls across many ids must not lose any
+        add, must not produce spurious survivors after every id has been
+        discarded, and must not raise.
+        """
+        n_threads = 10
+        ids_per_thread = 100
+
+        def adder(offset: int):
+            for i in range(ids_per_thread):
+                gen_id = f"req-{offset}-{i}"
+                with audit_plugin._verdict_lock:
+                    audit_plugin._requirement_generation_ids.add(gen_id)
+
+        def discarder(offset: int):
+            for i in range(ids_per_thread):
+                gen_id = f"req-{offset}-{i}"
+                with audit_plugin._verdict_lock:
+                    audit_plugin._requirement_generation_ids.discard(gen_id)
+
+        add_threads = [
+            threading.Thread(target=adder, args=(k,)) for k in range(n_threads)
+        ]
+        for t in add_threads:
+            t.start()
+        for t in add_threads:
+            t.join()
+        assert len(audit_plugin._requirement_generation_ids) == n_threads * ids_per_thread
+
+        discard_threads = [
+            threading.Thread(target=discarder, args=(k,)) for k in range(n_threads)
+        ]
+        for t in discard_threads:
+            t.start()
+        for t in discard_threads:
+            t.join()
+        assert audit_plugin._requirement_generation_ids == set()
+
 
 class TestNewHookCoverage:
     """Every 0.7-added hook type has a subscribed handler on both plugins."""

@@ -44,6 +44,35 @@ class TestMelleaDeprecationFilter:
         )
         assert len(_mellea_deprecation_warnings([w])) == 1
 
+    def test_message_text_filter_fires_on_prose_containing_mellea(self):
+        """False-positive documentation.
+
+        The message-text fallback in ``_mellea_deprecation_warnings`` is
+        intentionally loose (belt-and-braces): if a DeprecationWarning
+        originates from an unrelated lib but happens to mention "mellea"
+        in prose (e.g. a config-doc string), it will be flagged. This test
+        pins that behaviour so a future tightening is a conscious change,
+        not an accidental one. If someone wants stricter matching, this
+        test breaks and forces the discussion.
+        """
+        w = _warning_record(
+            "some_other_lib config: 'mellea' is one of the supported adapters",
+            filename="/pkgs/some_other_lib/config.py",
+        )
+        # Path check fails (not under /mellea/), so the filter falls to
+        # message-text scanning. The text mentions "mellea" so the filter
+        # fires. Documented as intentional-but-loose.
+        assert len(_mellea_deprecation_warnings([w])) == 1
+
+    def test_unrelated_lib_without_mellea_word_is_ignored(self):
+        """Complement to the case above: unrelated warnings with no mellea
+        mention pass through cleanly."""
+        w = _warning_record(
+            "some_other_lib.foo is deprecated, use some_other_lib.bar",
+            filename="/pkgs/some_other_lib/foo.py",
+        )
+        assert _mellea_deprecation_warnings([w]) == []
+
 
 class TestRunOneFixtureFailsOnMelleaDeprecation:
     def test_fixture_that_triggers_mellea_deprecation_fails_smoke(self):

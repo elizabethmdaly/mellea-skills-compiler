@@ -207,14 +207,27 @@ def _run_guardian_post_checks(
         return []
 
     generation_id = getattr(payload, "generation_id", None)
-    if generation_id is not None and generation_id in plugin._requirement_generation_ids:
-        plugin._requirement_generation_ids.discard(generation_id)
-        return []
+    if generation_id is not None:
+        # Lock-guarded to match the surrounding ``_verdict_lock`` discipline
+        # and to survive a free-threaded interpreter (PEP 703). CPython's GIL
+        # makes single ``set.__contains__`` / ``set.discard`` atomic today,
+        # but the read+discard pair is not.
+        with plugin._verdict_lock:
+            if generation_id in plugin._requirement_generation_ids:
+                plugin._requirement_generation_ids.discard(generation_id)
+                return []
 
     # Belt-and-braces: on pre-0.7 mellea, or if the pre-call hook did not
     # fire for any reason, still catch Requirement-driven generations.
     action = _get_thunk_action(model_output)
     if isinstance(action, Requirement):
+        LOGGER.warning(
+            "Guardian post-check: Requirement action reached the post-call hook "
+            "without a matching pre-call tag (generation_id=%s). Falling back to "
+            "the thunk-action inspection path; a future mellea hook-ordering "
+            "change may be masking this. Investigate if this recurs.",
+            generation_id,
+        )
         return []
 
     assistant_text = getattr(model_output, "value", None) or ""
@@ -270,7 +283,9 @@ def _run_guardian_pre_checks(
     if isinstance(action, Requirement):
         generation_id = getattr(payload, "generation_id", None)
         if generation_id is not None:
-            plugin._requirement_generation_ids.add(generation_id)
+            # Lock-guarded — see the paired discard in _run_guardian_post_checks.
+            with plugin._verdict_lock:
+                plugin._requirement_generation_ids.add(generation_id)
         return []
 
     # Get input text from the action component
@@ -444,24 +459,15 @@ class GuardianAuditPlugin(
 
     @hook(HookType.GENERATION_BATCH_PRE_CALL, mode=PluginMode.AUDIT)
     async def check_batch_input(self, payload: Any, ctx: Any) -> None:
-        """Pre-batch generation: dispatch each item through the per-call path.
+        """Pre-batch generation: no-op — Requirement metadata isn't on batch payloads.
 
-        Added in mellea 0.7. ``generate_from_raw`` (used by budget-forcing
-        sampling and any future context-free batch paths) fires the batch
-        hooks, not the per-call ones. Without this handler, batch
-        generations execute unmonitored — a silent governance hole.
+        Subscribed so a batch generation is visible to the plugin runner (and
+        so ``AuditTrailPlugin.log_batch_pre_call`` fires alongside), but there
+        is no per-item action metadata to filter on — ``generate_from_raw``
+        code paths don't wrap Requirements. All assessment happens on the
+        batch outputs in ``check_batch_output``.
         """
-        prompts = getattr(payload, "prompts", None) or []
-        generation_ids = getattr(payload, "generation_ids", None) or [None] * len(prompts)
-        for _prompt, gen_id in zip(prompts, generation_ids):
-            # Batch payloads don't carry a full pre-call payload shape — we
-            # only record the id-tagging side of the pre-call so the paired
-            # post-batch hook can skip Requirement-driven items. Assessment
-            # runs on the batch outputs in check_batch_output.
-            if gen_id is not None:
-                # No Requirement filtering possible without action metadata;
-                # batch generations are code paths that don't wrap Requirements.
-                pass
+        return None
 
     @hook(HookType.GENERATION_BATCH_POST_CALL, mode=PluginMode.AUDIT)
     async def check_batch_output(self, payload: Any, ctx: Any) -> None:

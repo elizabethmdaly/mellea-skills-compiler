@@ -679,6 +679,8 @@ def _render_pyproject_toml(
     modality: str,
     has_policy_manifest: bool = False,
 ) -> str:
+    # Local import to avoid a circular dependency with the package top-level
+    # (constants is a leaf module; this target module is imported at compile time).
     from mellea_skills_compiler.constants import MELLEA_PIN
 
     deps = ['    "langgraph>=0.2.0",\n', f'    "{MELLEA_PIN}",\n']

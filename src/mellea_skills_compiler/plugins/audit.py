@@ -75,7 +75,9 @@ class AuditTrailPlugin(
         Replaces the pre-0.7 positional ``recent[-len(risks):]`` slicing,
         which is race-prone under mellea 0.7 parallel sampling. Falls back
         to positional-tail lookup only when generation_id is None (i.e. on
-        mellea versions or code paths that don't populate it).
+        mellea versions or code paths that don't populate it). On mellea 0.7+
+        both pre-call and post-call payloads carry generation_id, so a
+        fallback firing signals a mellea-side omission and is worth surfacing.
         """
         if self.guardian_plugin is None:
             return []
@@ -85,6 +87,11 @@ class AuditTrailPlugin(
             )
             if verdicts:
                 return list(verdicts)
+        else:
+            LOGGER.debug(
+                "audit trail: falling back to positional verdict lookup "
+                "(no generation_id on payload). Expected on <0.7 mellea only."
+            )
         # Legacy fallback for payloads without a generation_id.
         n = len(getattr(self.guardian_plugin, "risks", []) or []) or 1
         return list(self.guardian_plugin.all_verdicts[-n:])
